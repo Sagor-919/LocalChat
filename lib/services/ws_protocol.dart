@@ -32,10 +32,33 @@ sealed class WsMessage {
           displayName: map['name'] as String,
           version: (map['v'] as num?)?.toInt() ?? 1,
         );
+      case ChatTextMessage.typeValue:
+        return ChatTextMessage(
+          messageId: map['mid'] as String,
+          fromUserId: map['from'] as String,
+          fromDisplayName: map['fromName'] as String? ?? 'Unknown',
+          text: map['text'] as String,
+          sentAtMs: (map['ts'] as num?)?.toInt() ??
+              DateTime.now().millisecondsSinceEpoch,
+          version: (map['v'] as num?)?.toInt() ?? 1,
+        );
       default:
-        throw FormatException('Unknown message type: $type');
+        return UnknownMessage(type: type, payload: map);
     }
   }
+}
+
+class UnknownMessage extends WsMessage {
+  final String type;
+  final Map<String, Object?> payload;
+
+  const UnknownMessage({
+    required this.type,
+    required this.payload,
+  });
+
+  @override
+  Map<String, Object?> toJson() => payload;
 }
 
 class HelloMessage extends WsMessage {
@@ -76,6 +99,37 @@ class HelloAckMessage extends WsMessage {
         'type': typeValue,
         'id': userId,
         'name': displayName,
+        'v': version,
+      };
+}
+
+class ChatTextMessage extends WsMessage {
+  static const String typeValue = 'chat_text';
+
+  final String messageId;
+  final String fromUserId;
+  final String fromDisplayName;
+  final String text;
+  final int sentAtMs;
+  final int version;
+
+  const ChatTextMessage({
+    required this.messageId,
+    required this.fromUserId,
+    required this.fromDisplayName,
+    required this.text,
+    required this.sentAtMs,
+    this.version = 1,
+  });
+
+  @override
+  Map<String, Object?> toJson() => {
+        'type': typeValue,
+        'mid': messageId,
+        'from': fromUserId,
+        'fromName': fromDisplayName,
+        'text': text,
+        'ts': sentAtMs,
         'v': version,
       };
 }

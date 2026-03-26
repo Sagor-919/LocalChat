@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../models/peer_device.dart';
+import '../screens/chat_screen.dart';
 import '../services/device_identity.dart';
 import '../services/mdns_presence_service.dart';
 import '../services/ws_connection_service.dart';
@@ -170,12 +171,24 @@ class _NearbyDevicesScreenState extends State<NearbyDevicesScreen> {
       _status = 'Connecting to ${peer.displayName}...';
     });
 
-    await connections.connectToPeer(peer);
+    final state = await connections.connectToPeer(peer);
 
     if (!mounted) return;
     setState(() {
       _status = 'Searching nearby devices...';
     });
+
+    if (state.status == PeerConnectionStatus.connected && _identity != null) {
+      await Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => ChatScreen(
+            me: _identity!,
+            peer: peer,
+            connections: connections,
+          ),
+        ),
+      );
+    }
   }
 
   Widget _statusChipForPeer(PeerDevice peer) {

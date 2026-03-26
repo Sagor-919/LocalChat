@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:uuid/uuid.dart';
+
 import '../models/peer_device.dart';
 import 'device_identity.dart';
 import 'ws_protocol.dart';
@@ -33,19 +35,28 @@ typedef ConnectionChanged = void Function(
   PeerConnectionState state,
 );
 
+typedef MessageReceived = void Function(
+  String peerId,
+  WsMessage message,
+);
+
 class WsConnectionService {
   final DeviceIdentity identity;
   final int listenPort;
+  final Uuid _uuid = const Uuid();
 
   HttpServer? _server;
   final Map<String, PeerConnectionState> _connections = {};
+  final Map<String, StreamSubscription> _socketSubscriptions = {};
 
   ConnectionChanged? onConnectionChanged;
+  MessageReceived? onMessageReceived;
 
   WsConnectionService({
     required this.identity,
     required this.listenPort,
     this.onConnectionChanged,
+    this.onMessageReceived,
   });
 
   Future<void> startServer() async {
@@ -80,7 +91,8 @@ class WsConnectionService {
     // Wait for hello.
     String? peerId;
     try {
-      final raw = await ws.first.timeout(const Duration(seconds: 4));
+      final stream = ws.asBroadcastStream();
+      final raw = await stream.first.timeout(const Duration(seconds: 4));
       final rawString = raw is String ? raw : utf8.decode(raw as List<int>);
       final msg = WsMessage.decode(rawString);
       if (msg case HelloMessage hello) {
@@ -107,6 +119,8 @@ class WsConnectionService {
           displayName: identity.displayName,
         );
         ws.add(ack.encode());
+
+        _attachMessageListener(peerId, stream);
 
         // Keep listening until closed.
         await ws.done;
@@ -136,6 +150,29 @@ class WsConnectionService {
 
   PeerConnectionState? getConnection(String peerId) => _connections[peerId];
 
+  void _attachMessageListener(String peerId, Stream<dynamic> stream) {
+    _socketSubscriptions[peerId]?.cancel();
+    _socketSubscriptions[peerId] = stream.listen(
+      (raw) {
+        try {
+          final rawString = raw is String ? raw : utf8.decode(raw as List<int>);
+          final msg = WsMessage.decode(rawString);
+          if (msg is HelloMessage || msg is HelloAckMessage) return;
+          onMessageReceived?.call(peerId, msg);
+        } catch (_) {
+          // Ignore malformed messages (best-effort LAN transport).
+        }
+      },
+      onDone: () {
+        _socketSubscriptions.remove(peerId)?.cancel();
+      },
+      onError: (_) {
+        _socketSubscriptions.remove(peerId)?.cancel();
+      },
+      cancelOnError: true,
+    );
+  }
+
   Future<PeerConnectionState> connectToPeer(PeerDevice peer) async {
     final existing = _connections[peer.userId];
     if (existing != null &&
@@ -154,6 +191,7 @@ class WsConnectionService {
     try {
       final ws = await WebSocket.connect('ws://${peer.ipAddress}:${peer.wsPort}')
           .timeout(const Duration(seconds: 5));
+      final stream = ws.asBroadcastStream();
 
       state.socket = ws;
       final hello = HelloMessage(
@@ -163,13 +201,15 @@ class WsConnectionService {
       ws.add(hello.encode());
 
       // Wait for ack.
-      final raw = await ws.first.timeout(const Duration(seconds: 4));
+      final raw = await stream.first.timeout(const Duration(seconds: 4));
       final rawString = raw is String ? raw : utf8.decode(raw as List<int>);
       final msg = WsMessage.decode(rawString);
       if (msg case HelloAckMessage _) {
         state.status = PeerConnectionStatus.connected;
         state.error = null;
         onConnectionChanged?.call(peer.userId, state);
+
+        _attachMessageListener(peer.userId, stream);
 
         unawaited(ws.done.then((_) {
           final current = _connections[peer.userId];
@@ -191,6 +231,25 @@ class WsConnectionService {
     }
   }
 
+  bool sendChatText(String peerId, String text) {
+    final state = _connections[peerId];
+    final ws = state?.socket;
+    if (state == null || ws == null || state.status != PeerConnectionStatus.connected) {
+      return false;
+    }
+
+    final msg = ChatTextMessage(
+      messageId: _uuid.v4(),
+      fromUserId: identity.userId,
+      fromDisplayName: identity.displayName,
+      text: text,
+      sentAtMs: DateTime.now().millisecondsSinceEpoch,
+    );
+
+    ws.add(msg.encode());
+    return true;
+  }
+
   Future<void> stopServer() async {
     final server = _server;
     _server = null;
@@ -203,6 +262,12 @@ class WsConnectionService {
         await entry.socket?.close();
       } catch (_) {}
     }
+    for (final sub in _socketSubscriptions.values) {
+      try {
+        await sub.cancel();
+      } catch (_) {}
+    }
+    _socketSubscriptions.clear();
     _connections.clear();
     await stopServer();
   }

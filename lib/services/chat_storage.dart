@@ -1,0 +1,52 @@
+import 'dart:convert';
+
+import 'package:shared_preferences/shared_preferences.dart';
+
+import '../models/chat_message.dart';
+
+class ChatStorage {
+  static const _keyPrefix = 'drivechat_chat_';
+  static const int _maxMessagesPerPeer = 300;
+
+  final SharedPreferences _prefs;
+
+  ChatStorage(this._prefs);
+
+  static Future<ChatStorage> create() async {
+    final prefs = await SharedPreferences.getInstance();
+    return ChatStorage(prefs);
+  }
+
+  String _keyForPeer(String peerUserId) => '$_keyPrefix$peerUserId';
+
+  List<ChatMessage> loadMessages(String peerUserId) {
+    final raw = _prefs.getString(_keyForPeer(peerUserId));
+    if (raw == null || raw.isEmpty) return const [];
+
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) return const [];
+      return decoded
+          .whereType<Map>()
+          .map((m) => ChatMessage.fromJson(m.cast<String, dynamic>()))
+          .toList()
+        ..sort((a, b) => a.sentAtMs.compareTo(b.sentAtMs));
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  Future<void> appendMessage(String peerUserId, ChatMessage message) async {
+    final existing = loadMessages(peerUserId).toList();
+    existing.add(message);
+
+    if (existing.length > _maxMessagesPerPeer) {
+      final start = existing.length - _maxMessagesPerPeer;
+      existing.removeRange(0, start);
+    }
+
+    final encoded = jsonEncode(existing.map((m) => m.toJson()).toList());
+    await _prefs.setString(_keyForPeer(peerUserId), encoded);
+  }
+}
+
