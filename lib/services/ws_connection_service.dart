@@ -11,6 +11,7 @@ import 'ws_protocol.dart';
 enum PeerConnectionStatus {
   disconnected,
   connecting,
+  incomingRequest,
   connected,
   failed,
 }
@@ -40,6 +41,11 @@ typedef MessageReceived = void Function(
   WsMessage message,
 );
 
+typedef IncomingConnectionRequested = void Function(
+  String peerId,
+  PeerConnectionState state,
+);
+
 class WsConnectionService {
   final DeviceIdentity identity;
   final int listenPort;
@@ -48,15 +54,18 @@ class WsConnectionService {
   HttpServer? _server;
   final Map<String, PeerConnectionState> _connections = {};
   final Map<String, StreamSubscription> _socketSubscriptions = {};
+  final Map<String, Completer<bool>> _incomingDecisions = {};
 
   ConnectionChanged? onConnectionChanged;
   MessageReceived? onMessageReceived;
+  IncomingConnectionRequested? onIncomingConnectionRequested;
 
   WsConnectionService({
     required this.identity,
     required this.listenPort,
     this.onConnectionChanged,
     this.onMessageReceived,
+    this.onIncomingConnectionRequested,
   });
 
   Future<void> startServer() async {
@@ -107,18 +116,42 @@ class WsConnectionService {
 
         final state = PeerConnectionState(
           peer: peer,
-          status: PeerConnectionStatus.connected,
+          status: PeerConnectionStatus.incomingRequest,
           socket: ws,
         );
         _connections[peerId] = state;
         onConnectionChanged?.call(peerId, state);
+        onIncomingConnectionRequested?.call(peerId, state);
 
-        // Reply with ack.
+        final decision = Completer<bool>();
+        _incomingDecisions[peerId] = decision;
+
+        final accepted = await decision.future.timeout(
+          const Duration(seconds: 30),
+          onTimeout: () => false,
+        );
+        _incomingDecisions.remove(peerId);
+
+        if (!accepted) {
+          try {
+            ws.add(const ConnectRejectMessage(reason: 'Declined').encode());
+          } catch (_) {}
+          await ws.close();
+          state.status = PeerConnectionStatus.disconnected;
+          onConnectionChanged?.call(peerId, state);
+          return;
+        }
+
+        // Reply with ack (consent granted).
         final ack = HelloAckMessage(
           userId: identity.userId,
           displayName: identity.displayName,
         );
         ws.add(ack.encode());
+
+        state.status = PeerConnectionStatus.connected;
+        state.error = null;
+        onConnectionChanged?.call(peerId, state);
 
         _attachMessageListener(peerId, stream);
 
@@ -149,6 +182,20 @@ class WsConnectionService {
   }
 
   PeerConnectionState? getConnection(String peerId) => _connections[peerId];
+
+  bool acceptIncoming(String peerId) {
+    final c = _incomingDecisions[peerId];
+    if (c == null || c.isCompleted) return false;
+    c.complete(true);
+    return true;
+  }
+
+  bool rejectIncoming(String peerId) {
+    final c = _incomingDecisions[peerId];
+    if (c == null || c.isCompleted) return false;
+    c.complete(false);
+    return true;
+  }
 
   void _attachMessageListener(String peerId, Stream<dynamic> stream) {
     _socketSubscriptions[peerId]?.cancel();
@@ -222,7 +269,11 @@ class WsConnectionService {
         return state;
       }
 
-      throw const FormatException('Expected hello_ack');
+      if (msg case ConnectRejectMessage rej) {
+        throw FormatException(rej.reason);
+      }
+
+      throw const FormatException('Expected hello_ack or connect_reject');
     } catch (e) {
       state.status = PeerConnectionStatus.failed;
       state.error = e.toString();
@@ -231,11 +282,14 @@ class WsConnectionService {
     }
   }
 
-  bool sendChatText(String peerId, String text) {
+  ChatTextMessage? sendChatText(String peerId, String text) {
     final state = _connections[peerId];
     final ws = state?.socket;
-    if (state == null || ws == null || state.status != PeerConnectionStatus.connected) {
-      return false;
+    if (state == null ||
+        ws == null ||
+        state.status != PeerConnectionStatus.connected ||
+        ws.closeCode != null) {
+      return null;
     }
 
     final msg = ChatTextMessage(
@@ -246,8 +300,64 @@ class WsConnectionService {
       sentAtMs: DateTime.now().millisecondsSinceEpoch,
     );
 
-    ws.add(msg.encode());
-    return true;
+    try {
+      ws.add(msg.encode());
+      return msg;
+    } catch (e) {
+      state.status = PeerConnectionStatus.disconnected;
+      state.error = e.toString();
+      onConnectionChanged?.call(peerId, state);
+      return null;
+    }
+  }
+
+  bool sendTyping(String peerId, {required bool isTyping}) {
+    final state = _connections[peerId];
+    final ws = state?.socket;
+    if (state == null ||
+        ws == null ||
+        state.status != PeerConnectionStatus.connected ||
+        ws.closeCode != null) {
+      return false;
+    }
+
+    try {
+      ws.add(
+        ChatTypingMessage(
+          fromUserId: identity.userId,
+          isTyping: isTyping,
+        ).encode(),
+      );
+      return true;
+    } catch (_) {
+      state.status = PeerConnectionStatus.disconnected;
+      onConnectionChanged?.call(peerId, state);
+      return false;
+    }
+  }
+
+  bool sendLeaveChat(String peerId) {
+    final state = _connections[peerId];
+    final ws = state?.socket;
+    if (state == null ||
+        ws == null ||
+        state.status != PeerConnectionStatus.connected ||
+        ws.closeCode != null) {
+      return false;
+    }
+
+    try {
+      ws.add(
+        ChatLeaveMessage(
+          fromUserId: identity.userId,
+        ).encode(),
+      );
+      return true;
+    } catch (_) {
+      state.status = PeerConnectionStatus.disconnected;
+      onConnectionChanged?.call(peerId, state);
+      return false;
+    }
   }
 
   Future<void> stopServer() async {

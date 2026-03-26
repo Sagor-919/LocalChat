@@ -32,6 +32,22 @@ sealed class WsMessage {
           displayName: map['name'] as String,
           version: (map['v'] as num?)?.toInt() ?? 1,
         );
+      case ConnectRejectMessage.typeValue:
+        return ConnectRejectMessage(
+          reason: map['reason'] as String? ?? 'Rejected',
+          version: (map['v'] as num?)?.toInt() ?? 1,
+        );
+      case ChatTypingMessage.typeValue:
+        return ChatTypingMessage(
+          fromUserId: map['from'] as String,
+          isTyping: (map['typing'] as bool?) ?? false,
+          version: (map['v'] as num?)?.toInt() ?? 1,
+        );
+      case ChatLeaveMessage.typeValue:
+        return ChatLeaveMessage(
+          fromUserId: map['from'] as String,
+          version: (map['v'] as num?)?.toInt() ?? 1,
+        );
       case ChatTextMessage.typeValue:
         return ChatTextMessage(
           messageId: map['mid'] as String,
@@ -99,6 +115,63 @@ class HelloAckMessage extends WsMessage {
         'type': typeValue,
         'id': userId,
         'name': displayName,
+        'v': version,
+      };
+}
+
+class ConnectRejectMessage extends WsMessage {
+  static const String typeValue = 'connect_reject';
+  final String reason;
+  final int version;
+
+  const ConnectRejectMessage({
+    required this.reason,
+    this.version = 1,
+  });
+
+  @override
+  Map<String, Object?> toJson() => {
+        'type': typeValue,
+        'reason': reason,
+        'v': version,
+      };
+}
+
+class ChatTypingMessage extends WsMessage {
+  static const String typeValue = 'chat_typing';
+  final String fromUserId;
+  final bool isTyping;
+  final int version;
+
+  const ChatTypingMessage({
+    required this.fromUserId,
+    required this.isTyping,
+    this.version = 1,
+  });
+
+  @override
+  Map<String, Object?> toJson() => {
+        'type': typeValue,
+        'from': fromUserId,
+        'typing': isTyping,
+        'v': version,
+      };
+}
+
+class ChatLeaveMessage extends WsMessage {
+  static const String typeValue = 'chat_leave';
+  final String fromUserId;
+  final int version;
+
+  const ChatLeaveMessage({
+    required this.fromUserId,
+    this.version = 1,
+  });
+
+  @override
+  Map<String, Object?> toJson() => {
+        'type': typeValue,
+        'from': fromUserId,
         'v': version,
       };
 }

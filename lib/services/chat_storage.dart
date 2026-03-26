@@ -6,6 +6,7 @@ import '../models/chat_message.dart';
 
 class ChatStorage {
   static const _keyPrefix = 'drivechat_chat_';
+  static const _readPrefix = 'drivechat_chat_read_';
   static const int _maxMessagesPerPeer = 300;
 
   final SharedPreferences _prefs;
@@ -18,6 +19,7 @@ class ChatStorage {
   }
 
   String _keyForPeer(String peerUserId) => '$_keyPrefix$peerUserId';
+  String _readKeyForPeer(String peerUserId) => '$_readPrefix$peerUserId';
 
   List<ChatMessage> loadMessages(String peerUserId) {
     final raw = _prefs.getString(_keyForPeer(peerUserId));
@@ -47,6 +49,24 @@ class ChatStorage {
 
     final encoded = jsonEncode(existing.map((m) => m.toJson()).toList());
     await _prefs.setString(_keyForPeer(peerUserId), encoded);
+  }
+
+  int getLastReadAtMs(String peerUserId) {
+    return _prefs.getInt(_readKeyForPeer(peerUserId)) ?? 0;
+  }
+
+  Future<void> setLastReadAtMs(String peerUserId, int tsMs) async {
+    await _prefs.setInt(_readKeyForPeer(peerUserId), tsMs);
+  }
+
+  int getUnreadCount(String peerUserId) {
+    final lastRead = getLastReadAtMs(peerUserId);
+    final messages = loadMessages(peerUserId);
+    var unread = 0;
+    for (final m in messages) {
+      if (!m.isMine && m.sentAtMs > lastRead) unread++;
+    }
+    return unread;
   }
 }
 

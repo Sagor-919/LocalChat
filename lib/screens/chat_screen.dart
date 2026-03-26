@@ -27,11 +27,21 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> {
   ChatStorage? _storage;
+  final List<ChatMessage> _allMessages = [];
   final List<ChatMessage> _messages = [];
+  static const int _pageSize = 30;
+  bool _loadingMore = false;
   final TextEditingController _composer = TextEditingController();
+  final FocusNode _composerFocus = FocusNode();
   final ScrollController _scroll = ScrollController();
 
   StreamSubscription? _messageSub;
+  Timer? _typingDebounce;
+  Timer? _typingStopTimer;
+  Timer? _typingKeepAlive;
+  bool _isTypingSent = false;
+  bool _peerTyping = false;
+  int? _peerLeftAtMs;
 
   bool _loading = true;
   String? _error;
@@ -39,6 +49,7 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void initState() {
     super.initState();
+    _composer.addListener(_onComposerChanged);
     _init();
   }
 
@@ -50,9 +61,16 @@ class _ChatScreenState extends State<ChatScreen> {
 
     try {
       _storage = await ChatStorage.create();
-      _messages
+      _allMessages
         ..clear()
         ..addAll(_storage!.loadMessages(widget.peer.userId));
+      _messages
+        ..clear()
+        ..addAll(_tail(_allMessages, _pageSize));
+      await _storage!.setLastReadAtMs(
+        widget.peer.userId,
+        DateTime.now().millisecondsSinceEpoch,
+      );
 
       _messageSub?.cancel();
       final connections = widget.connections;
@@ -60,6 +78,22 @@ class _ChatScreenState extends State<ChatScreen> {
       connections.onMessageReceived = (peerId, msg) {
         prevHandler?.call(peerId, msg);
         if (peerId != widget.peer.userId) return;
+        if (msg is ChatTypingMessage) {
+          if (!mounted) return;
+          setState(() {
+            _peerTyping = msg.isTyping && msg.fromUserId != widget.me.userId;
+            if (_peerTyping) _peerLeftAtMs = null;
+          });
+          return;
+        }
+        if (msg is ChatLeaveMessage) {
+          if (!mounted) return;
+          setState(() {
+            _peerTyping = false;
+            _peerLeftAtMs = DateTime.now().millisecondsSinceEpoch;
+          });
+          return;
+        }
         if (msg is! ChatTextMessage) return;
 
         final chat = ChatMessage(
@@ -73,11 +107,21 @@ class _ChatScreenState extends State<ChatScreen> {
         );
 
         unawaited(_storage?.appendMessage(widget.peer.userId, chat));
+        unawaited(
+          _storage?.setLastReadAtMs(
+            widget.peer.userId,
+            DateTime.now().millisecondsSinceEpoch,
+          ),
+        );
 
         if (!mounted) return;
+        final previousVisible = _messages.length;
         setState(() {
-          _messages.add(chat);
-          _messages.sort((a, b) => a.sentAtMs.compareTo(b.sentAtMs));
+          _allMessages.add(chat);
+          _allMessages.sort((a, b) => a.sentAtMs.compareTo(b.sentAtMs));
+          _messages
+            ..clear()
+            ..addAll(_tail(_allMessages, previousVisible + 1));
         });
         _scrollToBottomSoon();
       };
@@ -105,34 +149,118 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
+  Future<void> _loadMoreOlder() async {
+    if (_loadingMore) return;
+    if (_messages.length >= _allMessages.length) return;
+    if (!_scroll.hasClients) return;
+
+    setState(() => _loadingMore = true);
+
+    final previousMax = _scroll.position.maxScrollExtent;
+    final newCount = (_messages.length + _pageSize).clamp(0, _allMessages.length);
+
+    setState(() {
+      _messages
+        ..clear()
+        ..addAll(_tail(_allMessages, newCount));
+      _loadingMore = false;
+    });
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_scroll.hasClients) return;
+      final delta = _scroll.position.maxScrollExtent - previousMax;
+      if (delta > 0) {
+        _scroll.jumpTo(_scroll.position.pixels + delta);
+      }
+    });
+  }
+
+  String _formatTime(int tsMs) {
+    final dt = DateTime.fromMillisecondsSinceEpoch(tsMs);
+    final h = dt.hour.toString().padLeft(2, '0');
+    final m = dt.minute.toString().padLeft(2, '0');
+    return '$h:$m';
+  }
+
+  List<ChatMessage> _tail(List<ChatMessage> list, int n) {
+    if (n <= 0) return const [];
+    if (n >= list.length) return List<ChatMessage>.from(list);
+    final start = list.length - n;
+    return list.sublist(start);
+  }
+
+  void _onComposerChanged() {
+    final hasText = _composer.text.trim().isNotEmpty;
+
+    _typingDebounce?.cancel();
+    _typingDebounce = Timer(const Duration(milliseconds: 250), () {
+      if (!mounted) return;
+      if (hasText && !_isTypingSent) {
+        widget.connections.sendTyping(widget.peer.userId, isTyping: true);
+        _isTypingSent = true;
+        _typingKeepAlive?.cancel();
+        _typingKeepAlive = Timer.periodic(const Duration(seconds: 2), (_) {
+          widget.connections.sendTyping(widget.peer.userId, isTyping: true);
+        });
+      }
+      if (!hasText && _isTypingSent) {
+        widget.connections.sendTyping(widget.peer.userId, isTyping: false);
+        _isTypingSent = false;
+        _typingKeepAlive?.cancel();
+      }
+    });
+
+    _typingStopTimer?.cancel();
+    if (hasText) {
+      _typingStopTimer = Timer(const Duration(seconds: 4), () {
+        if (!mounted) return;
+        widget.connections.sendTyping(widget.peer.userId, isTyping: false);
+        _isTypingSent = false;
+        _typingKeepAlive?.cancel();
+      });
+    }
+  }
+
   Future<void> _send() async {
     final text = _composer.text.trim();
     if (text.isEmpty) return;
 
-    final ok = widget.connections.sendChatText(widget.peer.userId, text);
-    if (!ok) {
+    final sent = widget.connections.sendChatText(widget.peer.userId, text);
+    if (sent == null) {
       setState(() => _error = 'Not connected. Go back and reconnect.');
       return;
     }
 
     _composer.clear();
+    _composerFocus.requestFocus();
+    widget.connections.sendTyping(widget.peer.userId, isTyping: false);
+    _isTypingSent = false;
+    _typingKeepAlive?.cancel();
 
     // Also append locally immediately (optimistic UI).
     final local = ChatMessage(
-      messageId: DateTime.now().microsecondsSinceEpoch.toString(),
+      messageId: sent.messageId,
       peerUserId: widget.peer.userId,
       senderUserId: widget.me.userId,
       senderDisplayName: widget.me.displayName,
       text: text,
-      sentAtMs: DateTime.now().millisecondsSinceEpoch,
+      sentAtMs: sent.sentAtMs,
       isMine: true,
     );
     await _storage?.appendMessage(widget.peer.userId, local);
+    await _storage?.setLastReadAtMs(
+      widget.peer.userId,
+      DateTime.now().millisecondsSinceEpoch,
+    );
 
     if (!mounted) return;
+    final previousVisible = _messages.length;
     setState(() {
-      _messages.add(local);
-      _messages.sort((a, b) => a.sentAtMs.compareTo(b.sentAtMs));
+      _allMessages.add(local);
+      _allMessages.sort((a, b) => a.sentAtMs.compareTo(b.sentAtMs));
+      _messages
+        ..clear()
+        ..addAll(_tail(_allMessages, previousVisible + 1));
     });
     _scrollToBottomSoon();
   }
@@ -140,7 +268,13 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void dispose() {
     _messageSub?.cancel();
+    _typingDebounce?.cancel();
+    _typingStopTimer?.cancel();
+    _typingKeepAlive?.cancel();
+    widget.connections.sendLeaveChat(widget.peer.userId);
+    _composer.removeListener(_onComposerChanged);
     _composer.dispose();
+    _composerFocus.dispose();
     _scroll.dispose();
     super.dispose();
   }
@@ -185,12 +319,37 @@ class _ChatScreenState extends State<ChatScreen> {
             Expanded(
               child: _loading
                   ? const Center(child: CircularProgressIndicator())
-                  : ListView.builder(
-                      controller: _scroll,
-                      padding: const EdgeInsets.all(12),
-                      itemCount: _messages.length,
-                      itemBuilder: (context, index) {
-                        final m = _messages[index];
+                  : NotificationListener<ScrollNotification>(
+                      onNotification: (n) {
+                        if (n.metrics.pixels <= 24) {
+                          unawaited(_loadMoreOlder());
+                        }
+                        return false;
+                      },
+                      child: ListView.builder(
+                        controller: _scroll,
+                        padding: const EdgeInsets.all(12),
+                        itemCount: _messages.length + (_loadingMore ? 1 : 0),
+                        itemBuilder: (context, index) {
+                          if (_loadingMore && index == 0) {
+                            return const Padding(
+                              padding: EdgeInsets.symmetric(vertical: 8),
+                              child: Center(
+                                child: SizedBox(
+                                  height: 16,
+                                  width: 16,
+                                  child: CircularProgressIndicator(strokeWidth: 2),
+                                ),
+                              ),
+                            );
+                          }
+
+                          final actualIndex = _loadingMore ? index - 1 : index;
+                          if (actualIndex < 0 || actualIndex >= _messages.length) {
+                            return const SizedBox.shrink();
+                          }
+
+                        final m = _messages[actualIndex];
                         final isMine = m.isMine;
 
                         return Align(
@@ -238,25 +397,85 @@ class _ChatScreenState extends State<ChatScreen> {
                                     height: 1.25,
                                   ),
                                 ),
+                                const SizedBox(height: 4),
+                                Align(
+                                  alignment: Alignment.centerRight,
+                                  child: Text(
+                                    _formatTime(m.sentAtMs),
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w600,
+                                      color: (isMine
+                                              ? Theme.of(context)
+                                                  .colorScheme
+                                                  .onPrimary
+                                              : Theme.of(context)
+                                                  .colorScheme
+                                                  .onSurfaceVariant)
+                                          .withValues(alpha: 0.72),
+                                    ),
+                                  ),
+                                ),
                               ],
                             ),
                           ),
                         );
-                      },
+                        },
+                      ),
                     ),
             ),
+            if (_peerTyping)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    '${widget.peer.displayName} is typing…',
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
+                          fontWeight: FontWeight.w600,
+                        ),
+                  ),
+                ),
+              ),
+            if (!_peerTyping && _peerLeftAtMs != null)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    '${widget.peer.displayName} left the chat',
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
+                          fontWeight: FontWeight.w600,
+                        ),
+                  ),
+                ),
+              ),
             Padding(
-              padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+              padding: const EdgeInsets.fromLTRB(12, 6, 12, 12),
               child: Row(
                 children: [
                   Expanded(
                     child: TextField(
                       controller: _composer,
+                      focusNode: _composerFocus,
                       textInputAction: TextInputAction.send,
                       onSubmitted: (_) => _send(),
-                      decoration: const InputDecoration(
+                      decoration: InputDecoration(
                         hintText: 'Message',
-                        border: OutlineInputBorder(),
+                        filled: true,
+                        fillColor: Theme.of(context)
+                            .colorScheme
+                            .surfaceContainerHighest,
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(999),
+                          borderSide: BorderSide.none,
+                        ),
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 12,
+                        ),
                       ),
                     ),
                   ),

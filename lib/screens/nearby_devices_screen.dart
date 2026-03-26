@@ -2,27 +2,24 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import '../app_services.dart';
 import '../models/peer_device.dart';
 import '../screens/chat_screen.dart';
-import '../services/device_identity.dart';
-import '../services/mdns_presence_service.dart';
 import '../services/ws_connection_service.dart';
 
 class NearbyDevicesScreen extends StatefulWidget {
-  const NearbyDevicesScreen({super.key});
+  final AppServices services;
+
+  const NearbyDevicesScreen({
+    super.key,
+    required this.services,
+  });
 
   @override
   State<NearbyDevicesScreen> createState() => _NearbyDevicesScreenState();
 }
 
 class _NearbyDevicesScreenState extends State<NearbyDevicesScreen> {
-  static const int kPhase1WebSocketPort = 4040;
-
-  DeviceIdentityRepository? _identityRepo;
-  DeviceIdentity? _identity;
-  MdnsPresenceService? _presence;
-  WsConnectionService? _connections;
-
   final Map<String, PeerDevice> _peersById = {};
   Timer? _pollTimer;
 
@@ -32,6 +29,7 @@ class _NearbyDevicesScreenState extends State<NearbyDevicesScreen> {
   bool _loading = true;
   String? _error;
   String _status = 'Starting...';
+  bool _showingConsent = false;
 
   static const Duration _discoverTimeout = Duration(seconds: 2);
   static const Duration _pollInterval = Duration(seconds: 2);
@@ -51,34 +49,27 @@ class _NearbyDevicesScreenState extends State<NearbyDevicesScreen> {
     });
 
     try {
-      _identityRepo = await DeviceIdentityRepository.create();
-      _identity = await _identityRepo!.loadOrCreate();
-      _displayNameController.text = _identity!.displayName;
-
-      _connections = WsConnectionService(
-        identity: _identity!,
-        listenPort: kPhase1WebSocketPort,
-        onConnectionChanged: (_, _) {
-          if (!mounted) return;
-          setState(() {});
-        },
-      );
-      await _connections!.startServer();
-
-      _presence = MdnsPresenceService(
-        identity: _identity!,
-        websocketPort: kPhase1WebSocketPort,
-      );
-
-      _status = 'Advertising on local network...';
-      try {
-        await _presence!.startAdvertising();
-        _status = 'Searching nearby devices...';
-      } catch (e) {
-        // Advertising may fail due to OS permissions; discovery can still work.
-        _error = 'Advertising failed: $e';
-        _status = 'Searching nearby devices (advertising disabled)...';
+      final me = widget.services.identity;
+      final presence = widget.services.presence;
+      final connections = widget.services.connections;
+      if (me == null || presence == null || connections == null) {
+        throw StateError('App services not started.');
       }
+      _displayNameController.text = me.displayName;
+
+      connections.onConnectionChanged = (_, _) {
+        if (!mounted) return;
+        setState(() {});
+      };
+      connections.onIncomingConnectionRequested = (peerId, state) {
+        if (!mounted) return;
+        final peer = state.peer;
+        if (_showingConsent) return;
+        _showingConsent = true;
+        unawaited(_promptIncoming(peerId, peer));
+      };
+
+      _status = 'Searching nearby devices...';
 
       // First discovery immediately.
       await _pollOnce();
@@ -95,12 +86,14 @@ class _NearbyDevicesScreenState extends State<NearbyDevicesScreen> {
   }
 
   Future<void> _pollOnce() async {
-    if (_presence == null || _identity == null) return;
+    final presence = widget.services.presence;
+    final me = widget.services.identity;
+    if (presence == null || me == null) return;
 
     final now = DateTime.now();
 
     try {
-      final discovered = await _presence!.discoverOnce(
+      final discovered = await presence.discoverOnce(
         timeout: _discoverTimeout,
       );
 
@@ -127,44 +120,69 @@ class _NearbyDevicesScreenState extends State<NearbyDevicesScreen> {
   }
 
   Future<void> _saveDisplayName() async {
-    final repo = _identityRepo;
-    final presence = _presence;
-    if (repo == null || presence == null || _identity == null) return;
-
     final newName = _displayNameController.text.trim();
     if (newName.isEmpty) return;
 
-    await repo.setDisplayName(newName);
-    final updatedIdentity = await repo.loadOrCreate();
-
-    // Restart mDNS advertising to update TXT record values.
-    try {
-      await presence.stopAdvertising();
-    } catch (_) {
-      // ignore; we'll try restarting anyway.
-    }
-
-    _identity = updatedIdentity;
-    _presence = MdnsPresenceService(
-      identity: _identity!,
-      websocketPort: kPhase1WebSocketPort,
-    );
-
-    await _presence!.startAdvertising();
+    await widget.services.setDisplayName(newName);
     await _pollOnce();
   }
 
   @override
   void dispose() {
     _pollTimer?.cancel();
-    _presence?.close();
-    _connections?.close();
     _displayNameController.dispose();
     super.dispose();
   }
 
+  Future<void> _promptIncoming(String peerId, PeerDevice peer) async {
+    if (!mounted) return;
+    final connections = widget.services.connections;
+    final me = widget.services.identity;
+    if (connections == null || me == null) return;
+
+    final accepted = await showDialog<bool>(
+          context: context,
+          barrierDismissible: false,
+          builder: (ctx) {
+            return AlertDialog(
+              title: const Text('Connection request'),
+              content: Text('${peer.displayName} wants to chat with you.'),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(ctx).pop(false),
+                  child: const Text('Decline'),
+                ),
+                ElevatedButton(
+                  onPressed: () => Navigator.of(ctx).pop(true),
+                  child: const Text('Accept'),
+                ),
+              ],
+            );
+          },
+        ) ??
+        false;
+
+    _showingConsent = false;
+    if (!mounted) return;
+
+    if (accepted) {
+      connections.acceptIncoming(peerId);
+      await Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => ChatScreen(
+            me: me,
+            peer: peer,
+            connections: connections,
+          ),
+        ),
+      );
+    } else {
+      connections.rejectIncoming(peerId);
+    }
+  }
+
   Future<void> _connectTo(PeerDevice peer) async {
-    final connections = _connections;
+    final connections = widget.services.connections;
     if (connections == null) return;
 
     setState(() {
@@ -178,11 +196,12 @@ class _NearbyDevicesScreenState extends State<NearbyDevicesScreen> {
       _status = 'Searching nearby devices...';
     });
 
-    if (state.status == PeerConnectionStatus.connected && _identity != null) {
+    final me = widget.services.identity;
+    if (state.status == PeerConnectionStatus.connected && me != null) {
       await Navigator.of(context).push(
         MaterialPageRoute(
           builder: (_) => ChatScreen(
-            me: _identity!,
+            me: me,
             peer: peer,
             connections: connections,
           ),
@@ -192,7 +211,7 @@ class _NearbyDevicesScreenState extends State<NearbyDevicesScreen> {
   }
 
   Widget _statusChipForPeer(PeerDevice peer) {
-    final state = _connections?.getConnection(peer.userId);
+    final state = widget.services.connections?.getConnection(peer.userId);
     final status = state?.status ?? PeerConnectionStatus.disconnected;
 
     Color bg;
@@ -209,6 +228,11 @@ class _NearbyDevicesScreenState extends State<NearbyDevicesScreen> {
         bg = Colors.blue.withValues(alpha: 0.12);
         fg = Colors.blue.shade800;
         label = 'Connecting';
+        break;
+      case PeerConnectionStatus.incomingRequest:
+        bg = Colors.orange.withValues(alpha: 0.12);
+        fg = Colors.orange.shade900;
+        label = 'Request';
         break;
       case PeerConnectionStatus.failed:
         bg = Colors.red.withValues(alpha: 0.12);
@@ -233,6 +257,28 @@ class _NearbyDevicesScreenState extends State<NearbyDevicesScreen> {
         style: TextStyle(
           color: fg,
           fontWeight: FontWeight.w600,
+          fontSize: 12,
+        ),
+      ),
+    );
+  }
+
+  Widget _unreadBadge(PeerDevice peer) {
+    final unread = widget.services.chatStorage?.getUnreadCount(peer.userId) ?? 0;
+    if (unread <= 0) return const SizedBox.shrink();
+
+    return Container(
+      margin: const EdgeInsets.only(right: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.primary,
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Text(
+        unread > 99 ? '99+' : unread.toString(),
+        style: TextStyle(
+          color: Theme.of(context).colorScheme.onPrimary,
+          fontWeight: FontWeight.w800,
           fontSize: 12,
         ),
       ),
@@ -296,8 +342,10 @@ class _NearbyDevicesScreenState extends State<NearbyDevicesScreen> {
             else
               ...peers.map(
                 (peer) {
-                  final state = _connections?.getConnection(peer.userId);
-                  final status = state?.status ?? PeerConnectionStatus.disconnected;
+                  final state =
+                      widget.services.connections?.getConnection(peer.userId);
+                  final status =
+                      state?.status ?? PeerConnectionStatus.disconnected;
 
                   return Card(
                     elevation: 0,
@@ -356,6 +404,7 @@ class _NearbyDevicesScreenState extends State<NearbyDevicesScreen> {
                               ),
                             ),
                             const SizedBox(width: 10),
+                            _unreadBadge(peer),
                             _statusChipForPeer(peer),
                           ],
                         ),
