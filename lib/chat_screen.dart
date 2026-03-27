@@ -5,15 +5,16 @@ import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:uuid/uuid.dart';
 
 import 'connection_service.dart';
 import 'device.dart';
-import 'file_transfer_service.dart';
 import 'message_model.dart';
 import 'message_store.dart';
+import 'transfer_manager.dart';
 
 class ChatScreen extends StatefulWidget {
   final DeviceInfo me;
@@ -45,12 +46,13 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _connected = false;
   bool _loading = true;
 
-  final Map<String, _TransferState> _transfers = {};
-  FileReceiver? _fileReceiver;
-
   final List<_StagedFile> _staged = [];
 
+  StreamSubscription<void>? _transferSub;
+  StreamSubscription<FileMessageEvent>? _fileMsgSub;
+
   String get _peerId => widget.peer.userId;
+  TransferManager get _tm => TransferManager.instance;
 
   @override
   void initState() {
@@ -72,8 +74,27 @@ class _ChatScreenState extends State<ChatScreen> {
       }
     };
 
+    _transferSub = _tm.transferUpdates.listen((_) {
+      if (mounted) setState(() {});
+    });
+
+    _fileMsgSub = _tm.fileMessages.listen((event) {
+      if (event.peerId != _peerId) return;
+      if (!mounted) return;
+      if (_messages.any((m) => m.id == event.message.id)) {
+        // Update existing message (e.g. attachmentPath set on completion)
+        final idx =
+            _messages.indexWhere((m) => m.id == event.message.id);
+        if (idx >= 0) {
+          setState(() => _messages[idx] = event.message);
+        }
+      } else {
+        setState(() => _messages.add(event.message));
+      }
+      _scrollToBottom();
+    });
+
     if (!_connected) _connect();
-    _startFileReceiver();
     _loadHistory();
   }
 
@@ -94,84 +115,12 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  Future<void> _startFileReceiver() async {
-    _fileReceiver = FileReceiver();
-    _fileReceiver!.onFileStarted = (fileId, fileName, fileSize) {
-      if (!mounted) return;
-      final msg = ChatMessage(
-        id: fileId,
-        senderId: _peerId,
-        text: 'File: $fileName',
-        timestamp: DateTime.now().millisecondsSinceEpoch,
-        isMine: false,
-        attachmentName: fileName,
-        attachmentSize: fileSize,
-      );
-      setState(() {
-        _transfers[fileId] = _TransferState(
-          fileId: fileId,
-          fileName: fileName,
-          totalBytes: fileSize,
-          isSending: false,
-        );
-        _messages.add(msg);
-      });
-      widget.store.add(_peerId, msg);
-      _scrollToBottom();
-    };
-    _fileReceiver!.onProgress = (received, total) {
-      if (!mounted) return;
-      final t = _transfers.values
-          .where((t) => !t.isSending && t.totalBytes == total)
-          .firstOrNull;
-      if (t == null) return;
-      setState(() {
-        t.transferredBytes = received;
-        t.progress = total == 0 ? 0 : received / total;
-      });
-    };
-    _fileReceiver!.onFileComplete = (fileId, savedPath) {
-      if (!mounted) return;
-      setState(() {
-        _transfers.remove(fileId);
-        final idx = _messages.indexWhere((m) => m.id == fileId);
-        if (idx >= 0) {
-          final old = _messages[idx];
-          _messages[idx] = ChatMessage(
-            id: old.id,
-            senderId: old.senderId,
-            text: old.text,
-            timestamp: old.timestamp,
-            isMine: old.isMine,
-            attachmentName: old.attachmentName,
-            attachmentPath: savedPath,
-            attachmentSize: old.attachmentSize,
-          );
-        }
-      });
-      widget.store.updateAttachmentPath(_peerId, fileId, savedPath);
-    };
-    _fileReceiver!.onFileError = (fileId, error) {
-      if (!mounted) return;
-      setState(() {
-        final t = _transfers[fileId];
-        if (t != null) t.error = error;
-      });
-    };
-
-    try {
-      await _fileReceiver!.startServer();
-    } catch (_) {}
-  }
-
   @override
   void dispose() {
     widget.connections.onMessage = _prevOnMessage;
     widget.connections.onDisconnected = _prevOnDisconnected;
-    for (final t in _transfers.values) {
-      t.sender?.cancel();
-    }
-    _fileReceiver?.stop();
+    _transferSub?.cancel();
+    _fileMsgSub?.cancel();
     _input.dispose();
     _focus.dispose();
     _scroll.dispose();
@@ -226,16 +175,22 @@ class _ChatScreenState extends State<ChatScreen> {
         Offset.zero & overlay.size,
       ),
       items: const [
-        PopupMenuItem(value: 'files', child: ListTile(
-          leading: Icon(Icons.description),
-          title: Text('Select Files'),
-          dense: true, visualDensity: VisualDensity.compact,
-        )),
-        PopupMenuItem(value: 'folder', child: ListTile(
-          leading: Icon(Icons.folder),
-          title: Text('Select Folder'),
-          dense: true, visualDensity: VisualDensity.compact,
-        )),
+        PopupMenuItem(
+            value: 'files',
+            child: ListTile(
+              leading: Icon(Icons.description),
+              title: Text('Select Files'),
+              dense: true,
+              visualDensity: VisualDensity.compact,
+            )),
+        PopupMenuItem(
+            value: 'folder',
+            child: ListTile(
+              leading: Icon(Icons.folder),
+              title: Text('Select Folder'),
+              dense: true,
+              visualDensity: VisualDensity.compact,
+            )),
       ],
     ).then((value) {
       if (value == 'files') _pickDesktopFiles();
@@ -274,18 +229,16 @@ class _ChatScreenState extends State<ChatScreen> {
     final picker = ImagePicker();
     final images = await picker.pickMultiImage(limit: 20);
     if (images.isEmpty) return;
-    _stageFiles(
-        images.map((x) => _StagedFile(x.path, x.name)).toList());
+    _stageFiles(images.map((x) => _StagedFile(x.path, x.name)).toList());
   }
 
   void _onDropDone(DropDoneDetails details) {
-    _stageFiles(details.files
-        .map((x) => _StagedFile(x.path, x.name))
-        .toList());
+    _stageFiles(
+        details.files.map((x) => _StagedFile(x.path, x.name)).toList());
   }
 
   // -----------------------------------------------------------------------
-  // Send — text + all staged files
+  // Send — text + all staged files via TransferManager
   // -----------------------------------------------------------------------
   void _sendAll() {
     final text = _input.text.trim();
@@ -325,93 +278,22 @@ class _ChatScreenState extends State<ChatScreen> {
     final fileId = _uuid.v4();
     final fileSize = await File(filePath).length();
 
-    final msg = ChatMessage(
-      id: fileId,
-      senderId: widget.me.userId,
-      text: 'File: $fileName',
-      timestamp: DateTime.now().millisecondsSinceEpoch,
-      isMine: true,
-      attachmentName: fileName,
-      attachmentPath: filePath,
-      attachmentSize: fileSize,
-    );
-
-    final transfer = _TransferState(
+    await _tm.sendFile(
+      peerId: _peerId,
+      peerIp: widget.peer.ip,
       fileId: fileId,
       fileName: fileName,
-      totalBytes: fileSize,
-      isSending: true,
+      filePath: filePath,
+      fileSize: fileSize,
     );
-
-    setState(() {
-      _messages.add(msg);
-      _transfers[fileId] = transfer;
-    });
-    widget.store.add(_peerId, msg);
-    _scrollToBottom();
-
-    widget.connections.sendJson(_peerId, {
-      'type': 'file_notify',
-      'id': fileId,
-      'name': fileName,
-      'size': fileSize,
-    });
-
-    unawaited(_runSend(transfer, filePath, fileSize));
-  }
-
-  Future<void> _runSend(
-      _TransferState t, String filePath, int fileSize) async {
-    final sender = FileSender();
-    t.sender = sender;
-
-    try {
-      await sender.send(
-        host: widget.peer.ip,
-        fileId: t.fileId,
-        fileName: t.fileName,
-        fileSize: fileSize,
-        file: File(filePath),
-        onProgress: (sent, total) {
-          if (!mounted) return;
-          setState(() {
-            t.transferredBytes = sent;
-            t.progress = total == 0 ? 0 : sent / total;
-          });
-        },
-      );
-
-      if (!mounted) return;
-      setState(() => _transfers.remove(t.fileId));
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => t.error = e.toString());
-    }
   }
 
   void _cancelTransfer(String fileId) {
-    final t = _transfers[fileId];
-    if (t == null) return;
-    t.sender?.cancel();
-    _fileReceiver?.cancel();
-    setState(() => _transfers.remove(fileId));
+    _tm.cancel(fileId);
   }
 
   void _retryTransfer(String fileId) {
-    final t = _transfers[fileId];
-    if (t == null || !t.isSending) return;
-
-    final msg = _messages.where((m) => m.id == fileId).firstOrNull;
-    final filePath = msg?.attachmentPath;
-    if (filePath == null) return;
-
-    t.error = null;
-    t.transferredBytes = 0;
-    t.progress = 0;
-    t.stopwatch.reset();
-    t.stopwatch.start();
-    setState(() {});
-    unawaited(_runSend(t, filePath, t.totalBytes));
+    _tm.retry(fileId);
   }
 
   void _openFolder(String filePath) {
@@ -421,6 +303,36 @@ class _ChatScreenState extends State<ChatScreen> {
       final dir = File(filePath).parent.path;
       OpenFilex.open(dir);
     }
+  }
+
+  // -----------------------------------------------------------------------
+  // Clear chat
+  // -----------------------------------------------------------------------
+  void _confirmClearChat() {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Clear Chat'),
+        content:
+            const Text('Delete all messages in this conversation? This cannot be undone.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () async {
+              Navigator.pop(ctx);
+              await widget.store.clear(_peerId);
+              if (mounted) setState(() => _messages.clear());
+            },
+            style: FilledButton.styleFrom(
+                backgroundColor: Theme.of(context).colorScheme.error),
+            child: const Text('Clear'),
+          ),
+        ],
+      ),
+    );
   }
 
   // -----------------------------------------------------------------------
@@ -511,6 +423,24 @@ class _ChatScreenState extends State<ChatScreen> {
     return Scaffold(
       appBar: AppBar(
         title: Text(widget.peer.name),
+        actions: [
+          PopupMenuButton<String>(
+            onSelected: (value) {
+              if (value == 'clear') _confirmClearChat();
+            },
+            itemBuilder: (_) => const [
+              PopupMenuItem(
+                value: 'clear',
+                child: ListTile(
+                  leading: Icon(Icons.delete_sweep),
+                  title: Text('Clear Chat'),
+                  dense: true,
+                  visualDensity: VisualDensity.compact,
+                ),
+              ),
+            ],
+          ),
+        ],
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(24),
           child: Padding(
@@ -667,8 +597,7 @@ class _ChatScreenState extends State<ChatScreen> {
                         top: -6,
                         right: -6,
                         child: GestureDetector(
-                          onTap: () =>
-                              setState(() => _staged.removeAt(i)),
+                          onTap: () => setState(() => _staged.removeAt(i)),
                           child: Container(
                             width: 20,
                             height: 20,
@@ -676,8 +605,8 @@ class _ChatScreenState extends State<ChatScreen> {
                               shape: BoxShape.circle,
                               color: cs.error,
                             ),
-                            child: Icon(Icons.close,
-                                size: 12, color: cs.onError),
+                            child:
+                                Icon(Icons.close, size: 12, color: cs.onError),
                           ),
                         ),
                       ),
@@ -693,16 +622,47 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   // -----------------------------------------------------------------------
-  // Bubbles
+  // Bubbles — reads transfer state from TransferManager
   // -----------------------------------------------------------------------
+  void _copyMessage(ChatMessage m) {
+    final text = m.attachmentName != null ? m.attachmentName! : m.text;
+    Clipboard.setData(ClipboardData(text: text));
+    if (mounted) {
+      ScaffoldMessenger.of(context)
+        ..clearSnackBars()
+        ..showSnackBar(const SnackBar(
+          content: Text('Copied to clipboard'),
+          duration: Duration(seconds: 1),
+          behavior: SnackBarBehavior.floating,
+        ));
+    }
+  }
+
+  void _showCopyMenu(BuildContext context, Offset position, ChatMessage m) {
+    showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+          position.dx, position.dy, position.dx, position.dy),
+      items: const [
+        PopupMenuItem(value: 'copy', child: Text('Copy')),
+      ],
+    ).then((value) {
+      if (value == 'copy') _copyMessage(m);
+    });
+  }
+
   Widget _buildBubble(BuildContext context, ChatMessage m) {
     final cs = Theme.of(context).colorScheme;
     final mine = m.isMine;
-    final t = _transfers[m.id];
+    final t = _tm.transfers[m.id];
 
     return Align(
       alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
-      child: Container(
+      child: GestureDetector(
+        onLongPress: () => _copyMessage(m),
+        onSecondaryTapUp: (details) =>
+            _showCopyMenu(context, details.globalPosition, m),
+        child: Container(
         constraints: const BoxConstraints(maxWidth: 520),
         margin: const EdgeInsets.symmetric(vertical: 3),
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
@@ -776,6 +736,7 @@ class _ChatScreenState extends State<ChatScreen> {
           ],
         ),
       ),
+      ),
     );
   }
 
@@ -799,7 +760,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final cs = Theme.of(context).colorScheme;
     final hasPath = m.attachmentPath != null;
     final isImg = hasPath && _isImage(m.attachmentName!);
-    final isTransferring = _transfers.containsKey(m.id);
+    final isTransferring = _tm.transfers.containsKey(m.id);
     final fgColor = mine ? cs.onPrimary : cs.onSurface;
     final subtleColor =
         (mine ? cs.onPrimary : cs.onSurfaceVariant).withValues(alpha: 0.7);
@@ -968,31 +929,4 @@ class _StagedFile {
   final String path;
   final String name;
   const _StagedFile(this.path, this.name);
-}
-
-// ---------------------------------------------------------------------------
-class _TransferState {
-  final String fileId;
-  final String fileName;
-  final int totalBytes;
-  final bool isSending;
-
-  int transferredBytes = 0;
-  double progress = 0;
-  String? error;
-  FileSender? sender;
-  final Stopwatch stopwatch = Stopwatch()..start();
-
-  _TransferState({
-    required this.fileId,
-    required this.fileName,
-    required this.totalBytes,
-    required this.isSending,
-  });
-
-  double get currentSpeed {
-    final elapsed = stopwatch.elapsedMilliseconds;
-    if (elapsed < 300 || transferredBytes == 0) return 0;
-    return transferredBytes / (elapsed / 1000);
-  }
 }

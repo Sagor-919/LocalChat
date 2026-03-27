@@ -47,6 +47,47 @@ class MessageStore {
   }
 
   File _file(String peerId) => File('$_basePath/$peerId.json');
+  File get _peersFile => File('$_basePath/_peers.json');
+
+  // ---------------------------------------------------------------------------
+  // Peer metadata cache — persists name/ip/port so offline peers still show up
+  // ---------------------------------------------------------------------------
+  Future<void> savePeerInfo(
+      String peerId, String name, String ip, int port) async {
+    final all = await _loadPeersMap();
+    all[peerId] = {'name': name, 'ip': ip, 'port': port};
+    await _peersFile.writeAsString(jsonEncode(all));
+  }
+
+  Future<Map<String, Map<String, dynamic>>> loadAllPeerInfos() async {
+    return _loadPeersMap();
+  }
+
+  Future<Map<String, Map<String, dynamic>>> _loadPeersMap() async {
+    final f = _peersFile;
+    if (!await f.exists()) return {};
+    try {
+      final raw = await f.readAsString();
+      final decoded = jsonDecode(raw) as Map<String, dynamic>;
+      return decoded
+          .map((k, v) => MapEntry(k, Map<String, dynamic>.from(v as Map)));
+    } catch (_) {
+      return {};
+    }
+  }
+
+  Future<List<String>> listPeerIds() async {
+    final dir = Directory(_basePath);
+    if (!await dir.exists()) return [];
+    final ids = <String>[];
+    await for (final f in dir.list()) {
+      if (f is! File) continue;
+      final name = f.path.split(Platform.pathSeparator).last;
+      if (name.startsWith('_') || !name.endsWith('.json')) continue;
+      ids.add(name.replaceAll('.json', ''));
+    }
+    return ids;
+  }
 
   Future<List<ChatMessage>> load(String peerId) async {
     return _withLock(peerId, () async {
@@ -111,6 +152,13 @@ class MessageStore {
       await for (final f in dir.list()) {
         if (f is File) await f.delete();
       }
+    }
+  }
+
+  Future<void> removePeerInfo(String peerId) async {
+    final all = await _loadPeersMap();
+    if (all.remove(peerId) != null) {
+      await _peersFile.writeAsString(jsonEncode(all));
     }
   }
 }

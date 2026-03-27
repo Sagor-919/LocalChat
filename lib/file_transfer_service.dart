@@ -35,10 +35,8 @@ class FileSender {
       socket.write('$header\n');
       await socket.flush();
 
-      // Wait for START
       await _waitForStart(socket);
 
-      // Stream file bytes
       final raf = await file.open();
       try {
         bytesSent = 0;
@@ -61,7 +59,9 @@ class FileSender {
 
       await socket.close();
     } catch (_) {
-      try { await socket.close(); } catch (_) {}
+      try {
+        await socket.close();
+      } catch (_) {}
       rethrow;
     }
   }
@@ -77,7 +77,9 @@ class FileSender {
         buf.write(utf8.decode(data, allowMalformed: true));
         if (buf.toString().contains('START')) c.complete();
       },
-      onError: (Object e) { if (!c.isCompleted) c.completeError(e); },
+      onError: (Object e) {
+        if (!c.isCompleted) c.completeError(e);
+      },
       onDone: () {
         if (!c.isCompleted) {
           c.completeError(const SocketException('Closed before START'));
@@ -96,21 +98,22 @@ class FileSender {
 
 // ---------------------------------------------------------------------------
 // Receiver — TCP server accepts socket, reads header, sends START, writes file
+// Concurrent-safe: each _receiveFile call uses local state only.
 // ---------------------------------------------------------------------------
 class FileReceiver {
   ServerSocket? _server;
-  bool _cancelled = false;
-  int bytesReceived = 0;
+  final Set<String> _cancelledIds = {};
 
   void Function(String fileId, String fileName, int fileSize)? onFileStarted;
-  void Function(int received, int total)? onProgress;
+  void Function(String fileId, int received, int total)? onProgress;
   void Function(String fileId, String savedPath)? onFileComplete;
   void Function(String fileId, String error)? onFileError;
 
-  void cancel() => _cancelled = true;
+  void cancelReceive(String fileId) => _cancelledIds.add(fileId);
 
   Future<void> startServer() async {
-    _server = await ServerSocket.bind(InternetAddress.anyIPv4, kFileTransferPort);
+    _server =
+        await ServerSocket.bind(InternetAddress.anyIPv4, kFileTransferPort);
     _server!.listen(_handleSocket);
   }
 
@@ -127,6 +130,7 @@ class FileReceiver {
     bool setupDone = false;
     RandomAccessFile? raf;
     int totalBytes = 0;
+    int received = 0;
     String fileId = '';
 
     late StreamSubscription<List<int>> sub;
@@ -134,7 +138,6 @@ class FileReceiver {
       (data) async {
         if (done.isCompleted) return;
 
-        // Phase 1: read header
         if (!headerDone) {
           headerBuf.write(utf8.decode(data, allowMalformed: true));
           final content = headerBuf.toString();
@@ -142,8 +145,8 @@ class FileReceiver {
           if (nl >= 0) {
             headerDone = true;
             try {
-              final json = jsonDecode(content.substring(0, nl))
-                  as Map<String, dynamic>;
+              final json =
+                  jsonDecode(content.substring(0, nl)) as Map<String, dynamic>;
               headerCompleter.complete(json);
             } catch (e) {
               headerCompleter.completeError(e);
@@ -153,31 +156,36 @@ class FileReceiver {
           return;
         }
 
-        // Phase 2: write file data
         if (!setupDone) return;
 
-        if (_cancelled) {
-          if (!done.isCompleted) done.completeError(const _CancelledException());
+        if (_cancelledIds.contains(fileId)) {
+          if (!done.isCompleted) {
+            done.completeError(const _CancelledException());
+          }
           return;
         }
 
         sub.pause();
         try {
           await raf!.writeFrom(data);
-          bytesReceived += data.length;
-          onProgress?.call(bytesReceived, totalBytes);
+          received += data.length;
+          onProgress?.call(fileId, received, totalBytes);
         } finally {
           if (!done.isCompleted) sub.resume();
         }
       },
-      onDone: () { if (!done.isCompleted) done.complete(); },
-      onError: (Object e) { if (!done.isCompleted) done.completeError(e); },
+      onDone: () {
+        if (!done.isCompleted) done.complete();
+      },
+      onError: (Object e) {
+        if (!done.isCompleted) done.completeError(e);
+      },
       cancelOnError: true,
     );
 
     try {
-      final header = await headerCompleter.future
-          .timeout(const Duration(seconds: 8));
+      final header =
+          await headerCompleter.future.timeout(const Duration(seconds: 8));
 
       fileId = header['id'] as String? ?? '';
       final fileName = header['name'] as String? ?? 'file';
@@ -191,9 +199,8 @@ class FileReceiver {
       raf = await saveFile.open(mode: FileMode.write);
 
       onFileStarted?.call(fileId, fileName, totalBytes);
-      bytesReceived = 0;
+      received = 0;
 
-      // Tell sender to start streaming
       socket.write('START\n');
       await socket.flush();
 
@@ -205,18 +212,27 @@ class FileReceiver {
       await raf.close();
       raf = null;
 
-      if (bytesReceived >= totalBytes) {
+      _cancelledIds.remove(fileId);
+
+      if (received >= totalBytes) {
         onFileComplete?.call(fileId, savePath);
       } else {
-        onFileError?.call(fileId,
-            'Incomplete: $bytesReceived/$totalBytes bytes');
+        onFileError?.call(
+            fileId, 'Incomplete: $received/$totalBytes bytes');
       }
     } catch (e) {
+      _cancelledIds.remove(fileId);
       onFileError?.call(fileId, e.toString());
     } finally {
-      try { await sub.cancel(); } catch (_) {}
-      try { await raf?.close(); } catch (_) {}
-      try { await socket.close(); } catch (_) {}
+      try {
+        await sub.cancel();
+      } catch (_) {}
+      try {
+        await raf?.close();
+      } catch (_) {}
+      try {
+        await socket.close();
+      } catch (_) {}
     }
   }
 

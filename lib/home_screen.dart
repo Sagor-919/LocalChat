@@ -28,11 +28,20 @@ class _HomeScreenState extends State<HomeScreen> {
   final Map<String, int> _unread = {};
   void Function(String, Map<String, dynamic>)? _prevOnMessage;
 
+  List<_PeerEntry> _peerList = [];
+
   @override
   void initState() {
     super.initState();
+    _refreshPeerList();
+
     widget.discovery.onPeersChanged = () {
-      if (mounted) setState(() {});
+      if (mounted) {
+        for (final p in widget.discovery.peers) {
+          widget.store.savePeerInfo(p.userId, p.name, p.ip, p.port);
+        }
+        _refreshPeerList();
+      }
     };
 
     _prevOnMessage = widget.connections.onMessage;
@@ -44,6 +53,43 @@ class _HomeScreenState extends State<HomeScreen> {
         }
       }
     };
+  }
+
+  Future<void> _refreshPeerList() async {
+    final onlinePeers = widget.discovery.peers;
+    final onlineIds = onlinePeers.map((p) => p.userId).toSet();
+
+    final storedInfos = await widget.store.loadAllPeerInfos();
+    final storedPeerIds = await widget.store.listPeerIds();
+    final offlineIds =
+        storedPeerIds.where((id) => !onlineIds.contains(id)).toSet();
+
+    final list = <_PeerEntry>[];
+
+    for (final p in onlinePeers) {
+      list.add(_PeerEntry(
+        userId: p.userId,
+        name: p.name,
+        ip: p.ip,
+        port: p.port,
+        online: true,
+        peer: p,
+      ));
+    }
+
+    for (final id in offlineIds) {
+      final info = storedInfos[id];
+      if (info == null) continue;
+      list.add(_PeerEntry(
+        userId: id,
+        name: info['name'] as String? ?? 'Unknown',
+        ip: info['ip'] as String? ?? '',
+        port: (info['port'] as num?)?.toInt() ?? 4041,
+        online: false,
+      ));
+    }
+
+    if (mounted) setState(() => _peerList = list);
   }
 
   @override
@@ -127,7 +173,6 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final peers = widget.discovery.peers;
     final cs = Theme.of(context).colorScheme;
 
     return Scaffold(
@@ -174,7 +219,7 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         ),
       ),
-      body: peers.isEmpty
+      body: _peerList.isEmpty
           ? Center(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
@@ -200,14 +245,12 @@ class _HomeScreenState extends State<HomeScreen> {
           : ListView.separated(
               padding:
                   const EdgeInsets.symmetric(vertical: 8, horizontal: 8),
-              itemCount: peers.length,
+              itemCount: _peerList.length,
               separatorBuilder: (_, i) =>
                   const Divider(height: 1, indent: 72),
               itemBuilder: (context, index) {
-                final peer = peers[index];
-                final unread = _unread[peer.userId] ?? 0;
-                final isOnline =
-                    widget.connections.isConnected(peer.userId);
+                final entry = _peerList[index];
+                final unread = _unread[entry.userId] ?? 0;
 
                 return ListTile(
                   shape: RoundedRectangleBorder(
@@ -216,10 +259,10 @@ class _HomeScreenState extends State<HomeScreen> {
                     children: [
                       CircleAvatar(
                         radius: 22,
-                        backgroundColor: peer.avatarColor,
+                        backgroundColor: entry.avatarColor,
                         child: Text(
-                          peer.name.isNotEmpty
-                              ? peer.name[0].toUpperCase()
+                          entry.name.isNotEmpty
+                              ? entry.name[0].toUpperCase()
                               : '?',
                           style: const TextStyle(
                             color: Colors.white,
@@ -236,7 +279,7 @@ class _HomeScreenState extends State<HomeScreen> {
                           height: 12,
                           decoration: BoxDecoration(
                             shape: BoxShape.circle,
-                            color: isOnline ? Colors.green : cs.outline,
+                            color: entry.online ? Colors.green : cs.outline,
                             border:
                                 Border.all(color: cs.surface, width: 2),
                           ),
@@ -244,13 +287,19 @@ class _HomeScreenState extends State<HomeScreen> {
                       ),
                     ],
                   ),
-                  title: Text(peer.name,
+                  title: Text(entry.name,
                       style: TextStyle(
                         fontWeight:
                             unread > 0 ? FontWeight.w800 : FontWeight.w600,
+                        color: entry.online ? null : cs.onSurfaceVariant,
                       )),
-                  subtitle: Text(peer.ip,
-                      style: TextStyle(color: cs.outline, fontSize: 13)),
+                  subtitle: Text(
+                      entry.online ? entry.ip : 'Offline',
+                      style: TextStyle(
+                        color: entry.online ? cs.outline : cs.outline.withValues(alpha: 0.5),
+                        fontSize: 13,
+                        fontStyle: entry.online ? FontStyle.normal : FontStyle.italic,
+                      )),
                   trailing: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
@@ -275,15 +324,25 @@ class _HomeScreenState extends State<HomeScreen> {
                       Icon(Icons.chevron_right, color: cs.outline),
                     ],
                   ),
-                  onTap: () => _openChat(peer),
+                  onTap: () => _openChat(entry),
                 );
               },
             ),
     );
   }
 
-  void _openChat(PeerDevice peer) {
-    setState(() => _unread.remove(peer.userId));
+  void _openChat(_PeerEntry entry) {
+    setState(() => _unread.remove(entry.userId));
+
+    final peer = entry.peer ??
+        PeerDevice(
+          userId: entry.userId,
+          name: entry.name,
+          ip: entry.ip,
+          port: entry.port,
+          lastSeen: DateTime.now(),
+        );
+
     Navigator.of(context).push(
       MaterialPageRoute(
         builder: (_) => ChatScreen(
@@ -294,5 +353,40 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
       ),
     );
+  }
+}
+
+// ---------------------------------------------------------------------------
+class _PeerEntry {
+  final String userId;
+  final String name;
+  final String ip;
+  final int port;
+  final bool online;
+  final PeerDevice? peer;
+
+  const _PeerEntry({
+    required this.userId,
+    required this.name,
+    required this.ip,
+    required this.port,
+    required this.online,
+    this.peer,
+  });
+
+  Color get avatarColor {
+    const palette = [
+      Colors.blue,
+      Colors.red,
+      Colors.green,
+      Colors.purple,
+      Colors.orange,
+      Colors.teal,
+      Colors.pink,
+      Colors.indigo,
+      Colors.cyan,
+      Colors.amber,
+    ];
+    return palette[userId.hashCode.abs() % palette.length];
   }
 }

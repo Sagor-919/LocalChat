@@ -9,6 +9,7 @@ import 'discovery_service.dart';
 import 'home_screen.dart';
 import 'message_model.dart';
 import 'message_store.dart';
+import 'transfer_manager.dart';
 
 late DeviceInfo _me;
 late DiscoveryService _discovery;
@@ -27,6 +28,12 @@ Future<void> main() async {
   await _connections.startServer();
   await _discovery.start();
 
+  await TransferManager.instance.init(
+    connections: _connections,
+    store: _store,
+    myId: _me.userId,
+  );
+
   await _notifications.initialize(
     const InitializationSettings(
       android: AndroidInitializationSettings('@mipmap/ic_launcher'),
@@ -38,14 +45,34 @@ Future<void> main() async {
   );
 
   _connections.onMessage = (peerId, json) {
-    if (json['type'] == 'message') {
+    final type = json['type'] as String?;
+
+    if (type == 'hello') {
+      final name = json['name'] as String? ?? '';
+      final peer =
+          _discovery.peers.where((p) => p.userId == peerId).firstOrNull;
+      if (peer != null) {
+        _store.savePeerInfo(peerId, name, peer.ip, peer.port);
+      }
+    }
+
+    if (type == 'message') {
       final msg = ChatMessage.fromJson(json, _me.userId);
       if (msg != null) {
         _store.add(peerId, msg);
       }
     }
 
-    if (!_appInForeground && json['type'] == 'message') {
+    if (type == 'file_notify') {
+      TransferManager.instance.registerIncoming(
+        peerId,
+        json['id'] as String? ?? '',
+        json['name'] as String? ?? '',
+        (json['size'] as num?)?.toInt() ?? 0,
+      );
+    }
+
+    if (!_appInForeground && type == 'message') {
       final text = json['text'] as String? ?? '';
       final from = json['from'] as String? ?? 'Someone';
       final peer =
@@ -67,6 +94,29 @@ Future<void> main() async {
       );
     }
   };
+
+  TransferManager.instance.fileMessages.listen((event) {
+    if (!_appInForeground) {
+      final peer =
+          _discovery.peers.where((p) => p.userId == event.peerId).firstOrNull;
+      final name = peer?.name ?? 'Someone';
+      final fileName = event.message.attachmentName ?? 'a file';
+
+      _notifications.show(
+        event.peerId.hashCode,
+        name,
+        'Sent you $fileName',
+        const NotificationDetails(
+          android: AndroidNotificationDetails(
+            'messages', 'Messages',
+            importance: Importance.high,
+            priority: Priority.high,
+          ),
+        ),
+        payload: jsonEncode({'peerId': event.peerId}),
+      );
+    }
+  });
 
   runApp(const LocalChatApp());
 }
@@ -94,8 +144,8 @@ class _LocalChatAppState extends State<LocalChatApp>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    _appInForeground =
-        state == AppLifecycleState.resumed || state == AppLifecycleState.inactive;
+    _appInForeground = state == AppLifecycleState.resumed ||
+        state == AppLifecycleState.inactive;
   }
 
   @override
