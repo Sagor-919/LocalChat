@@ -106,6 +106,7 @@ class AppServices {
           me: me,
           peer: peer,
           connections: conn,
+          downloadDir: settings?.downloadDir,
         ),
       ),
     );

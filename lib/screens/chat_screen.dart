@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
-import 'dart:isolate';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -20,12 +19,14 @@ class ChatScreen extends StatefulWidget {
   final DeviceIdentity me;
   final PeerDevice peer;
   final WsConnectionService connections;
+  final String? downloadDir;
 
   const ChatScreen({
     super.key,
     required this.me,
     required this.peer,
     required this.connections,
+    this.downloadDir,
   });
 
   @override
@@ -134,7 +135,7 @@ class _ChatScreenState extends State<ChatScreen> {
             fileSize: msg.fileSize,
             totalChunks: msg.totalChunks,
             sentAtMs: msg.sentAtMs,
-            chunks: List<Uint8List?>.filled(msg.totalChunks, null),
+            chunkBase64: List<String?>.filled(msg.totalChunks, null),
           );
           setState(() {
             _incomingTransfersById[msg.fileId] = transfer;
@@ -147,19 +148,15 @@ class _ChatScreenState extends State<ChatScreen> {
           final t = _incomingTransfersById[msg.fileId];
           if (t == null || t.fileId != msg.fileId) return;
           if (msg.index < 0 || msg.index >= t.totalChunks) return;
-          if (t.chunks[msg.index] == null) {
-            unawaited(() async {
-              final decoded = await _base64DecodeAsync(msg.base64Data);
-              if (!mounted) return;
-              if (t.chunks[msg.index] != null) return;
-              t.chunks[msg.index] = decoded;
-              t.receivedChunks++;
-              final prog = t.receivedChunks / t.totalChunks;
-              setState(() {
-                t._lastProgress = prog;
-                _incomingTransfersById[msg.fileId] = t;
-              });
-            }());
+          if (t.chunkBase64[msg.index] == null) {
+            // Keep exact payload immediately to avoid races with file_complete.
+            t.chunkBase64[msg.index] = msg.base64Data;
+            t.receivedChunks++;
+            final prog = t.receivedChunks / t.totalChunks;
+            setState(() {
+              t._lastProgress = prog;
+              _incomingTransfersById[msg.fileId] = t;
+            });
           }
           return;
         }
@@ -227,31 +224,27 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Uint8List _assembleFileBytes(_IncomingFileTransfer t) {
     // WebSocket guarantees ordering per connection, but we still fill by index.
-    if (t.chunks.any((c) => c == null)) {
+    if (t.chunkBase64.any((c) => c == null)) {
       throw StateError('Missing chunks for ${t.fileId}');
     }
 
     final out = Uint8List(t.fileSize);
     var offset = 0;
-    for (final chunk in t.chunks) {
-      final c = chunk!;
+    for (final chunkB64 in t.chunkBase64) {
+      final c = base64Decode(chunkB64!);
       out.setRange(offset, offset + c.length, c);
       offset += c.length;
     }
     return out;
   }
 
-  Future<String> _base64EncodeAsync(Uint8List bytes) {
-    return Isolate.run(() => base64Encode(bytes));
-  }
-
-  Future<Uint8List> _base64DecodeAsync(String data) {
-    return Isolate.run(() => base64Decode(data));
-  }
-
   Future<String> _saveReceivedFile(Uint8List bytes, String originalName) async {
-    // Download path will be configurable via Settings screen; for now use temp.
-    final dir = Directory.systemTemp;
+    final configured = widget.downloadDir;
+    final dir =
+        (configured != null && configured.isNotEmpty) ? Directory(configured) : Directory.systemTemp;
+    if (!await dir.exists()) {
+      await dir.create(recursive: true);
+    }
     final safeName = originalName.replaceAll('/', '_');
     final fileName = '${DateTime.now().millisecondsSinceEpoch}-$safeName';
     final path = '${dir.path}/$fileName';
@@ -306,7 +299,7 @@ class _ChatScreenState extends State<ChatScreen> {
     }
 
     final fileId = _uuid.v4();
-    const int chunkSize = 16 * 1024;
+    const int chunkSize = 64 * 1024;
     int len = 0;
     if (filePath != null) {
       len = await File(filePath).length();
@@ -354,7 +347,7 @@ class _ChatScreenState extends State<ChatScreen> {
             if (chunk.isEmpty) break;
             sentBytes += chunk.length;
 
-            final b64 = await _base64EncodeAsync(Uint8List.fromList(chunk));
+            final b64 = base64Encode(chunk);
             final ok = widget.connections.sendWsMessage(
               widget.peer.userId,
               ChatFileChunkMessage(
@@ -392,7 +385,7 @@ class _ChatScreenState extends State<ChatScreen> {
               : (start + chunkSize);
           final chunk = bytes.sublist(start, end);
           sentBytes += chunk.length;
-          final b64 = await _base64EncodeAsync(Uint8List.fromList(chunk));
+          final b64 = base64Encode(chunk);
           final ok = widget.connections.sendWsMessage(
             widget.peer.userId,
             ChatFileChunkMessage(
@@ -829,26 +822,26 @@ class _ChatScreenState extends State<ChatScreen> {
                                     onTap: m.attachmentPath == null
                                         ? null
                                         : () => OpenFilex.open(m.attachmentPath!),
-                                    child: Row(
-                                      mainAxisSize: MainAxisSize.min,
+                                    child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
                                       children: [
-                                        Icon(
-                                          Icons.insert_drive_file,
-                                          size: 18,
-                                          color: isMine
-                                              ? Theme.of(context)
-                                                  .colorScheme
-                                                  .onPrimary
-                                              : Theme.of(context)
-                                                  .colorScheme
-                                                  .onSurface,
-                                        ),
-                                        const SizedBox(width: 6),
-                                        Flexible(
-                                          child: Text(
-                                            m.attachmentName!,
-                                            overflow: TextOverflow.ellipsis,
-                                            style: TextStyle(
+                                        if (m.attachmentPath != null &&
+                                            _isImageFileName(m.attachmentName!))
+                                          ClipRRect(
+                                            borderRadius: BorderRadius.circular(12),
+                                            child: Image.file(
+                                              File(m.attachmentPath!),
+                                              width: 220,
+                                              height: 160,
+                                              fit: BoxFit.cover,
+                                            ),
+                                          ),
+                                        Row(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            Icon(
+                                              Icons.insert_drive_file,
+                                              size: 18,
                                               color: isMine
                                                   ? Theme.of(context)
                                                       .colorScheme
@@ -856,14 +849,30 @@ class _ChatScreenState extends State<ChatScreen> {
                                                   : Theme.of(context)
                                                       .colorScheme
                                                       .onSurface,
-                                              fontSize: 15,
-                                              height: 1.25,
-                                              fontWeight: FontWeight.w700,
-                                              decoration: m.attachmentPath == null
-                                                  ? TextDecoration.none
-                                                  : TextDecoration.underline,
                                             ),
-                                          ),
+                                            const SizedBox(width: 6),
+                                            Flexible(
+                                              child: Text(
+                                                m.attachmentName!,
+                                                overflow: TextOverflow.ellipsis,
+                                                style: TextStyle(
+                                                  color: isMine
+                                                      ? Theme.of(context)
+                                                          .colorScheme
+                                                          .onPrimary
+                                                      : Theme.of(context)
+                                                          .colorScheme
+                                                          .onSurface,
+                                                  fontSize: 15,
+                                                  height: 1.25,
+                                                  fontWeight: FontWeight.w700,
+                                                  decoration: m.attachmentPath == null
+                                                      ? TextDecoration.none
+                                                      : TextDecoration.underline,
+                                                ),
+                                              ),
+                                            ),
+                                          ],
                                         ),
                                       ],
                                     ),
@@ -1047,7 +1056,7 @@ class _IncomingFileTransfer {
   final int fileSize;
   final int totalChunks;
   final int sentAtMs;
-  final List<Uint8List?> chunks;
+  final List<String?> chunkBase64;
 
   int receivedChunks = 0;
   double _lastProgress = 0.0;
@@ -1060,7 +1069,7 @@ class _IncomingFileTransfer {
     required this.fileSize,
     required this.totalChunks,
     required this.sentAtMs,
-    required this.chunks,
+    required this.chunkBase64,
   });
 }
 

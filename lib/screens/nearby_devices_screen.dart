@@ -174,6 +174,7 @@ class _NearbyDevicesScreenState extends State<NearbyDevicesScreen> {
             me: me,
             peer: peer,
             connections: connections,
+            downloadDir: widget.services.settings?.downloadDir,
           ),
         ),
       );
@@ -205,6 +206,7 @@ class _NearbyDevicesScreenState extends State<NearbyDevicesScreen> {
             me: me,
             peer: peer,
             connections: connections,
+            downloadDir: widget.services.settings?.downloadDir,
           ),
         ),
       );
