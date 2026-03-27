@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
@@ -6,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import 'android_app_control.dart';
 import 'android_storage_access.dart';
 import 'app_branding.dart';
 import 'app_settings.dart';
@@ -20,13 +22,44 @@ class SettingsScreen extends StatefulWidget {
   State<SettingsScreen> createState() => _SettingsScreenState();
 }
 
-class _SettingsScreenState extends State<SettingsScreen> {
+class _SettingsScreenState extends State<SettingsScreen>
+    with WidgetsBindingObserver {
   final _settings = AppSettings.instance;
+
+  /// null until first read from the platform.
+  bool? _batteryUnrestricted;
 
   bool get _isDesktop =>
       !kIsWeb && (Platform.isWindows || Platform.isLinux || Platform.isMacOS);
 
   bool get _isAndroid => !kIsWeb && Platform.isAndroid;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    if (_isAndroid) {
+      unawaited(_refreshBatteryStatus());
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && _isAndroid) {
+      unawaited(_refreshBatteryStatus());
+    }
+  }
+
+  Future<void> _refreshBatteryStatus() async {
+    final v = await androidIgnoringBatteryOptimizations();
+    if (mounted) setState(() => _batteryUnrestricted = v);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -113,6 +146,57 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
           ),
           const SizedBox(height: 16),
+
+          if (_isAndroid) ...[
+            _sectionLabel(context, 'BACKGROUND & BATTERY'),
+            _card(
+              isDark: isDark,
+              cs: cs,
+              child: SwitchListTile(
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(16)),
+                secondary: Icon(
+                  _batteryUnrestricted == true
+                      ? Icons.battery_charging_full
+                      : Icons.battery_saver_outlined,
+                  color: cs.primary,
+                ),
+                title: const Text('Unrestricted battery usage'),
+                subtitle: Text(
+                  _batteryUnrestricted == null
+                      ? 'Checking system setting\u2026'
+                      : _batteryUnrestricted!
+                          ? 'Android should not aggressively suspend Local Chat. '
+                              'Recommended for stable LAN connections.'
+                          : 'Battery optimization can drop discovery and chat in the '
+                              'background on Samsung, Xiaomi, OnePlus, and similar devices. '
+                              'Turn this on to open the system prompt, or open app info to change it.',
+                ),
+                value: _batteryUnrestricted ?? false,
+                onChanged: _batteryUnrestricted == null
+                    ? null
+                    : (wantUnrestricted) async {
+                        if (wantUnrestricted) {
+                          await androidRequestIgnoreBatteryOptimizations();
+                        } else {
+                          await androidOpenApplicationDetailsSettings();
+                          if (context.mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                behavior: SnackBarBehavior.floating,
+                                content: Text(
+                                  'In App info → Battery, remove unrestricted or enable optimization if you prefer.',
+                                ),
+                              ),
+                            );
+                          }
+                        }
+                        await _refreshBatteryStatus();
+                      },
+              ),
+            ),
+            const SizedBox(height: 16),
+          ],
 
           if (_isDesktop) ...[
             _sectionLabel(context, 'BACKGROUND'),

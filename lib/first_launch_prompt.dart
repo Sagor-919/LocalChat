@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+import 'android_app_control.dart';
 import 'android_storage_access.dart';
 import 'app_settings.dart';
 
@@ -44,6 +45,37 @@ Future<void> showFirstLaunchOnboardingIfNeeded(BuildContext context) async {
       if (!n.isGranted) {
         await Permission.notification.request();
       }
+    }
+
+    if (!context.mounted) return;
+    final batteryAllow = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: const Text('Battery optimization'),
+        content: const Text(
+          'To keep LAN chat and discovery connected in the background, please allow '
+          'Local Chat to ignore battery optimization.\n\n'
+          'On many phones (Samsung, Xiaomi, Huawei, OnePlus, etc.) the system otherwise '
+          'suspends the app and you can lose connections even without force-closing the app.\n\n'
+          'Messaging apps like WhatsApp ask for the same setting.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Not now'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Allow'),
+          ),
+        ],
+      ),
+    );
+    if (!context.mounted) return;
+    if (batteryAllow == true) {
+      await androidRequestIgnoreBatteryOptimizations();
     }
 
     if (!context.mounted) return;

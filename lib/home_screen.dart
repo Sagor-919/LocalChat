@@ -318,11 +318,20 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildChatsBody(BuildContext context, ColorScheme cs) {
-    int nameCmp(_PeerEntry a, _PeerEntry b) =>
-        a.name.toLowerCase().compareTo(b.name.toLowerCase());
+    int activityCmp(_PeerEntry a, _PeerEntry b) {
+      final ta = _lastMsgTime[a.userId];
+      final tb = _lastMsgTime[b.userId];
+      if (ta != null && tb != null && ta != tb) {
+        return tb.compareTo(ta);
+      }
+      if (ta != null && tb == null) return -1;
+      if (ta == null && tb != null) return 1;
+      return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+    }
 
-    final online = _peerList.where((e) => e.online).toList()..sort(nameCmp);
-    final offline = _peerList.where((e) => !e.online).toList()..sort(nameCmp);
+    final online = _peerList.where((e) => e.online).toList()..sort(activityCmp);
+    final offline =
+        _peerList.where((e) => !e.online).toList()..sort(activityCmp);
 
     if (online.isEmpty && offline.isEmpty) {
       return Center(
@@ -444,85 +453,81 @@ class _HomeScreenState extends State<HomeScreen> {
     final cs = Theme.of(context).colorScheme;
     final isDark = Theme.of(context).brightness == Brightness.dark;
 
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: isDark ? cs.surfaceContainerHigh : Colors.white,
+    return Material(
+      color: isDark ? cs.surfaceContainerHigh : Colors.white,
+      elevation: isDark ? 0 : 1.5,
+      shadowColor: Colors.black26,
+      borderRadius: BorderRadius.circular(20),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: _editProfile,
         borderRadius: BorderRadius.circular(20),
-        boxShadow: [
-          if (!isDark)
-            BoxShadow(
-              color: Colors.black.withValues(alpha: 0.06),
-              blurRadius: 16,
-              offset: const Offset(0, 4),
-            ),
-        ],
-      ),
-      child: Row(
-        children: [
-          _RingAvatar(
-            letter: widget.me.displayName.isNotEmpty
-                ? widget.me.displayName[0].toUpperCase()
-                : '?',
-            radius: 28,
-            fontSize: 22,
-            online: true,
-          ),
-          const SizedBox(width: 14),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  widget.me.displayName,
-                  style: TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.w700,
-                    color: cs.onSurface,
-                  ),
-                ),
-                const SizedBox(height: 2),
-                GestureDetector(
-                  onTap: _editProfile,
-                  child: Row(
-                    children: [
-                      Container(
-                        width: 8,
-                        height: 8,
-                        decoration: const BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: _RingAvatar._onlineGreen,
-                        ),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Row(
+            children: [
+              _RingAvatar(
+                letter: widget.me.displayName.isNotEmpty
+                    ? widget.me.displayName[0].toUpperCase()
+                    : '?',
+                radius: 28,
+                fontSize: 22,
+                online: true,
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      widget.me.displayName,
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w700,
+                        color: cs.onSurface,
                       ),
-                      const SizedBox(width: 5),
-                      Text(
-                        'Online',
-                        style: TextStyle(
-                          fontSize: 13,
-                          fontWeight: FontWeight.w500,
-                          color: cs.outline,
+                    ),
+                    const SizedBox(height: 2),
+                    Row(
+                      children: [
+                        Container(
+                          width: 8,
+                          height: 8,
+                          decoration: const BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: _RingAvatar._onlineGreen,
+                          ),
                         ),
-                      ),
-                      const SizedBox(width: 4),
-                      Icon(Icons.edit, size: 13, color: cs.outline),
-                    ],
-                  ),
+                        const SizedBox(width: 5),
+                        Text(
+                          'Online',
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w500,
+                            color: cs.outline,
+                          ),
+                        ),
+                        const SizedBox(width: 4),
+                        Icon(Icons.edit, size: 13, color: cs.outline),
+                      ],
+                    ),
+                  ],
                 ),
-              ],
-            ),
+              ),
+              IconButton(
+                onPressed: () {
+                  Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => SettingsScreen(store: widget.store),
+                    ),
+                  );
+                },
+                icon: Icon(Icons.settings, color: cs.onSurfaceVariant),
+                tooltip: 'Settings',
+              ),
+            ],
           ),
-          IconButton(
-            onPressed: () {
-              Navigator.of(context).push(
-                MaterialPageRoute(
-                  builder: (_) => SettingsScreen(store: widget.store),
-                ),
-              );
-            },
-            icon: Icon(Icons.settings, color: cs.onSurfaceVariant),
-            tooltip: 'Settings',
-          ),
-        ],
+        ),
       ),
     );
   }

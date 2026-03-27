@@ -9,6 +9,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:open_filex/open_filex.dart';
+import 'package:path/path.dart' as p;
+import 'package:super_clipboard/super_clipboard.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:uuid/uuid.dart';
 
@@ -825,14 +827,21 @@ class _ChatScreenState extends State<ChatScreen> {
                         ),
                         clipBehavior: Clip.antiAlias,
                         child: isImg
-                            ? Image.file(File(sf.path),
-                                fit: BoxFit.cover,
-                                width: 64,
-                                height: 64,
-                                errorBuilder: (_, _, _) => Icon(
+                            ? _wrapImageWithContextMenu(
+                                path: sf.path,
+                                fileName: sf.name,
+                                image: Image.file(
+                                  File(sf.path),
+                                  fit: BoxFit.cover,
+                                  width: 64,
+                                  height: 64,
+                                  errorBuilder: (_, _, _) => Icon(
                                     Icons.broken_image,
                                     size: 24,
-                                    color: cs.outline))
+                                    color: cs.outline,
+                                  ),
+                                ),
+                              )
                             : Column(
                                 mainAxisAlignment: MainAxisAlignment.center,
                                 children: [
@@ -1095,6 +1104,112 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  Future<void> _showAttachmentImageMenu(
+    BuildContext context,
+    Offset globalPosition, {
+    required String path,
+    required String fileName,
+  }) async {
+    final overlayState = Overlay.maybeOf(context);
+    final overlayBox =
+        overlayState?.context.findRenderObject() as RenderBox?;
+    if (overlayBox == null) return;
+
+    final topLeft = overlayBox.globalToLocal(globalPosition);
+    final selected = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromRect(
+        Rect.fromLTWH(topLeft.dx, topLeft.dy, 0, 0),
+        Offset.zero & overlayBox.size,
+      ),
+      items: const [
+        PopupMenuItem(value: 'path', child: Text('Copy file path')),
+        PopupMenuItem(value: 'image', child: Text('Copy image to clipboard')),
+      ],
+    );
+    if (!context.mounted) return;
+    if (selected == 'path') {
+      final messenger = ScaffoldMessenger.of(context);
+      await Clipboard.setData(ClipboardData(text: path));
+      if (!context.mounted) return;
+      messenger.showSnackBar(
+        const SnackBar(content: Text('File path copied')),
+      );
+    } else if (selected == 'image') {
+      await _copyImageBytesToClipboard(path, fileName);
+    }
+  }
+
+  Future<void> _copyImageBytesToClipboard(
+      String path, String displayFileName) async {
+    final clipboard = SystemClipboard.instance;
+    if (clipboard == null) {
+      if (!context.mounted) return;
+      final messenger = ScaffoldMessenger.of(context);
+      messenger.showSnackBar(
+        const SnackBar(
+          content: Text('Image clipboard is not available here'),
+        ),
+      );
+      return;
+    }
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final bytes = await File(path).readAsBytes();
+      if (!context.mounted) return;
+      final item =
+          DataWriterItem(suggestedName: p.basename(displayFileName));
+      final ext = p.extension(displayFileName).toLowerCase();
+      if (ext == '.png') {
+        item.add(Formats.png(bytes));
+      } else if (ext == '.jpg' || ext == '.jpeg') {
+        item.add(Formats.jpeg(bytes));
+      } else if (ext == '.gif') {
+        item.add(Formats.gif(bytes));
+      } else if (ext == '.webp') {
+        item.add(Formats.webp(bytes));
+      } else if (ext == '.bmp') {
+        item.add(Formats.bmp(bytes));
+      } else {
+        item.add(Formats.png(bytes));
+      }
+      await clipboard.write([item]);
+      if (!context.mounted) return;
+      messenger.showSnackBar(
+        const SnackBar(content: Text('Image copied to clipboard')),
+      );
+    } catch (e) {
+      if (!context.mounted) return;
+      messenger.showSnackBar(
+        SnackBar(content: Text('Could not copy image: $e')),
+      );
+    }
+  }
+
+  Widget _wrapImageWithContextMenu({
+    required String path,
+    required String fileName,
+    required Widget image,
+  }) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () => OpenFilex.open(path),
+      onLongPressStart: (d) => unawaited(_showAttachmentImageMenu(
+            context,
+            d.globalPosition,
+            path: path,
+            fileName: fileName,
+          )),
+      onSecondaryTapDown: (d) => unawaited(_showAttachmentImageMenu(
+            context,
+            d.globalPosition,
+            path: path,
+            fileName: fileName,
+          )),
+      child: image,
+    );
+  }
+
   Widget _actionButton({
     required String label,
     required IconData icon,
@@ -1149,11 +1264,12 @@ class _ChatScreenState extends State<ChatScreen> {
         if (isImg && !strikeAborted)
           Padding(
             padding: const EdgeInsets.only(bottom: 6),
-            child: GestureDetector(
-              onTap: () => OpenFilex.open(m.attachmentPath!),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(12),
-                child: Image.file(
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(12),
+              child: _wrapImageWithContextMenu(
+                path: m.attachmentPath!,
+                fileName: m.attachmentName!,
+                image: Image.file(
                   File(m.attachmentPath!),
                   width: 220,
                   height: 160,
