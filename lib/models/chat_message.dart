@@ -4,6 +4,8 @@ class ChatMessage {
   final String senderUserId;
   final String senderDisplayName;
   final String text;
+  final String? attachmentName;
+  final String? attachmentPath;
   final int sentAtMs;
   final bool isMine;
 
@@ -13,6 +15,8 @@ class ChatMessage {
     required this.senderUserId,
     required this.senderDisplayName,
     required this.text,
+    this.attachmentName,
+    this.attachmentPath,
     required this.sentAtMs,
     required this.isMine,
   });
@@ -25,6 +29,8 @@ class ChatMessage {
         'from': senderUserId,
         'fromName': senderDisplayName,
         'text': text,
+        'attName': attachmentName,
+        'attPath': attachmentPath,
         'ts': sentAtMs,
         'mine': isMine,
       };
@@ -36,6 +42,8 @@ class ChatMessage {
       senderUserId: json['from'] as String,
       senderDisplayName: (json['fromName'] as String?) ?? 'Unknown',
       text: json['text'] as String,
+      attachmentName: json['attName'] as String?,
+      attachmentPath: json['attPath'] as String?,
       sentAtMs: (json['ts'] as num).toInt(),
       isMine: (json['mine'] as bool?) ?? false,
     );

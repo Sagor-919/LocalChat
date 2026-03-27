@@ -311,6 +311,27 @@ class WsConnectionService {
     }
   }
 
+  bool sendWsMessage(String peerId, WsMessage msg) {
+    final state = _connections[peerId];
+    final ws = state?.socket;
+    if (state == null ||
+        ws == null ||
+        state.status != PeerConnectionStatus.connected ||
+        ws.closeCode != null) {
+      return false;
+    }
+
+    try {
+      ws.add(msg.encode());
+      return true;
+    } catch (e) {
+      state.status = PeerConnectionStatus.disconnected;
+      state.error = e.toString();
+      onConnectionChanged?.call(peerId, state);
+      return false;
+    }
+  }
+
   bool sendTyping(String peerId, {required bool isTyping}) {
     final state = _connections[peerId];
     final ws = state?.socket;

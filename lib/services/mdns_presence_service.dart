@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:mdns_dart/mdns_dart.dart';
+import 'package:multicast_dns/multicast_dns.dart';
 
 import '../models/peer_device.dart';
 import 'device_identity.dart';
@@ -54,47 +55,92 @@ class MdnsPresenceService {
   }
 
   Future<List<PeerDevice>> discoverOnce({Duration timeout = const Duration(seconds: 2)}) async {
-    // mdns_dart discover() returns all results after `timeout`.
-    final results = await MDNSClient.discover(
-      kMdnsServiceType,
-      timeout: timeout,
-    );
+    // NOTE: mdns_dart's discover() has been causing "Cannot add event after closing"
+    // crashes on Windows/Android. We use multicast_dns for discovery instead.
+    final client = MDnsClient();
+    await client.start();
 
     final now = DateTime.now();
-    final peers = <PeerDevice>[];
+    final peersById = <String, PeerDevice>{};
 
-    for (final mdnsService in results) {
-      final txtFields = mdnsService.infoFields;
-      final parsed = MDNSService.parseTXTRecords(txtFields);
+    final serviceTypeFqdn = '$kMdnsServiceType.local';
 
-      final peerId = parsed['id'];
-      final peerName = parsed['name']?.trim().isNotEmpty == true
-          ? parsed['name']!.trim()
-          : mdnsService.name;
+    Future<void> resolveService(String instanceFqdn) async {
+      // SRV gives us target host + port.
+      await for (final srv in client.lookup<SrvResourceRecord>(
+        ResourceRecordQuery.service(instanceFqdn),
+      )) {
+        final target = srv.target;
+        final port = srv.port;
 
-      // mdns_dart might not include TXT (or might be incomplete), so be defensive.
-      final wsPort = int.tryParse(parsed['wsPort'] ?? '') ?? mdnsService.port;
+        // TXT contains our app metadata.
+        String? peerId;
+        String? peerName;
+        int? wsPort;
+        await for (final txt in client.lookup<TxtResourceRecord>(
+          ResourceRecordQuery.text(instanceFqdn),
+        )) {
+          final entries = txt.text.split('\n');
+          for (final s in entries) {
+            final idx = s.indexOf('=');
+            if (idx <= 0) continue;
+            final k = s.substring(0, idx);
+            final v = s.substring(idx + 1);
+            switch (k) {
+              case 'id':
+                peerId = v;
+                break;
+              case 'name':
+                peerName = v;
+                break;
+              case 'wsPort':
+                wsPort = int.tryParse(v);
+                break;
+            }
+          }
+        }
 
-      if (peerId == null || peerId.isEmpty) continue;
+        if (peerId == null || peerId.isEmpty) return;
+        if (peerId == identity.userId) return;
 
-      // Don't show ourselves.
-      if (peerId == identity.userId) continue;
+        // A record gives us IPv4 for the target host.
+        String? ip;
+        await for (final a in client.lookup<IPAddressResourceRecord>(
+          ResourceRecordQuery.addressIPv4(target),
+        )) {
+          ip = a.address.address;
+          break;
+        }
 
-      final ip = mdnsService.primaryAddress?.address;
-      if (ip == null || ip.isEmpty) continue;
+        if (ip == null || ip.isEmpty) return;
 
-      peers.add(
-        PeerDevice(
+        final device = PeerDevice(
           userId: peerId,
-          displayName: peerName,
+          displayName: (peerName?.trim().isNotEmpty == true)
+              ? peerName!.trim()
+              : instanceFqdn,
           ipAddress: ip,
-          wsPort: wsPort,
+          wsPort: wsPort ?? port,
           lastSeen: now,
-        ),
-      );
+        );
+        peersById[device.userId] = device;
+      }
     }
 
-    return peers;
+    // Gather PTR results for our service type for the duration of `timeout`.
+    final ptrStream = client
+        .lookup<PtrResourceRecord>(ResourceRecordQuery.serverPointer(serviceTypeFqdn));
+
+    final endAt = DateTime.now().add(timeout);
+    await for (final ptr in ptrStream) {
+      if (DateTime.now().isAfter(endAt)) break;
+      unawaited(resolveService(ptr.domainName));
+    }
+
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    client.stop();
+
+    return peersById.values.toList();
   }
 
   bool get isAdvertising => _advertising;
