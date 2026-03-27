@@ -22,8 +22,15 @@ class DiscoveryService {
   List<PeerDevice> get peers => _peers.values.toList();
 
   Future<void> start() async {
-    _socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, udpPort,
-        reuseAddress: true, reusePort: !Platform.isWindows);
+    // reusePort is unsupported on Android; reuseAddress:true has caused
+    // reusePort-related failures on some Android builds — keep both off there.
+    final reuseAddr = !Platform.isAndroid;
+    _socket = await RawDatagramSocket.bind(
+      InternetAddress.anyIPv4,
+      udpPort,
+      reuseAddress: reuseAddr,
+      reusePort: false,
+    );
     _socket!.broadcastEnabled = true;
 
     _socket!.listen((event) {

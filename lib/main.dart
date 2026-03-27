@@ -8,7 +8,9 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
+import 'app_branding.dart';
 import 'app_settings.dart';
+import 'chat_screen.dart';
 import 'connection_service.dart';
 import 'device.dart';
 import 'discovery_service.dart';
@@ -35,6 +37,13 @@ bool _desktopNotifyIncomingMessages = false;
 bool get _isDesktop =>
     !kIsWeb && (Platform.isWindows || Platform.isLinux || Platform.isMacOS);
 
+PeerDevice? _discoveryPeerById(String peerId) {
+  for (final p in _discovery.peers) {
+    if (p.userId == peerId) return p;
+  }
+  return null;
+}
+
 Future<void> _syncDesktopNotifyForIncomingMessages() async {
   if (!_isDesktop) return;
   try {
@@ -42,7 +51,126 @@ Future<void> _syncDesktopNotifyForIncomingMessages() async {
     final min = await windowManager.isMinimized();
     final focused = await windowManager.isFocused();
     _desktopNotifyIncomingMessages = !vis || min || !focused;
+
+    if (Platform.isWindows && vis && !min && focused) {
+      try {
+        await windowManager.setProgressBar(-1);
+      } catch (_) {}
+    }
   } catch (_) {}
+}
+
+/// Windows taskbar “pulse” (indeterminate progress bar under the icon) when
+/// the window is not in the foreground — includes minimized, tray-hidden, and
+/// unfocused (another app on top).
+Future<void> _pulseWindowsTaskbarForAttention() async {
+  if (!_isDesktop || !Platform.isWindows) return;
+  try {
+    final vis = await windowManager.isVisible();
+    final min = await windowManager.isMinimized();
+    final focused = await windowManager.isFocused();
+    if (!vis || min || !focused) {
+      await windowManager.setProgressBar(2);
+    }
+  } catch (_) {}
+}
+
+String? _parsePeerIdFromPayload(String? payload) {
+  if (payload == null || payload.isEmpty) return null;
+  try {
+    final map = jsonDecode(payload) as Map<String, dynamic>?;
+    final id = map?['peerId'] as String?;
+    if (id == null || id.isEmpty) return null;
+    return id;
+  } catch (_) {
+    return null;
+  }
+}
+
+Future<PeerDevice?> _peerDeviceFromStore(String peerId) async {
+  final infos = await _store.loadAllPeerInfos();
+  final info = infos[peerId];
+  if (info == null) return null;
+  return PeerDevice(
+    userId: peerId,
+    name: info['name'] as String? ?? 'Unknown',
+    ip: info['ip'] as String? ?? '',
+    port: (info['port'] as num?)?.toInt() ?? ConnectionService.tcpPort,
+    lastSeen: DateTime.now(),
+  );
+}
+
+/// Show desktop window (from tray/minimized), then open the chat for [peerId].
+Future<void> openChatFromNotificationPayload(String peerId) async {
+  if (peerId.isEmpty) return;
+
+  if (_isDesktop) {
+    await windowManager.show();
+    if (await windowManager.isMinimized()) {
+      await windowManager.restore();
+    }
+    await windowManager.focus();
+    await Future<void>.delayed(const Duration(milliseconds: 60));
+  }
+
+  final ctx = appNavigatorKey.currentContext;
+  if (ctx == null || !ctx.mounted) return;
+
+  PeerDevice? peer = _discoveryPeerById(peerId);
+  peer ??= await _peerDeviceFromStore(peerId);
+  if (peer == null) {
+    debugPrint('LocalChat: no peer metadata for $peerId');
+    return;
+  }
+
+  if (!ctx.mounted) return;
+  Navigator.of(ctx).popUntil((route) => route.isFirst);
+  if (!ctx.mounted) return;
+  await Navigator.of(ctx).push<void>(
+    MaterialPageRoute<void>(
+      builder: (_) => ChatScreen(
+        me: _me,
+        peer: peer!,
+        discovery: _discovery,
+        connections: _connections,
+        store: _store,
+      ),
+    ),
+  );
+
+  if (_isDesktop) {
+    unawaited(_syncDesktopNotifyForIncomingMessages());
+  }
+}
+
+void _onNotificationTapped(NotificationResponse response) {
+  if (response.notificationResponseType !=
+      NotificationResponseType.selectedNotification) {
+    return;
+  }
+  final peerId = _parsePeerIdFromPayload(response.payload);
+  if (peerId == null) return;
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    unawaited(openChatFromNotificationPayload(peerId));
+  });
+}
+
+Future<void> _tryOpenChatFromColdStartNotification() async {
+  try {
+    final details = await _notifications.getNotificationAppLaunchDetails();
+    if (details?.didNotificationLaunchApp != true) return;
+    final r = details!.notificationResponse;
+    if (r == null ||
+        r.notificationResponseType !=
+            NotificationResponseType.selectedNotification) {
+      return;
+    }
+    final peerId = _parsePeerIdFromPayload(r.payload);
+    if (peerId == null) return;
+    await openChatFromNotificationPayload(peerId);
+  } catch (e, st) {
+    debugPrint('Launch notification handling failed: $e\n$st');
+  }
 }
 
 bool _shouldAlertIncomingMessage() {
@@ -71,6 +199,8 @@ Future<void> main() async {
 
   if (_isDesktop) {
     await windowManager.ensureInitialized();
+    // Initializes ITaskbarList3; required before setProgressBar / taskbar APIs.
+    await windowManager.waitUntilReadyToShow();
     const windowWidth = 420.0;
     const windowHeight = 720.0;
     await windowManager.setSize(const Size(windowWidth, windowHeight));
@@ -96,23 +226,27 @@ Future<void> main() async {
     notificationsPlugin: _notifications,
   );
 
-  await _notifications.initialize(
-    const InitializationSettings(
-      android: AndroidInitializationSettings('@mipmap/ic_launcher'),
-      windows: WindowsInitializationSettings(
-          appName: 'Local Chat',
-          appUserModelId: 'com.localchat.app',
-          guid: 'd3c1f8a0-1234-5678-9abc-def012345678'),
-    ),
-  );
+  try {
+    await _notifications.initialize(
+      const InitializationSettings(
+        android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+        windows: WindowsInitializationSettings(
+            appName: 'Local Chat',
+            appUserModelId: 'com.localchat.app',
+            guid: 'd3c1f8a0-1234-5678-9abc-def012345678'),
+      ),
+      onDidReceiveNotificationResponse: _onNotificationTapped,
+    );
+  } catch (e, st) {
+    debugPrint('Local notifications init failed: $e\n$st');
+  }
 
   _connections.onMessage = (peerId, json) {
     final type = json['type'] as String?;
 
     if (type == 'hello') {
       final name = json['name'] as String? ?? '';
-      final peer =
-          _discovery.peers.where((p) => p.userId == peerId).firstOrNull;
+      final peer = _discoveryPeerById(peerId);
       if (peer != null) {
         _store.savePeerInfo(peerId, name, peer.ip, peer.port);
       }
@@ -139,8 +273,7 @@ Future<void> main() async {
         type == 'message') {
       final text = json['text'] as String? ?? '';
       final from = json['from'] as String? ?? 'Someone';
-      final peer =
-          _discovery.peers.where((p) => p.userId == peerId).firstOrNull;
+      final peer = _discoveryPeerById(peerId);
       final name = peer?.name ?? from;
 
       _notifications.show(
@@ -150,6 +283,7 @@ Future<void> main() async {
         _incomingMessageNotificationDetails(),
         payload: jsonEncode({'peerId': peerId}),
       );
+      unawaited(_pulseWindowsTaskbarForAttention());
     }
   };
 
@@ -157,8 +291,7 @@ Future<void> main() async {
     if (event.message.isMine) return;
     if (_shouldAlertIncomingMessage() &&
         !AppSettings.instance.notificationsMuted.value) {
-      final peer =
-          _discovery.peers.where((p) => p.userId == event.peerId).firstOrNull;
+      final peer = _discoveryPeerById(event.peerId);
       final name = peer?.name ?? 'Someone';
       final fileName = event.message.attachmentName ?? 'a file';
 
@@ -169,6 +302,7 @@ Future<void> main() async {
         _incomingMessageNotificationDetails(),
         payload: jsonEncode({'peerId': event.peerId}),
       );
+      unawaited(_pulseWindowsTaskbarForAttention());
     }
   });
 
@@ -180,7 +314,7 @@ String _trayAssetPath() {
   if (Platform.isWindows) {
     return 'windows/runner/resources/app_icon.ico';
   }
-  return 'assets/app_icon.png';
+  return AppAssets.appIcon;
 }
 
 class LocalChatApp extends StatefulWidget {
@@ -192,6 +326,8 @@ class LocalChatApp extends StatefulWidget {
 
 class _LocalChatAppState extends State<LocalChatApp>
     with WidgetsBindingObserver, TrayListener, WindowListener {
+  Timer? _androidStopForegroundTimer;
+
   @override
   void initState() {
     super.initState();
@@ -205,12 +341,20 @@ class _LocalChatAppState extends State<LocalChatApp>
       WidgetsBinding.instance.addPostFrameCallback((_) async {
         await _initTray();
         await _syncDesktopNotifyForIncomingMessages();
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          unawaited(_tryOpenChatFromColdStartNotification());
+        });
+      });
+    } else {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        unawaited(_tryOpenChatFromColdStartNotification());
       });
     }
   }
 
   @override
   void dispose() {
+    _androidStopForegroundTimer?.cancel();
     if (_isDesktop) {
       windowManager.removeListener(this);
       trayManager.removeListener(this);
@@ -249,17 +393,24 @@ class _LocalChatAppState extends State<LocalChatApp>
         builder: (_) => SettingsScreen(store: _store),
       ),
     );
-    unawaited(windowManager.show());
-    unawaited(windowManager.focus());
+    unawaited(() async {
+      await windowManager.show();
+      await windowManager.focus();
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+      await _syncDesktopNotifyForIncomingMessages();
+    }());
   }
 
   @override
   void onWindowClose() {
-    if (_isDesktop) {
+    if (!_isDesktop) return;
+    if (AppSettings.instance.desktopRunInBackground.value) {
       unawaited(windowManager.hide());
       Future<void>.delayed(const Duration(milliseconds: 120), () {
         unawaited(_syncDesktopNotifyForIncomingMessages());
       });
+    } else {
+      unawaited(_quitFromTray());
     }
   }
 
@@ -325,12 +476,19 @@ class _LocalChatAppState extends State<LocalChatApp>
     _appInForeground = state == AppLifecycleState.resumed ||
         state == AppLifecycleState.inactive;
     if (!kIsWeb && Platform.isAndroid) {
-      if (state == AppLifecycleState.paused) {
-        if (AppSettings.instance.backgroundRunningEnabled.value) {
-          unawaited(startLanForegroundIfNeeded());
-        }
-      } else if (state == AppLifecycleState.resumed) {
-        unawaited(stopLanForeground());
+      final bg = AppSettings.instance.backgroundRunningEnabled.value;
+      if (bg &&
+          (state == AppLifecycleState.inactive ||
+              state == AppLifecycleState.hidden ||
+              state == AppLifecycleState.paused)) {
+        _androidStopForegroundTimer?.cancel();
+        unawaited(startLanForegroundIfNeeded());
+      }
+      if (state == AppLifecycleState.resumed) {
+        _androidStopForegroundTimer?.cancel();
+        _androidStopForegroundTimer = Timer(const Duration(milliseconds: 600), () {
+          unawaited(stopLanForeground());
+        });
       }
     }
   }

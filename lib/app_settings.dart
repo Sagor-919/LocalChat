@@ -16,6 +16,9 @@ class AppSettings {
   /// Android: keep discovery/chat active via foreground service when app is in background.
   final backgroundRunningEnabled = ValueNotifier<bool>(true);
 
+  /// Desktop: when true, closing the window hides to tray and keeps LAN active; when false, exit the app.
+  final desktopRunInBackground = ValueNotifier<bool>(true);
+
   Future<void> init() async {
     _prefs = await SharedPreferences.getInstance();
 
@@ -30,6 +33,11 @@ class AppSettings {
 
     backgroundRunningEnabled.value =
         _prefs.getBool('background_running') ?? true;
+
+    if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
+      desktopRunInBackground.value =
+          _prefs.getBool('desktop_run_in_background') ?? true;
+    }
 
     downloadPath.value =
         _prefs.getString('download_path') ?? _defaultDownloadPath();
@@ -57,6 +65,14 @@ class AppSettings {
   Future<void> setBackgroundRunningEnabled(bool enabled) async {
     backgroundRunningEnabled.value = enabled;
     await _prefs.setBool('background_running', enabled);
+  }
+
+  Future<void> setDesktopRunInBackground(bool enabled) async {
+    if (!(Platform.isWindows || Platform.isLinux || Platform.isMacOS)) {
+      return;
+    }
+    desktopRunInBackground.value = enabled;
+    await _prefs.setBool('desktop_run_in_background', enabled);
   }
 
   Future<void> setDownloadPath(String path) async {

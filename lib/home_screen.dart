@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import 'android_app_control.dart';
+import 'app_branding.dart';
 import 'chat_screen.dart';
 import 'connection_service.dart';
 import 'device.dart';
@@ -268,13 +269,19 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             Padding(
               padding: const EdgeInsets.fromLTRB(24, 24, 24, 8),
-              child: Text(
-                'Chats',
-                style: TextStyle(
-                  fontSize: 22,
-                  fontWeight: FontWeight.w800,
-                  color: cs.onSurface,
-                ),
+              child: Row(
+                children: [
+                  const AppIconTile(size: 30),
+                  const SizedBox(width: 12),
+                  Text(
+                    'Chats',
+                    style: TextStyle(
+                      fontSize: 22,
+                      fontWeight: FontWeight.w800,
+                      color: cs.onSurface,
+                    ),
+                  ),
+                ],
               ),
             ),
             Expanded(

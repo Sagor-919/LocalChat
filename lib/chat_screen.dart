@@ -829,7 +829,7 @@ class _ChatScreenState extends State<ChatScreen> {
                                 fit: BoxFit.cover,
                                 width: 64,
                                 height: 64,
-                                errorBuilder: (_, e, s) => Icon(
+                                errorBuilder: (_, _, _) => Icon(
                                     Icons.broken_image,
                                     size: 24,
                                     color: cs.outline))
@@ -1158,7 +1158,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   width: 220,
                   height: 160,
                   fit: BoxFit.cover,
-                  errorBuilder: (_, e, s) =>
+                  errorBuilder: (_, _, _) =>
                       const Icon(Icons.broken_image, size: 48),
                 ),
               ),

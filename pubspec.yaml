@@ -20,6 +20,7 @@ dependencies:
   window_manager: ^0.4.3
   tray_manager: ^0.2.4
   flutter_foreground_task: ^8.17.0
+  permission_handler: ^11.4.0
 
 dev_dependencies:
   flutter_test:
@@ -38,5 +39,8 @@ flutter_launcher_icons:
   android: true
   image_path: assets/app_icon.png
   windows:
+    generate: true
+    image_path: assets/app_icon.png
+  macos:
     generate: true
     image_path: assets/app_icon.png
