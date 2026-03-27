@@ -52,9 +52,12 @@ class _ChatScreenState extends State<ChatScreen> {
   ConnectionChanged? _prevOnConnectionChanged;
   MessageReceived? _prevOnMessageReceived;
 
-  _IncomingFileTransfer? _activeIncomingTransfer;
-  _OutgoingFileTransfer? _activeOutgoingTransfer;
+  final Map<String, _IncomingFileTransfer> _incomingTransfersById = {};
+  final Map<String, _OutgoingFileTransfer> _outgoingTransfersById = {};
+  String? _activeIncomingFileId;
+  String? _activeOutgoingFileId;
   PlatformFile? _pendingAttachment;
+  Uint8List? _pendingAttachmentPreviewBytes;
 
   bool _loading = true;
   String? _error;
@@ -133,13 +136,14 @@ class _ChatScreenState extends State<ChatScreen> {
             chunks: List<Uint8List?>.filled(msg.totalChunks, null),
           );
           setState(() {
-            _activeIncomingTransfer = transfer;
+            _incomingTransfersById[msg.fileId] = transfer;
+            _activeIncomingFileId = msg.fileId;
           });
           // If it's a file we sent ourselves, we still treat it as incoming.
           return;
         }
         if (msg is ChatFileChunkMessage) {
-          final t = _activeIncomingTransfer;
+          final t = _incomingTransfersById[msg.fileId];
           if (t == null || t.fileId != msg.fileId) return;
           if (msg.index < 0 || msg.index >= t.totalChunks) return;
           if (t.chunks[msg.index] == null) {
@@ -148,13 +152,13 @@ class _ChatScreenState extends State<ChatScreen> {
             final prog = t.receivedChunks / t.totalChunks;
             setState(() {
               t._lastProgress = prog;
-              _activeIncomingTransfer = t;
+              _incomingTransfersById[msg.fileId] = t;
             });
           }
           return;
         }
         if (msg is ChatFileCompleteMessage) {
-          final t = _activeIncomingTransfer;
+          final t = _incomingTransfersById[msg.fileId];
           if (t == null || t.fileId != msg.fileId) return;
           unawaited(_handleIncomingFileComplete(t));
           return;
@@ -245,12 +249,26 @@ class _ChatScreenState extends State<ChatScreen> {
     final picked = await FilePicker.platform.pickFiles(
       type: FileType.any,
       allowMultiple: false,
-      withData: true,
+      withData: false,
     );
     if (picked == null || picked.files.isEmpty) return;
 
+    final pf = picked.files.single;
+    Uint8List? preview;
+    try {
+      final path = pf.path;
+      if (path != null && _isImageFileName(pf.name)) {
+        final f = File(path);
+        if (await f.exists()) {
+          // Small preview read (best-effort).
+          preview = await f.readAsBytes();
+        }
+      }
+    } catch (_) {}
+
     setState(() {
-      _pendingAttachment = picked.files.single;
+      _pendingAttachment = pf;
+      _pendingAttachmentPreviewBytes = preview;
       _error = null;
     });
     _composerFocus.requestFocus();
@@ -261,11 +279,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (file == null) return;
 
     final fileName = file.name;
-    final bytes = file.bytes;
-    if (bytes == null) {
-      setState(() => _error = 'Could not read file data.');
-      return;
-    }
+    final filePath = file.path;
 
     // Only allow sending when connected.
     final connected =
@@ -278,16 +292,24 @@ class _ChatScreenState extends State<ChatScreen> {
 
     final fileId = _uuid.v4();
     const int chunkSize = 16 * 1024;
-    final len = bytes.length;
+    int len = 0;
+    if (filePath != null) {
+      len = await File(filePath).length();
+    } else if (file.bytes != null) {
+      len = file.bytes!.length;
+    }
     final totalChunks = len == 0 ? 0 : ((len + chunkSize - 1) ~/ chunkSize);
 
     setState(() {
-      _activeOutgoingTransfer = _OutgoingFileTransfer(
+      _outgoingTransfersById[fileId] = _OutgoingFileTransfer(
         fileId: fileId,
         fileName: fileName,
         totalChunks: totalChunks,
+        totalBytes: len,
       ).._lastProgress = 0;
+      _activeOutgoingFileId = fileId;
       _pendingAttachment = null;
+      _pendingAttachmentPreviewBytes = null;
       _error = null;
     });
 
@@ -306,36 +328,79 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
       );
 
-      for (var i = 0; i < totalChunks; i++) {
-        final start = i * chunkSize;
-        if (start >= len) break;
-        final end = (start + chunkSize) > len ? len : (start + chunkSize);
-        final chunk = bytes.sublist(start, end);
+      final sw = Stopwatch()..start();
+      var sentBytes = 0;
 
-        final ok = widget.connections.sendWsMessage(
-          widget.peer.userId,
-          ChatFileChunkMessage(
-            fileId: fileId,
-            fromUserId: widget.me.userId,
-            index: i,
-            totalChunks: totalChunks,
-            base64Data: base64Encode(chunk),
-          ),
-        );
-        if (!ok) {
-          throw StateError('Socket closed while sending.');
-        }
+      if (filePath != null) {
+        final raf = await File(filePath).open();
+        try {
+          for (var i = 0; i < totalChunks; i++) {
+            final chunk = await raf.read(chunkSize);
+            if (chunk.isEmpty) break;
+            sentBytes += chunk.length;
 
-        final prog = (i + 1) / totalChunks;
-        // Update UI occasionally, not every chunk.
-        if (i % 3 == 0 || i == totalChunks - 1) {
-          setState(() {
-            if (_activeOutgoingTransfer != null) {
-              _activeOutgoingTransfer!._lastProgress = prog;
+            final ok = widget.connections.sendWsMessage(
+              widget.peer.userId,
+              ChatFileChunkMessage(
+                fileId: fileId,
+                fromUserId: widget.me.userId,
+                index: i,
+                totalChunks: totalChunks,
+                base64Data: base64Encode(chunk),
+              ),
+            );
+            if (!ok) throw StateError('Socket closed while sending.');
+
+            final prog = sentBytes / (len == 0 ? 1 : len);
+            if (i % 2 == 0 || i == totalChunks - 1) {
+              final t = _outgoingTransfersById[fileId];
+              if (t != null) {
+                t._lastProgress = prog.clamp(0, 1);
+                t.sentBytes = sentBytes;
+                t.elapsedMs = sw.elapsedMilliseconds;
+              }
+              if (mounted) setState(() {});
+              await Future<void>.delayed(Duration.zero);
             }
-          });
-          await Future<void>.delayed(Duration.zero);
+          }
+        } finally {
+          await raf.close();
         }
+      } else if (file.bytes != null) {
+        final bytes = file.bytes!;
+        for (var i = 0; i < totalChunks; i++) {
+          final start = i * chunkSize;
+          if (start >= bytes.length) break;
+          final end = (start + chunkSize) > bytes.length
+              ? bytes.length
+              : (start + chunkSize);
+          final chunk = bytes.sublist(start, end);
+          sentBytes += chunk.length;
+          final ok = widget.connections.sendWsMessage(
+            widget.peer.userId,
+            ChatFileChunkMessage(
+              fileId: fileId,
+              fromUserId: widget.me.userId,
+              index: i,
+              totalChunks: totalChunks,
+              base64Data: base64Encode(chunk),
+            ),
+          );
+          if (!ok) throw StateError('Socket closed while sending.');
+          final prog = sentBytes / (len == 0 ? 1 : len);
+          if (i % 2 == 0 || i == totalChunks - 1) {
+            final t = _outgoingTransfersById[fileId];
+            if (t != null) {
+              t._lastProgress = prog.clamp(0, 1);
+              t.sentBytes = sentBytes;
+              t.elapsedMs = sw.elapsedMilliseconds;
+            }
+            if (mounted) setState(() {});
+            await Future<void>.delayed(Duration.zero);
+          }
+        }
+      } else {
+        throw StateError('No file path/bytes available.');
       }
 
       final ok = widget.connections.sendWsMessage(
@@ -355,7 +420,7 @@ class _ChatScreenState extends State<ChatScreen> {
         senderDisplayName: widget.me.displayName,
         text: 'Attachment',
         attachmentName: fileName,
-        attachmentPath: file.path,
+        attachmentPath: filePath,
         sentAtMs: DateTime.now().millisecondsSinceEpoch,
         isMine: true,
       );
@@ -369,7 +434,8 @@ class _ChatScreenState extends State<ChatScreen> {
       final previousVisible = _messages.length;
       final target = previousVisible > 0 ? previousVisible + 1 : _pageSize;
       setState(() {
-        _activeOutgoingTransfer = null;
+        _outgoingTransfersById.remove(fileId);
+        if (_activeOutgoingFileId == fileId) _activeOutgoingFileId = null;
         _allMessages.add(chat);
         _allMessages.sort((a, b) => a.sentAtMs.compareTo(b.sentAtMs));
         _messages
@@ -381,7 +447,8 @@ class _ChatScreenState extends State<ChatScreen> {
       if (!mounted) return;
       setState(() {
         _error = 'File send failed: $e';
-        _activeOutgoingTransfer = null;
+        _outgoingTransfersById.remove(fileId);
+        if (_activeOutgoingFileId == fileId) _activeOutgoingFileId = null;
       });
     }
   }
@@ -415,7 +482,8 @@ class _ChatScreenState extends State<ChatScreen> {
       final previousVisible = _messages.length;
       final target = previousVisible > 0 ? previousVisible + 1 : _pageSize;
       setState(() {
-        _activeIncomingTransfer = null;
+        _incomingTransfersById.remove(t.fileId);
+        if (_activeIncomingFileId == t.fileId) _activeIncomingFileId = null;
         _allMessages.add(chat);
         _allMessages.sort((a, b) => a.sentAtMs.compareTo(b.sentAtMs));
         _messages
@@ -427,9 +495,29 @@ class _ChatScreenState extends State<ChatScreen> {
       if (!mounted) return;
       setState(() {
         _error = 'File receive failed: $e';
-        _activeIncomingTransfer = null;
+        _incomingTransfersById.remove(t.fileId);
+        if (_activeIncomingFileId == t.fileId) _activeIncomingFileId = null;
       });
     }
+  }
+
+  bool _isImageFileName(String name) {
+    final lower = name.toLowerCase();
+    return lower.endsWith('.png') ||
+        lower.endsWith('.jpg') ||
+        lower.endsWith('.jpeg') ||
+        lower.endsWith('.gif') ||
+        lower.endsWith('.webp');
+  }
+
+  String _formatBytes(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    final kb = bytes / 1024;
+    if (kb < 1024) return '${kb.toStringAsFixed(1)} KB';
+    final mb = kb / 1024;
+    if (mb < 1024) return '${mb.toStringAsFixed(1)} MB';
+    final gb = mb / 1024;
+    return '${gb.toStringAsFixed(1)} GB';
   }
 
   Future<void> _loadMoreOlder() async {
@@ -601,14 +689,20 @@ class _ChatScreenState extends State<ChatScreen> {
                   style: TextStyle(color: Theme.of(context).colorScheme.error),
                 ),
               ),
-            if (_activeIncomingTransfer != null)
+            if (_activeIncomingFileId != null &&
+                _incomingTransfersById[_activeIncomingFileId] != null)
               Padding(
                 padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
                 child: Align(
                   alignment: Alignment.centerLeft,
                   child: Text(
-                    'Receiving ${_activeIncomingTransfer!.fileName} '
-                    '(${(_activeIncomingTransfer!._lastProgress * 100).toStringAsFixed(0)}%)',
+                    () {
+                      final id = _activeIncomingFileId;
+                      final t = id == null ? null : _incomingTransfersById[id];
+                      if (t == null) return '';
+                      return 'Receiving ${t.fileName} '
+                          '(${(t._lastProgress * 100).toStringAsFixed(0)}%)';
+                    }(),
                     style: Theme.of(context).textTheme.bodySmall?.copyWith(
                           color: Theme.of(context).colorScheme.onSurfaceVariant,
                           fontWeight: FontWeight.w600,
@@ -616,14 +710,25 @@ class _ChatScreenState extends State<ChatScreen> {
                   ),
                 ),
               ),
-            if (_activeOutgoingTransfer != null)
+            if (_activeOutgoingFileId != null &&
+                _outgoingTransfersById[_activeOutgoingFileId] != null)
               Padding(
                 padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
                 child: Align(
                   alignment: Alignment.centerRight,
                   child: Text(
-                    'Sending ${_activeOutgoingTransfer!.fileName} '
-                    '(${(_activeOutgoingTransfer!._lastProgress * 100).toStringAsFixed(0)}%)',
+                    () {
+                      final id = _activeOutgoingFileId;
+                      final t = id == null ? null : _outgoingTransfersById[id];
+                      if (t == null) return '';
+                      final elapsed = (t.elapsedMs <= 0) ? 1 : t.elapsedMs;
+                      final speedBps = (t.sentBytes * 1000) ~/ elapsed;
+                      final remaining = (t.totalBytes - t.sentBytes).clamp(0, t.totalBytes);
+                      return 'Sending ${t.fileName} '
+                          '(${(t._lastProgress * 100).toStringAsFixed(0)}%) • '
+                          '${_formatBytes(speedBps)}/s • '
+                          '${_formatBytes(remaining)} left';
+                    }(),
                     style: Theme.of(context).textTheme.bodySmall?.copyWith(
                           color: Theme.of(context).colorScheme.onSurfaceVariant,
                           fontWeight: FontWeight.w600,
@@ -840,7 +945,18 @@ class _ChatScreenState extends State<ChatScreen> {
                         ),
                         child: Row(
                           children: [
-                            const Icon(Icons.insert_drive_file, size: 18),
+                            if (_pendingAttachmentPreviewBytes != null)
+                              ClipRRect(
+                                borderRadius: BorderRadius.circular(6),
+                                child: Image.memory(
+                                  _pendingAttachmentPreviewBytes!,
+                                  width: 28,
+                                  height: 28,
+                                  fit: BoxFit.cover,
+                                ),
+                              )
+                            else
+                              const Icon(Icons.insert_drive_file, size: 18),
                             const SizedBox(width: 8),
                             Expanded(
                               child: Text(
@@ -935,13 +1051,17 @@ class _OutgoingFileTransfer {
   final String fileId;
   final String fileName;
   final int totalChunks;
+  final int totalBytes;
 
   double _lastProgress = 0.0;
+  int sentBytes = 0;
+  int elapsedMs = 0;
 
   _OutgoingFileTransfer({
     required this.fileId,
     required this.fileName,
     required this.totalChunks,
+    required this.totalBytes,
   });
 }
 
