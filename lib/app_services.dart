@@ -8,6 +8,7 @@ import 'services/chat_storage.dart';
 import 'services/device_identity.dart';
 import 'services/mdns_presence_service.dart';
 import 'services/notification_service.dart';
+import 'services/settings_storage.dart';
 import 'services/ws_connection_service.dart';
 import 'services/ws_protocol.dart';
 import 'screens/chat_screen.dart';
@@ -22,6 +23,7 @@ class AppServices {
   MdnsPresenceService? presence;
   WsConnectionService? connections;
   ChatStorage? chatStorage;
+  SettingsStorage? settings;
   final NotificationService notifications = NotificationService();
 
   bool isInForeground = true;
@@ -34,6 +36,7 @@ class AppServices {
     _identityRepo = await DeviceIdentityRepository.create();
     identity = await _identityRepo!.loadOrCreate();
     chatStorage = await ChatStorage.create();
+    settings = await SettingsStorage.create();
 
     connections = WsConnectionService(
       identity: identity!,
@@ -69,12 +72,14 @@ class AppServices {
       unawaited(chatStorage?.appendMessage(peer.userId, chat));
 
       if (!isInForeground) {
-        unawaited(
-          notifications.showIncomingMessage(
-            peer: peer,
-            message: msg.text,
-          ),
-        );
+        if (settings?.notificationsEnabled ?? true) {
+          unawaited(
+            notifications.showIncomingMessage(
+              peer: peer,
+              message: msg.text,
+            ),
+          );
+        }
       }
     };
 

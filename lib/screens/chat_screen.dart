@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
+import 'dart:isolate';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -147,13 +148,18 @@ class _ChatScreenState extends State<ChatScreen> {
           if (t == null || t.fileId != msg.fileId) return;
           if (msg.index < 0 || msg.index >= t.totalChunks) return;
           if (t.chunks[msg.index] == null) {
-            t.chunks[msg.index] = base64Decode(msg.base64Data);
-            t.receivedChunks++;
-            final prog = t.receivedChunks / t.totalChunks;
-            setState(() {
-              t._lastProgress = prog;
-              _incomingTransfersById[msg.fileId] = t;
-            });
+            unawaited(() async {
+              final decoded = await _base64DecodeAsync(msg.base64Data);
+              if (!mounted) return;
+              if (t.chunks[msg.index] != null) return;
+              t.chunks[msg.index] = decoded;
+              t.receivedChunks++;
+              final prog = t.receivedChunks / t.totalChunks;
+              setState(() {
+                t._lastProgress = prog;
+                _incomingTransfersById[msg.fileId] = t;
+              });
+            }());
           }
           return;
         }
@@ -235,7 +241,16 @@ class _ChatScreenState extends State<ChatScreen> {
     return out;
   }
 
+  Future<String> _base64EncodeAsync(Uint8List bytes) {
+    return Isolate.run(() => base64Encode(bytes));
+  }
+
+  Future<Uint8List> _base64DecodeAsync(String data) {
+    return Isolate.run(() => base64Decode(data));
+  }
+
   Future<String> _saveReceivedFile(Uint8List bytes, String originalName) async {
+    // Download path will be configurable via Settings screen; for now use temp.
     final dir = Directory.systemTemp;
     final safeName = originalName.replaceAll('/', '_');
     final fileName = '${DateTime.now().millisecondsSinceEpoch}-$safeName';
@@ -339,6 +354,7 @@ class _ChatScreenState extends State<ChatScreen> {
             if (chunk.isEmpty) break;
             sentBytes += chunk.length;
 
+            final b64 = await _base64EncodeAsync(Uint8List.fromList(chunk));
             final ok = widget.connections.sendWsMessage(
               widget.peer.userId,
               ChatFileChunkMessage(
@@ -346,7 +362,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 fromUserId: widget.me.userId,
                 index: i,
                 totalChunks: totalChunks,
-                base64Data: base64Encode(chunk),
+                base64Data: b64,
               ),
             );
             if (!ok) throw StateError('Socket closed while sending.');
@@ -376,6 +392,7 @@ class _ChatScreenState extends State<ChatScreen> {
               : (start + chunkSize);
           final chunk = bytes.sublist(start, end);
           sentBytes += chunk.length;
+          final b64 = await _base64EncodeAsync(Uint8List.fromList(chunk));
           final ok = widget.connections.sendWsMessage(
             widget.peer.userId,
             ChatFileChunkMessage(
@@ -383,7 +400,7 @@ class _ChatScreenState extends State<ChatScreen> {
               fromUserId: widget.me.userId,
               index: i,
               totalChunks: totalChunks,
-              base64Data: base64Encode(chunk),
+              base64Data: b64,
             ),
           );
           if (!ok) throw StateError('Socket closed while sending.');

@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import '../app_services.dart';
 import '../models/peer_device.dart';
 import '../screens/chat_screen.dart';
+import '../screens/settings_screen.dart';
 import '../services/ws_connection_service.dart';
 
 class NearbyDevicesScreen extends StatefulWidget {
@@ -293,6 +294,18 @@ class _NearbyDevicesScreenState extends State<NearbyDevicesScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Nearby Devices'),
+        actions: [
+          IconButton(
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => SettingsScreen(services: widget.services),
+                ),
+              );
+            },
+            icon: const Icon(Icons.settings),
+          ),
+        ],
       ),
       body: SafeArea(
         child: ListView(

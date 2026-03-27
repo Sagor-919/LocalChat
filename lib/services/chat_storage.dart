@@ -21,6 +21,20 @@ class ChatStorage {
   String _keyForPeer(String peerUserId) => '$_keyPrefix$peerUserId';
   String _readKeyForPeer(String peerUserId) => '$_readPrefix$peerUserId';
 
+  Future<void> clearPeer(String peerUserId) async {
+    await _prefs.remove(_keyForPeer(peerUserId));
+    await _prefs.remove(_readKeyForPeer(peerUserId));
+  }
+
+  Future<void> clearAll() async {
+    final keys = _prefs.getKeys().toList();
+    for (final k in keys) {
+      if (k.startsWith(_keyPrefix) || k.startsWith(_readPrefix)) {
+        await _prefs.remove(k);
+      }
+    }
+  }
+
   List<ChatMessage> loadMessages(String peerUserId) {
     final raw = _prefs.getString(_keyForPeer(peerUserId));
     if (raw == null || raw.isEmpty) return const [];
