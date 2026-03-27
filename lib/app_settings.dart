@@ -1,11 +1,15 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 class AppSettings {
   static final instance = AppSettings._();
   AppSettings._();
+
+  static const _kFirstLaunchPermissionsDone = 'first_launch_permissions_done';
 
   late SharedPreferences _prefs;
 
@@ -13,9 +17,6 @@ class AppSettings {
   final notificationsMuted = ValueNotifier<bool>(false);
   final downloadPath = ValueNotifier<String>('');
   final startWithWindows = ValueNotifier<bool>(false);
-  /// Android: keep discovery/chat active via foreground service when app is in background.
-  final backgroundRunningEnabled = ValueNotifier<bool>(true);
-
   /// Desktop: when true, closing the window hides to tray and keeps LAN active; when false, exit the app.
   final desktopRunInBackground = ValueNotifier<bool>(true);
 
@@ -31,16 +32,22 @@ class AppSettings {
 
     notificationsMuted.value = _prefs.getBool('notifications_muted') ?? false;
 
-    backgroundRunningEnabled.value =
-        _prefs.getBool('background_running') ?? true;
-
     if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
       desktopRunInBackground.value =
           _prefs.getBool('desktop_run_in_background') ?? true;
     }
 
-    downloadPath.value =
-        _prefs.getString('download_path') ?? _defaultDownloadPath();
+    final savedPath = _prefs.getString('download_path');
+    if (savedPath == null || savedPath.isEmpty) {
+      final path = await ensureLocalChatDownloadDirectory();
+      downloadPath.value = path;
+      await _prefs.setString('download_path', path);
+    } else {
+      downloadPath.value = savedPath;
+      try {
+        await Directory(savedPath).create(recursive: true);
+      } catch (_) {}
+    }
 
     if (Platform.isWindows) {
       startWithWindows.value = await _readStartupRegistry();
@@ -62,11 +69,6 @@ class AppSettings {
     await _prefs.setBool('notifications_muted', muted);
   }
 
-  Future<void> setBackgroundRunningEnabled(bool enabled) async {
-    backgroundRunningEnabled.value = enabled;
-    await _prefs.setBool('background_running', enabled);
-  }
-
   Future<void> setDesktopRunInBackground(bool enabled) async {
     if (!(Platform.isWindows || Platform.isLinux || Platform.isMacOS)) {
       return;
@@ -78,6 +80,13 @@ class AppSettings {
   Future<void> setDownloadPath(String path) async {
     downloadPath.value = path;
     await _prefs.setString('download_path', path);
+  }
+
+  bool get firstLaunchPermissionsDone =>
+      _prefs.getBool(_kFirstLaunchPermissionsDone) ?? false;
+
+  Future<void> setFirstLaunchPermissionsDone() async {
+    await _prefs.setBool(_kFirstLaunchPermissionsDone, true);
   }
 
   Future<void> setStartWithWindows(bool enabled) async {
@@ -116,16 +125,24 @@ class AppSettings {
     }
   }
 
-  static String _defaultDownloadPath() {
-    if (Platform.isWindows) {
-      final userProfile = Platform.environment['USERPROFILE'];
-      if (userProfile != null) return '$userProfile\\Downloads';
-      return Directory.systemTemp.path;
+  /// Default save folder: `Downloads/LocalChat Folder` (desktop) or app `Documents/LocalChat Folder` (Android).
+  static Future<String> ensureLocalChatDownloadDirectory() async {
+    const folderName = 'LocalChat Folder';
+    if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
+      final downloads = await getDownloadsDirectory();
+      final base = downloads?.path ?? Directory.systemTemp.path;
+      final dir = Directory(p.join(base, folderName));
+      await dir.create(recursive: true);
+      return dir.path;
     }
-    if (Platform.isAndroid) {
-      final appDir = Directory.systemTemp.parent.path;
-      return '$appDir/files/LocalChat/Downloads';
+    if (Platform.isAndroid || Platform.isIOS) {
+      final docDir = await getApplicationDocumentsDirectory();
+      final dir = Directory(p.join(docDir.path, folderName));
+      await dir.create(recursive: true);
+      return dir.path;
     }
-    return Directory.systemTemp.path;
+    final fallback = Directory(p.join(Directory.systemTemp.path, folderName));
+    await fallback.create(recursive: true);
+    return fallback.path;
   }
 }

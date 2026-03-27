@@ -13,9 +13,9 @@ import 'app_settings.dart';
 import 'chat_screen.dart';
 import 'connection_service.dart';
 import 'device.dart';
+import 'first_launch_prompt.dart';
 import 'discovery_service.dart';
 import 'home_screen.dart';
-import 'lan_foreground.dart';
 import 'message_model.dart';
 import 'message_store.dart';
 import 'settings_screen.dart';
@@ -195,7 +195,6 @@ NotificationDetails _incomingMessageNotificationDetails() {
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  registerLanForegroundPort();
 
   if (_isDesktop) {
     await windowManager.ensureInitialized();
@@ -326,15 +325,10 @@ class LocalChatApp extends StatefulWidget {
 
 class _LocalChatAppState extends State<LocalChatApp>
     with WidgetsBindingObserver, TrayListener, WindowListener {
-  Timer? _androidStopForegroundTimer;
-
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    if (!kIsWeb && Platform.isAndroid) {
-      initLanForegroundTask();
-    }
     if (_isDesktop) {
       windowManager.addListener(this);
       trayManager.addListener(this);
@@ -346,7 +340,14 @@ class _LocalChatAppState extends State<LocalChatApp>
         });
       });
     } else {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        if (!kIsWeb && Platform.isAndroid) {
+          final ctx = appNavigatorKey.currentContext;
+          if (ctx != null && ctx.mounted) {
+            await showFirstLaunchPermissionsIfNeeded(ctx);
+          }
+        }
+        if (!mounted) return;
         unawaited(_tryOpenChatFromColdStartNotification());
       });
     }
@@ -354,7 +355,6 @@ class _LocalChatAppState extends State<LocalChatApp>
 
   @override
   void dispose() {
-    _androidStopForegroundTimer?.cancel();
     if (_isDesktop) {
       windowManager.removeListener(this);
       trayManager.removeListener(this);
@@ -475,22 +475,6 @@ class _LocalChatAppState extends State<LocalChatApp>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     _appInForeground = state == AppLifecycleState.resumed ||
         state == AppLifecycleState.inactive;
-    if (!kIsWeb && Platform.isAndroid) {
-      final bg = AppSettings.instance.backgroundRunningEnabled.value;
-      if (bg &&
-          (state == AppLifecycleState.inactive ||
-              state == AppLifecycleState.hidden ||
-              state == AppLifecycleState.paused)) {
-        _androidStopForegroundTimer?.cancel();
-        unawaited(startLanForegroundIfNeeded());
-      }
-      if (state == AppLifecycleState.resumed) {
-        _androidStopForegroundTimer?.cancel();
-        _androidStopForegroundTimer = Timer(const Duration(milliseconds: 600), () {
-          unawaited(stopLanForeground());
-        });
-      }
-    }
   }
 
   @override

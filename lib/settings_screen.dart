@@ -9,7 +9,6 @@ import 'package:url_launcher/url_launcher.dart';
 import 'android_storage_access.dart';
 import 'app_branding.dart';
 import 'app_settings.dart';
-import 'lan_foreground.dart';
 import 'message_store.dart';
 
 class SettingsScreen extends StatefulWidget {
@@ -115,75 +114,37 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
           const SizedBox(height: 16),
 
-          if (_isAndroid || _isDesktop) ...[
+          if (_isDesktop) ...[
             _sectionLabel(context, 'BACKGROUND'),
             _card(
               isDark: isDark,
               cs: cs,
-              child: _isAndroid
-                  ? ValueListenableBuilder<bool>(
-                      valueListenable: _settings.backgroundRunningEnabled,
-                      builder: (_, enabled, _) {
-                        return SwitchListTile(
-                          shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(16)),
-                          secondary: Icon(
-                            enabled
-                                ? Icons.notifications_active_outlined
-                                : Icons.notifications_off_outlined,
-                            color: cs.primary,
-                          ),
-                          title: const Text('Run in background'),
-                          subtitle: Text(
-                            enabled
-                                ? 'Keeps LAN discovery, chat, and file transfer running after you leave the app. Android shows a low-priority ongoing notification while this is on—required for background networking.'
-                                : 'Turn on to keep LAN features active in the background. Android will show a silent ongoing notification while the app runs in the background.',
-                          ),
-                          value: enabled,
-                          onChanged: (v) async {
-                            await _settings.setBackgroundRunningEnabled(v);
-                            if (!v) {
-                              await stopLanForeground();
-                            } else {
-                              final life =
-                                  WidgetsBinding.instance.lifecycleState;
-                              if (life == AppLifecycleState.paused ||
-                                  life == AppLifecycleState.inactive ||
-                                  life == AppLifecycleState.hidden) {
-                                await startLanForegroundIfNeeded();
-                              }
-                            }
-                            if (mounted) setState(() {});
-                          },
-                        );
-                      },
-                    )
-                  : ValueListenableBuilder<bool>(
-                      valueListenable: _settings.desktopRunInBackground,
-                      builder: (_, enabled, _) {
-                        return SwitchListTile(
-                          shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(16)),
-                          secondary: Icon(
-                            enabled
-                                ? Icons.visibility_outlined
-                                : Icons.power_settings_new_outlined,
-                            color: cs.primary,
-                          ),
-                          title: const Text('Run in background'),
-                          subtitle: Text(
-                            enabled
-                                ? 'Closing the window keeps Local Chat in the system tray so LAN chat and discovery stay active.'
-                                : 'Closing the window exits the app completely.',
-                          ),
-                          value: enabled,
-                          onChanged: (v) async {
-                            await _settings.setDesktopRunInBackground(v);
-                            if (mounted) setState(() {});
-                          },
-                        );
-                      },
+              child: ValueListenableBuilder<bool>(
+                valueListenable: _settings.desktopRunInBackground,
+                builder: (_, enabled, _) {
+                  return SwitchListTile(
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16)),
+                    secondary: Icon(
+                      enabled
+                          ? Icons.visibility_outlined
+                          : Icons.power_settings_new_outlined,
+                      color: cs.primary,
                     ),
+                    title: const Text('Run in background'),
+                    subtitle: Text(
+                      enabled
+                          ? 'Closing the window keeps Local Chat in the system tray so LAN chat and discovery stay active.'
+                          : 'Closing the window exits the app completely.',
+                    ),
+                    value: enabled,
+                    onChanged: (v) async {
+                      await _settings.setDesktopRunInBackground(v);
+                      if (mounted) setState(() {});
+                    },
+                  );
+                },
+              ),
             ),
             const SizedBox(height: 16),
           ],
