@@ -19,6 +19,20 @@ class ConnectionService {
 
   ConnectionService({required this.me});
 
+  Future<Socket> _connectChatSocket(String host, int port) async {
+    final trimmed = host.trim();
+    if (trimmed.isEmpty) {
+      throw const SocketException('Empty peer address');
+    }
+    final addr = InternetAddress.tryParse(trimmed);
+    if (addr != null) {
+      return Socket.connect(addr, port,
+          timeout: const Duration(seconds: 8));
+    }
+    return Socket.connect(trimmed, port,
+        timeout: const Duration(seconds: 8));
+  }
+
   Future<void> startServer() async {
     _server = await ServerSocket.bind(InternetAddress.anyIPv4, tcpPort);
     _server!.listen(_handleIncoming);
@@ -28,17 +42,21 @@ class ConnectionService {
     _attachSocket(socket, null);
   }
 
-  Future<Socket?> connectTo(PeerDevice peer) async {
+  Future<Socket?> connectTo(PeerDevice peer, {bool forceNew = false}) async {
+    if (forceNew && _sockets.containsKey(peer.userId)) {
+      await disconnect(peer.userId);
+    }
+
     final existing = _sockets[peer.userId];
     if (existing != null) return existing;
 
     try {
-      final socket = await Socket.connect(peer.ip, peer.port,
-          timeout: const Duration(seconds: 4));
+      final socket = await _connectChatSocket(peer.ip, peer.port);
 
       _attachSocket(socket, peer.userId);
 
-      sendJson(peer.userId, {'type': 'hello', 'id': me.userId, 'name': me.displayName});
+      sendJson(peer.userId,
+          {'type': 'hello', 'id': me.userId, 'name': me.displayName});
       return socket;
     } catch (_) {
       return null;
@@ -66,16 +84,16 @@ class ConnectionService {
       },
       onDone: () {
         if (peerId != null) {
-          _sockets.remove(peerId);
+          final had = _sockets.remove(peerId) != null;
           _buffers.remove(peerId);
-          onDisconnected?.call(peerId!);
+          if (had) onDisconnected?.call(peerId!);
         }
       },
       onError: (_) {
         if (peerId != null) {
-          _sockets.remove(peerId);
+          final had = _sockets.remove(peerId) != null;
           _buffers.remove(peerId);
-          onDisconnected?.call(peerId!);
+          if (had) onDisconnected?.call(peerId!);
         }
       },
       cancelOnError: true,
@@ -85,6 +103,10 @@ class ConnectionService {
       _sockets[peerId!] = socket;
       _buffers[peerId!] = buf;
     }
+
+    try {
+      socket.setOption(SocketOption.tcpNoDelay, true);
+    } catch (_) {}
   }
 
   void _processBuffer(
@@ -128,6 +150,12 @@ class ConnectionService {
       socket.write('${jsonEncode(json)}\n');
       return true;
     } catch (_) {
+      _sockets.remove(peerId);
+      _buffers.remove(peerId);
+      try {
+        socket.destroy();
+      } catch (_) {}
+      onDisconnected?.call(peerId);
       return false;
     }
   }

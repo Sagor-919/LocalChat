@@ -1,13 +1,17 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
+import 'android_app_control.dart';
 import 'chat_screen.dart';
 import 'connection_service.dart';
 import 'device.dart';
 import 'discovery_service.dart';
+import 'message_model.dart';
 import 'message_store.dart';
 import 'settings_screen.dart';
+import 'transfer_manager.dart';
 
 class HomeScreen extends StatefulWidget {
   final DeviceInfo me;
@@ -34,11 +38,36 @@ class _HomeScreenState extends State<HomeScreen> {
   void Function(String, Map<String, dynamic>)? _prevOnMessage;
 
   List<_PeerEntry> _peerList = [];
+  StreamSubscription<FileMessageEvent>? _fileMsgSub;
+
+  void _onMessageHistoryRevision() {
+    final sig = widget.store.consumePendingHistoryClear();
+    if (sig == null) return;
+    if (sig.all) {
+      _lastMsg.clear();
+      _lastMsgTime.clear();
+      _unread.clear();
+      unawaited(_refreshPeerList());
+    } else {
+      final id = sig.peerId;
+      if (id != null) {
+        _lastMsg.remove(id);
+        _lastMsgTime.remove(id);
+        _unread.remove(id);
+        if (mounted) setState(() {});
+      }
+    }
+  }
 
   @override
   void initState() {
     super.initState();
+    widget.store.messageHistoryRevision.addListener(_onMessageHistoryRevision);
     _refreshPeerList();
+
+    _fileMsgSub = TransferManager.instance.fileMessages.listen((e) {
+      unawaited(_syncPreviewFromStore(e.peerId));
+    });
 
     widget.discovery.onPeersChanged = () {
       if (mounted) {
@@ -62,7 +91,7 @@ class _HomeScreenState extends State<HomeScreen> {
               _lastMsgTime[peerId] = (json['time'] as num?)?.toInt() ??
                   DateTime.now().millisecondsSinceEpoch;
             } else {
-              _lastMsg[peerId] = 'Sending file...';
+              _lastMsg[peerId] = 'Incoming file\u2026';
               _lastMsgTime[peerId] = DateTime.now().millisecondsSinceEpoch;
             }
           });
@@ -106,10 +135,46 @@ class _HomeScreenState extends State<HomeScreen> {
     }
 
     if (mounted) setState(() => _peerList = list);
+    await _hydratePreviewsFromStore(list);
+  }
+
+  String _subtitleForMessage(ChatMessage m) {
+    final name = m.attachmentName;
+    if (name != null && name.isNotEmpty) {
+      return 'File: $name';
+    }
+    return m.text;
+  }
+
+  Future<void> _syncPreviewFromStore(String peerId) async {
+    final list = await widget.store.load(peerId);
+    if (!mounted) return;
+    if (list.isEmpty) return;
+    list.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+    final last = list.last;
+    setState(() {
+      _lastMsgTime[peerId] = last.timestamp;
+      _lastMsg[peerId] = _subtitleForMessage(last);
+    });
+  }
+
+  Future<void> _hydratePreviewsFromStore(List<_PeerEntry> entries) async {
+    for (final e in entries) {
+      final list = await widget.store.load(e.userId);
+      if (!mounted) return;
+      if (list.isEmpty) continue;
+      list.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+      final last = list.last;
+      _lastMsg[e.userId] = _subtitleForMessage(last);
+      _lastMsgTime[e.userId] = last.timestamp;
+    }
+    if (mounted) setState(() {});
   }
 
   @override
   void dispose() {
+    widget.store.messageHistoryRevision.removeListener(_onMessageHistoryRevision);
+    _fileMsgSub?.cancel();
     widget.discovery.onPeersChanged = null;
     widget.connections.onMessage = _prevOnMessage;
     super.dispose();
@@ -191,7 +256,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final cs = Theme.of(context).colorScheme;
     final isDark = Theme.of(context).brightness == Brightness.dark;
 
-    return Scaffold(
+    final home = Scaffold(
       backgroundColor: isDark ? cs.surface : const Color(0xFFF5F5FA),
       body: SafeArea(
         child: Column(
@@ -250,6 +315,19 @@ class _HomeScreenState extends State<HomeScreen> {
           ],
         ),
       ),
+    );
+
+    final useAndroidBackToBg =
+        !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+    if (!useAndroidBackToBg) return home;
+
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) {
+        if (didPop) return;
+        unawaited(moveAndroidTaskToBackground());
+      },
+      child: home,
     );
   }
 
@@ -418,7 +496,17 @@ class _HomeScreenState extends State<HomeScreen> {
                                 : FontWeight.normal,
                           ),
                         ),
-                      ] else if (!entry.online) ...[
+                      ] else if (entry.online) ...[
+                        const SizedBox(height: 2),
+                        Text(
+                          'Online',
+                          style: TextStyle(
+                            fontSize: 13,
+                            color: cs.outline,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ] else ...[
                         const SizedBox(height: 2),
                         Text(
                           'Offline',
@@ -493,6 +581,7 @@ class _HomeScreenState extends State<HomeScreen> {
         builder: (_) => ChatScreen(
           me: widget.me,
           peer: peer,
+          discovery: widget.discovery,
           connections: widget.connections,
           store: widget.store,
         ),

@@ -2,11 +2,44 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
+
 import 'message_model.dart';
 
 class MessageStore {
   late final String _basePath;
   final Map<String, Future<void>> _locks = {};
+
+  /// Notified after [clear] / [clearAll]; [HomeScreen] resets chat previews.
+  final ValueNotifier<int> messageHistoryRevision = ValueNotifier(0);
+  bool _pendingClearAll = false;
+  String? _pendingClearPeerId;
+
+  void _notifyHistoryCleared({required bool all, String? peerId}) {
+    if (all) {
+      _pendingClearAll = true;
+      _pendingClearPeerId = null;
+    } else {
+      _pendingClearAll = false;
+      _pendingClearPeerId = peerId;
+    }
+    messageHistoryRevision.value++;
+  }
+
+  /// Returns null if no clear event is pending for this revision.
+  ({bool all, String? peerId})? consumePendingHistoryClear() {
+    if (_pendingClearAll) {
+      _pendingClearAll = false;
+      _pendingClearPeerId = null;
+      return (all: true, peerId: null);
+    }
+    final id = _pendingClearPeerId;
+    if (id != null) {
+      _pendingClearPeerId = null;
+      return (all: false, peerId: id);
+    }
+    return null;
+  }
 
   MessageStore._();
 
@@ -128,6 +161,20 @@ class MessageStore {
     });
   }
 
+  Future<void> updateTransferDismissed(
+      String peerId, String messageId) async {
+    return _withLock(peerId, () async {
+      final messages = await _loadRawUnsafe(peerId);
+      for (final m in messages) {
+        if (m['id'] == messageId) {
+          m['transferDismissed'] = true;
+          break;
+        }
+      }
+      await _file(peerId).writeAsString(jsonEncode(messages));
+    });
+  }
+
   Future<List<Map<String, dynamic>>> _loadRawUnsafe(String peerId) async {
     final f = _file(peerId);
     if (!await f.exists()) return [];
@@ -143,6 +190,7 @@ class MessageStore {
     return _withLock(peerId, () async {
       final f = _file(peerId);
       if (await f.exists()) await f.delete();
+      _notifyHistoryCleared(all: false, peerId: peerId);
     });
   }
 
@@ -153,6 +201,7 @@ class MessageStore {
         if (f is File) await f.delete();
       }
     }
+    _notifyHistoryCleared(all: true);
   }
 
   Future<void> removePeerInfo(String peerId) async {

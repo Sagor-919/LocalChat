@@ -7,6 +7,8 @@ class ChatMessage {
   final String? attachmentName;
   final String? attachmentPath;
   final int? attachmentSize;
+  /// User dismissed a failed/cancelled transfer; show strikethrough / muted bubble.
+  final bool transferDismissed;
 
   const ChatMessage({
     required this.id,
@@ -17,6 +19,7 @@ class ChatMessage {
     this.attachmentName,
     this.attachmentPath,
     this.attachmentSize,
+    this.transferDismissed = false,
   });
 
   /// For sending over TCP (text messages only).
@@ -50,6 +53,7 @@ class ChatMessage {
         'attachmentName': attachmentName,
         'attachmentPath': attachmentPath,
         'attachmentSize': attachmentSize,
+        'transferDismissed': transferDismissed,
       };
 
   static ChatMessage fromStore(Map<String, dynamic> json) {
@@ -62,6 +66,31 @@ class ChatMessage {
       attachmentName: json['attachmentName'] as String?,
       attachmentPath: json['attachmentPath'] as String?,
       attachmentSize: (json['attachmentSize'] as num?)?.toInt(),
+      transferDismissed: json['transferDismissed'] as bool? ?? false,
+    );
+  }
+
+  ChatMessage copyWith({
+    String? id,
+    String? senderId,
+    String? text,
+    int? timestamp,
+    bool? isMine,
+    String? attachmentName,
+    String? attachmentPath,
+    int? attachmentSize,
+    bool? transferDismissed,
+  }) {
+    return ChatMessage(
+      id: id ?? this.id,
+      senderId: senderId ?? this.senderId,
+      text: text ?? this.text,
+      timestamp: timestamp ?? this.timestamp,
+      isMine: isMine ?? this.isMine,
+      attachmentName: attachmentName ?? this.attachmentName,
+      attachmentPath: attachmentPath ?? this.attachmentPath,
+      attachmentSize: attachmentSize ?? this.attachmentSize,
+      transferDismissed: transferDismissed ?? this.transferDismissed,
     );
   }
 }

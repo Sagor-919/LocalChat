@@ -1,9 +1,11 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'app_settings.dart';
@@ -11,9 +13,13 @@ import 'connection_service.dart';
 import 'device.dart';
 import 'discovery_service.dart';
 import 'home_screen.dart';
+import 'lan_foreground.dart';
 import 'message_model.dart';
 import 'message_store.dart';
+import 'settings_screen.dart';
 import 'transfer_manager.dart';
+
+final GlobalKey<NavigatorState> appNavigatorKey = GlobalKey<NavigatorState>();
 
 late DeviceInfo _me;
 late DiscoveryService _discovery;
@@ -28,6 +34,7 @@ bool get _isDesktop =>
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  registerLanForegroundPort();
 
   if (_isDesktop) {
     await windowManager.ensureInitialized();
@@ -37,6 +44,7 @@ Future<void> main() async {
     await windowManager.setMinimumSize(const Size(360, 500));
     await windowManager.center();
     await windowManager.setTitle('Local Chat');
+    await windowManager.setPreventClose(true);
     await windowManager.show();
   }
 
@@ -119,6 +127,7 @@ Future<void> main() async {
   };
 
   TransferManager.instance.fileMessages.listen((event) {
+    if (event.message.isMine) return;
     if (!_appInForeground &&
         !AppSettings.instance.notificationsMuted.value) {
       final peer =
@@ -145,6 +154,14 @@ Future<void> main() async {
   runApp(const LocalChatApp());
 }
 
+/// Path relative to `data/flutter_assets/` — [tray_manager] builds the real path.
+String _trayAssetPath() {
+  if (Platform.isWindows) {
+    return 'windows/runner/resources/app_icon.ico';
+  }
+  return 'assets/app_icon.png';
+}
+
 class LocalChatApp extends StatefulWidget {
   const LocalChatApp({super.key});
 
@@ -153,23 +170,112 @@ class LocalChatApp extends StatefulWidget {
 }
 
 class _LocalChatAppState extends State<LocalChatApp>
-    with WidgetsBindingObserver {
+    with WidgetsBindingObserver, TrayListener, WindowListener {
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    if (!kIsWeb && Platform.isAndroid) {
+      initLanForegroundTask();
+    }
+    if (_isDesktop) {
+      windowManager.addListener(this);
+      trayManager.addListener(this);
+      WidgetsBinding.instance.addPostFrameCallback((_) => _initTray());
+    }
   }
 
   @override
   void dispose() {
+    if (_isDesktop) {
+      windowManager.removeListener(this);
+      trayManager.removeListener(this);
+    }
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
+  }
+
+  Future<void> _initTray() async {
+    if (!_isDesktop) return;
+    try {
+      await trayManager.setIcon(_trayAssetPath());
+      await trayManager.setToolTip('Local Chat');
+      await trayManager.setContextMenu(Menu(
+        items: [
+          MenuItem(key: 'show', label: 'Show Local Chat'),
+          MenuItem(key: 'settings', label: 'Open Settings'),
+          MenuItem.separator(),
+          MenuItem(key: 'exit', label: 'Close app'),
+        ],
+      ));
+    } catch (_) {}
+  }
+
+  Future<void> _quitFromTray() async {
+    await trayManager.destroy();
+    await windowManager.setPreventClose(false);
+    await windowManager.close();
+  }
+
+  void _openSettingsFromTray() {
+    final ctx = appNavigatorKey.currentContext;
+    if (ctx == null) return;
+    Navigator.of(ctx).push(
+      MaterialPageRoute<void>(
+        builder: (_) => SettingsScreen(store: _store),
+      ),
+    );
+    unawaited(windowManager.show());
+    unawaited(windowManager.focus());
+  }
+
+  @override
+  void onWindowClose() {
+    if (_isDesktop) {
+      unawaited(windowManager.hide());
+    }
+  }
+
+  @override
+  void onTrayIconMouseDown() {
+    if (!_isDesktop) return;
+    unawaited(windowManager.show());
+    unawaited(windowManager.focus());
+  }
+
+  @override
+  void onTrayIconRightMouseDown() {
+    if (!_isDesktop) return;
+    unawaited(trayManager.popUpContextMenu());
+  }
+
+  @override
+  void onTrayMenuItemClick(MenuItem menuItem) {
+    switch (menuItem.key) {
+      case 'show':
+        unawaited(windowManager.show());
+        unawaited(windowManager.focus());
+        break;
+      case 'settings':
+        _openSettingsFromTray();
+        break;
+      case 'exit':
+        unawaited(_quitFromTray());
+        break;
+    }
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     _appInForeground = state == AppLifecycleState.resumed ||
         state == AppLifecycleState.inactive;
+    if (!kIsWeb && Platform.isAndroid) {
+      if (state == AppLifecycleState.paused) {
+        unawaited(startLanForegroundIfNeeded());
+      } else if (state == AppLifecycleState.resumed) {
+        unawaited(stopLanForeground());
+      }
+    }
   }
 
   @override
@@ -178,6 +284,7 @@ class _LocalChatAppState extends State<LocalChatApp>
       valueListenable: AppSettings.instance.themeMode,
       builder: (_, mode, child) {
         return MaterialApp(
+          navigatorKey: appNavigatorKey,
           title: 'Local Chat',
           debugShowCheckedModeBanner: false,
           themeMode: mode,

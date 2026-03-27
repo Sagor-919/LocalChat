@@ -14,6 +14,7 @@ import 'package:uuid/uuid.dart';
 
 import 'connection_service.dart';
 import 'device.dart';
+import 'discovery_service.dart';
 import 'message_model.dart';
 import 'message_store.dart';
 import 'transfer_manager.dart';
@@ -21,6 +22,7 @@ import 'transfer_manager.dart';
 class ChatScreen extends StatefulWidget {
   final DeviceInfo me;
   final PeerDevice peer;
+  final DiscoveryService discovery;
   final ConnectionService connections;
   final MessageStore store;
 
@@ -28,6 +30,7 @@ class ChatScreen extends StatefulWidget {
     super.key,
     required this.me,
     required this.peer,
+    required this.discovery,
     required this.connections,
     required this.store,
   });
@@ -57,6 +60,8 @@ class _ChatScreenState extends State<ChatScreen> {
   StreamSubscription<void>? _transferSub;
   StreamSubscription<FileMessageEvent>? _fileMsgSub;
   Timer? _transferThrottle;
+  Timer? _connTimer;
+  DateTime? _lastAutoReconnect;
 
   String get _peerId => widget.peer.userId;
   TransferManager get _tm => TransferManager.instance;
@@ -116,6 +121,36 @@ class _ChatScreenState extends State<ChatScreen> {
     _scroll.addListener(_onScroll);
     if (!_connected) _connect();
     _loadHistory();
+
+    _connTimer = Timer.periodic(const Duration(seconds: 2), (_) => _syncConnection());
+  }
+
+  PeerDevice _resolveLivePeer() {
+    for (final p in widget.discovery.peers) {
+      if (p.userId == _peerId) return p;
+    }
+    return widget.peer;
+  }
+
+  void _syncConnection() {
+    if (!mounted) return;
+    final socketConnected = widget.connections.isConnected(_peerId);
+    final peerOnline =
+        widget.discovery.peers.any((p) => p.userId == _peerId);
+    if (socketConnected != _connected) {
+      setState(() => _connected = socketConnected);
+    }
+    if (!socketConnected && peerOnline) {
+      final now = DateTime.now();
+      if (_lastAutoReconnect != null &&
+          now.difference(_lastAutoReconnect!) <
+              const Duration(seconds: 4)) {
+        return;
+      }
+      _lastAutoReconnect = now;
+      unawaited(
+          widget.connections.connectTo(_resolveLivePeer(), forceNew: false));
+    }
   }
 
   Future<void> _loadHistory() async {
@@ -161,7 +196,8 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _connect() async {
-    final socket = await widget.connections.connectTo(widget.peer);
+    final socket =
+        await widget.connections.connectTo(_resolveLivePeer(), forceNew: false);
     if (socket != null && mounted) {
       setState(() => _connected = true);
     }
@@ -169,6 +205,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void dispose() {
+    _connTimer?.cancel();
     _scroll.removeListener(_onScroll);
     widget.connections.onMessage = _prevOnMessage;
     widget.connections.onDisconnected = _prevOnDisconnected;
@@ -307,12 +344,16 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _sendFile(String filePath, String fileName) async {
+    final live = _resolveLivePeer();
+    if (!widget.connections.isConnected(_peerId)) {
+      await widget.connections.connectTo(live, forceNew: false);
+    }
     final fileId = _uuid.v4();
     final fileSize = await File(filePath).length();
 
     await _tm.sendFile(
       peerId: _peerId,
-      peerIp: widget.peer.ip,
+      peerIp: live.ip,
       fileId: fileId,
       fileName: fileName,
       filePath: filePath,
@@ -894,9 +935,16 @@ class _ChatScreenState extends State<ChatScreen> {
 
     final bool isFailed = t != null && t.error != null && !t.cancelled;
     final bool isCancelled = t != null && t.cancelled;
+    final bool dismissedAborted = m.transferDismissed &&
+        m.attachmentName != null &&
+        t == null;
 
     Color bubbleColor;
-    if (isFailed) {
+    if (dismissedAborted) {
+      bubbleColor = isDark
+          ? const Color(0xFF4A4A4A).withValues(alpha: 0.85)
+          : const Color(0xFFD0D0D0);
+    } else if (isFailed) {
       bubbleColor = _failedRed.withValues(alpha: 0.15);
     } else if (isCancelled) {
       bubbleColor = _cancelledAmber.withValues(alpha: 0.12);
@@ -907,12 +955,16 @@ class _ChatScreenState extends State<ChatScreen> {
 
     final textColor = (isFailed || isCancelled)
         ? (isDark ? Colors.white : Colors.black87)
-        : (mine ? Colors.white : (isDark ? Colors.white : Colors.black));
+        : dismissedAborted
+            ? (isDark ? Colors.white54 : Colors.black45)
+            : (mine ? Colors.white : (isDark ? Colors.white : Colors.black));
     final subtleColor = (isFailed || isCancelled)
         ? (isDark ? Colors.white60 : Colors.black54)
-        : (mine
-            ? Colors.white.withValues(alpha: 0.6)
-            : (isDark ? Colors.white60 : Colors.black54));
+        : dismissedAborted
+            ? (isDark ? Colors.white38 : Colors.black38)
+            : (mine
+                ? Colors.white.withValues(alpha: 0.6)
+                : (isDark ? Colors.white60 : Colors.black54));
 
     return Align(
       alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
@@ -926,11 +978,17 @@ class _ChatScreenState extends State<ChatScreen> {
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
         decoration: BoxDecoration(
           color: bubbleColor,
-          border: (isFailed || isCancelled)
+          border: dismissedAborted
               ? Border.all(
-                  color: isFailed ? _failedRed : _cancelledAmber,
-                  width: 1.2)
-              : null,
+                  color: isDark
+                      ? Colors.white24
+                      : Colors.black26,
+                  width: 1)
+              : (isFailed || isCancelled)
+                  ? Border.all(
+                      color: isFailed ? _failedRed : _cancelledAmber,
+                      width: 1.2)
+                  : null,
           borderRadius: BorderRadius.only(
             topLeft: const Radius.circular(18),
             topRight: const Radius.circular(18),
@@ -943,7 +1001,7 @@ class _ChatScreenState extends State<ChatScreen> {
               mine ? CrossAxisAlignment.end : CrossAxisAlignment.start,
           children: [
             if (m.attachmentName != null)
-              _buildAttachment(context, m, mine)
+              _buildAttachment(context, m, mine, dismissedAborted)
             else
               _buildRichText(m.text, textColor, mine),
 
@@ -1068,12 +1126,15 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  Widget _buildAttachment(BuildContext context, ChatMessage m, bool mine) {
+  Widget _buildAttachment(
+      BuildContext context, ChatMessage m, bool mine, bool strikeAborted) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
     final hasPath = m.attachmentPath != null;
     final isImg = hasPath && _isImage(m.attachmentName!);
     final isTransferring = _tm.transfers.containsKey(m.id);
-    final fgColor = mine ? Colors.white : (isDark ? Colors.white : Colors.black);
+    final fgColor = strikeAborted
+        ? (isDark ? Colors.orangeAccent.shade100 : Colors.deepOrange.shade800)
+        : (mine ? Colors.white : (isDark ? Colors.white : Colors.black));
     final subtleColor = mine
         ? Colors.white.withValues(alpha: 0.7)
         : (isDark ? Colors.white60 : Colors.black54);
@@ -1085,7 +1146,7 @@ class _ChatScreenState extends State<ChatScreen> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        if (isImg)
+        if (isImg && !strikeAborted)
           Padding(
             padding: const EdgeInsets.only(bottom: 6),
             child: GestureDetector(
@@ -1104,7 +1165,9 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
           ),
         GestureDetector(
-          onTap: hasPath ? () => OpenFilex.open(m.attachmentPath!) : null,
+          onTap: hasPath && !strikeAborted
+              ? () => OpenFilex.open(m.attachmentPath!)
+              : null,
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
@@ -1122,9 +1185,14 @@ class _ChatScreenState extends State<ChatScreen> {
                     color: fgColor,
                     fontWeight: FontWeight.w700,
                     fontSize: 14,
-                    decoration: hasPath
-                        ? TextDecoration.underline
-                        : TextDecoration.none,
+                    decoration: strikeAborted
+                        ? TextDecoration.lineThrough
+                        : (hasPath
+                            ? TextDecoration.underline
+                            : TextDecoration.none),
+                    decorationThickness: strikeAborted ? 2.8 : 1,
+                    decorationColor:
+                        strikeAborted ? fgColor : null,
                   ),
                 ),
               ),

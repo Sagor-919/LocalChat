@@ -7,6 +7,19 @@ import 'app_settings.dart';
 const int kFileTransferPort = 4042;
 const int kChunkSize = 65536; // 64 KB
 
+Future<Socket> connectFileClient(String host, int port) async {
+  final trimmed = host.trim();
+  if (trimmed.isEmpty) {
+    throw const SocketException('Empty host for file transfer');
+  }
+  final addr = InternetAddress.tryParse(trimmed);
+  if (addr != null) {
+    return Socket.connect(addr, port,
+        timeout: const Duration(seconds: 12));
+  }
+  return Socket.connect(trimmed, port, timeout: const Duration(seconds: 12));
+}
+
 // ---------------------------------------------------------------------------
 // Sender — opens a new TCP socket, sends header, waits for START, streams file
 // ---------------------------------------------------------------------------
@@ -24,8 +37,7 @@ class FileSender {
     required File file,
     required void Function(int sent, int total) onProgress,
   }) async {
-    final socket = await Socket.connect(host, kFileTransferPort,
-        timeout: const Duration(seconds: 6));
+    final socket = await connectFileClient(host, kFileTransferPort);
     socket.setOption(SocketOption.tcpNoDelay, true);
 
     try {

@@ -137,7 +137,7 @@ class TransferManager {
     await _store.add(peerId, msg);
     _fileMessages.add(FileMessageEvent(peerId, msg));
 
-    _connections.sendJson(peerId, {
+    final notified = _connections.sendJson(peerId, {
       'type': 'file_notify',
       'id': fileId,
       'name': fileName,
@@ -153,9 +153,37 @@ class TransferManager {
       filePath: filePath,
     );
     transfers[fileId] = t;
+    if (!notified) {
+      t.error =
+          'Not connected — wait for peer or pull down to refresh peers, then retry.';
+      _notify();
+      return;
+    }
     _notify();
 
-    unawaited(_runSend(t, peerIp));
+    final targetIp = _resolveFileTransferHost(peerId, peerIp);
+    unawaited(_runSend(t, targetIp));
+  }
+
+  /// Prefer the address from the live chat TCP socket (matches successful retry path).
+  String _resolveFileTransferHost(String peerId, String discoveryIp) {
+    final sock = _connections.getSocket(peerId);
+    if (sock != null) {
+      final addr = sock.remoteAddress.address;
+      if (addr.isNotEmpty) return addr;
+    }
+    return discoveryIp.trim();
+  }
+
+  Future<void> _emitStoredFileMessageForPreview(
+      String peerId, String fileId) async {
+    final list = await _store.load(peerId);
+    for (final m in list) {
+      if (m.id == fileId) {
+        _fileMessages.add(FileMessageEvent(peerId, m));
+        break;
+      }
+    }
   }
 
   Future<void> _runSend(TransferState t, String peerIp) async {
@@ -180,6 +208,8 @@ class TransferManager {
     } catch (e) {
       t.error = e.toString();
       _notify();
+    } finally {
+      await _emitStoredFileMessageForPreview(t.peerId, t.fileId);
     }
   }
 
@@ -197,8 +227,25 @@ class TransferManager {
   }
 
   void dismiss(String fileId) {
-    transfers.remove(fileId);
+    final t = transfers.remove(fileId);
     _notify();
+    if (t == null) return;
+    unawaited(_persistDismissedTransfer(t.peerId, fileId));
+  }
+
+  Future<void> _persistDismissedTransfer(String peerId, String fileId) async {
+    await _store.updateTransferDismissed(peerId, fileId);
+    final list = await _store.load(peerId);
+    ChatMessage? found;
+    for (final m in list) {
+      if (m.id == fileId) {
+        found = m;
+        break;
+      }
+    }
+    if (found != null) {
+      _fileMessages.add(FileMessageEvent(peerId, found));
+    }
   }
 
   void retry(String fileId) {
@@ -312,8 +359,10 @@ class TransferManager {
   void _onReceiveError(String fileId, String error) {
     final t = transfers[fileId];
     if (t == null) return;
+    final peerId = t.peerId;
     t.error = error;
     _notify();
+    unawaited(_emitStoredFileMessageForPreview(peerId, fileId));
   }
 
   void _notify() {
