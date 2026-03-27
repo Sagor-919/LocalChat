@@ -1,6 +1,9 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+
 import 'connection_service.dart';
 import 'file_transfer_service.dart';
 import 'message_model.dart';
@@ -17,6 +20,7 @@ class TransferState {
   int transferredBytes = 0;
   double progress = 0;
   String? error;
+  bool cancelled = false;
   FileSender? sender;
   final Stopwatch stopwatch = Stopwatch()..start();
 
@@ -71,15 +75,22 @@ class TransferManager {
   late MessageStore _store;
   late String _myId;
   FileReceiver? _receiver;
+  FlutterLocalNotificationsPlugin? _notifPlugin;
+  Timer? _notifTimer;
+  static const _transferNotifId = 99999;
 
   Future<void> init({
     required ConnectionService connections,
     required MessageStore store,
     required String myId,
+    FlutterLocalNotificationsPlugin? notificationsPlugin,
   }) async {
     _connections = connections;
     _store = store;
     _myId = myId;
+    if (!kIsWeb && Platform.isAndroid) {
+      _notifPlugin = notificationsPlugin;
+    }
 
     _receiver = FileReceiver();
     _receiver!.onFileStarted = _onReceiveStarted;
@@ -180,23 +191,43 @@ class TransferManager {
     } else {
       _receiver?.cancelReceive(fileId);
     }
+    t.error = 'Cancelled';
+    t.cancelled = true;
+    _notify();
+  }
+
+  void dismiss(String fileId) {
     transfers.remove(fileId);
     _notify();
   }
 
-  /// Retry a failed outgoing transfer.
   void retry(String fileId) {
     final t = transfers[fileId];
-    if (t == null || !t.isSending || t.filePath == null) return;
+    if (t == null) return;
+
+    if (!t.isSending) {
+      transfers.remove(fileId);
+      _notify();
+      return;
+    }
+
+    if (t.filePath == null) return;
 
     final peerId = t.peerId;
-    final peer = _connections.isConnected(peerId);
-    if (!peer) return;
+    if (!_connections.isConnected(peerId)) return;
 
     final peerSocket = _connections.getSocket(peerId);
     if (peerSocket == null) return;
 
+    _connections.sendJson(peerId, {
+      'type': 'file_notify',
+      'id': fileId,
+      'name': t.fileName,
+      'size': t.totalBytes,
+    });
+
     t.error = null;
+    t.cancelled = false;
     t.transferredBytes = 0;
     t.progress = 0;
     t.stopwatch.reset();
@@ -287,5 +318,73 @@ class TransferManager {
 
   void _notify() {
     _transferUpdates.add(null);
+    _scheduleNotifUpdate();
+  }
+
+  void _scheduleNotifUpdate() {
+    if (_notifPlugin == null) return;
+    if (_notifTimer?.isActive ?? false) return;
+    _notifTimer = Timer(const Duration(milliseconds: 500), _updateTransferNotification);
+  }
+
+  Future<void> _updateTransferNotification() async {
+    if (_notifPlugin == null) return;
+    final active = transfers.values.where((t) => t.error == null).toList();
+    if (active.isEmpty) {
+      await _notifPlugin!.cancel(_transferNotifId);
+      return;
+    }
+
+    final count = active.length;
+    int totalBytes = 0;
+    int doneBytes = 0;
+    double speedSum = 0;
+    for (final t in active) {
+      totalBytes += t.totalBytes;
+      doneBytes += t.transferredBytes;
+      speedSum += t.currentSpeed;
+    }
+    final pct = totalBytes > 0 ? (doneBytes / totalBytes * 100).round() : 0;
+    final speedStr = _fmtSpeed(speedSum);
+    final remaining = speedSum > 0
+        ? _fmtDuration(((totalBytes - doneBytes) / speedSum).round())
+        : '';
+
+    final body = count == 1
+        ? '${active.first.fileName} — $pct% $speedStr${remaining.isNotEmpty ? ' ($remaining left)' : ''}'
+        : '$count transfers — $pct% $speedStr${remaining.isNotEmpty ? ' ($remaining left)' : ''}';
+
+    await _notifPlugin!.show(
+      _transferNotifId,
+      'File Transfer',
+      body,
+      NotificationDetails(
+        android: AndroidNotificationDetails(
+          'transfers', 'File Transfers',
+          importance: Importance.low,
+          priority: Priority.low,
+          ongoing: true,
+          autoCancel: false,
+          showProgress: true,
+          maxProgress: 100,
+          progress: pct.clamp(0, 100),
+          onlyAlertOnce: true,
+        ),
+      ),
+    );
+  }
+
+  static String _fmtSpeed(double bytesPerSec) {
+    if (bytesPerSec < 1024) return '${bytesPerSec.toStringAsFixed(0)} B/s';
+    final kb = bytesPerSec / 1024;
+    if (kb < 1024) return '${kb.toStringAsFixed(1)} KB/s';
+    final mb = kb / 1024;
+    return '${mb.toStringAsFixed(1)} MB/s';
+  }
+
+  static String _fmtDuration(int seconds) {
+    if (seconds < 60) return '${seconds}s';
+    if (seconds < 3600) return '${seconds ~/ 60}m ${seconds % 60}s';
+    return '${seconds ~/ 3600}h ${(seconds % 3600) ~/ 60}m';
   }
 }

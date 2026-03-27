@@ -1,7 +1,10 @@
 import 'dart:convert';
+import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:window_manager/window_manager.dart';
 
 import 'app_settings.dart';
 import 'connection_service.dart';
@@ -20,8 +23,23 @@ final FlutterLocalNotificationsPlugin _notifications =
     FlutterLocalNotificationsPlugin();
 bool _appInForeground = true;
 
+bool get _isDesktop =>
+    !kIsWeb && (Platform.isWindows || Platform.isLinux || Platform.isMacOS);
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  if (_isDesktop) {
+    await windowManager.ensureInitialized();
+    const windowWidth = 420.0;
+    const windowHeight = 720.0;
+    await windowManager.setSize(const Size(windowWidth, windowHeight));
+    await windowManager.setMinimumSize(const Size(360, 500));
+    await windowManager.center();
+    await windowManager.setTitle('Local Chat');
+    await windowManager.show();
+  }
+
   await AppSettings.instance.init();
   _me = await DeviceInfo.load();
   _store = await MessageStore.init();
@@ -34,6 +52,7 @@ Future<void> main() async {
     connections: _connections,
     store: _store,
     myId: _me.userId,
+    notificationsPlugin: _notifications,
   );
 
   await _notifications.initialize(

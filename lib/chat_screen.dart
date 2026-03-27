@@ -38,13 +38,17 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> {
   static const _uuid = Uuid();
-  final List<ChatMessage> _messages = [];
+  static const _pageSize = 50;
+  final List<ChatMessage> _allMessages = [];
+  List<ChatMessage> _messages = [];
+  int _displayCount = _pageSize;
   final TextEditingController _input = TextEditingController();
   final FocusNode _focus = FocusNode();
   final ScrollController _scroll = ScrollController();
 
   void Function(String, Map<String, dynamic>)? _prevOnMessage;
   void Function(String)? _prevOnDisconnected;
+  void Function(Socket, String)? _prevOnIncoming;
   bool _connected = false;
   bool _loading = true;
 
@@ -65,6 +69,9 @@ class _ChatScreenState extends State<ChatScreen> {
     _prevOnMessage = widget.connections.onMessage;
     widget.connections.onMessage = (peerId, json) {
       _prevOnMessage?.call(peerId, json);
+      if (peerId == _peerId && !_connected && mounted) {
+        setState(() => _connected = true);
+      }
       if (peerId != _peerId) return;
       _handleJson(json);
     };
@@ -74,6 +81,14 @@ class _ChatScreenState extends State<ChatScreen> {
       _prevOnDisconnected?.call(peerId);
       if (peerId == _peerId && mounted) {
         setState(() => _connected = false);
+      }
+    };
+
+    _prevOnIncoming = widget.connections.onIncomingConnection;
+    widget.connections.onIncomingConnection = (socket, peerId) {
+      _prevOnIncoming?.call(socket, peerId);
+      if (peerId == _peerId && mounted) {
+        setState(() => _connected = true);
       }
     };
 
@@ -87,19 +102,18 @@ class _ChatScreenState extends State<ChatScreen> {
     _fileMsgSub = _tm.fileMessages.listen((event) {
       if (event.peerId != _peerId) return;
       if (!mounted) return;
-      if (_messages.any((m) => m.id == event.message.id)) {
-        // Update existing message (e.g. attachmentPath set on completion)
-        final idx =
-            _messages.indexWhere((m) => m.id == event.message.id);
-        if (idx >= 0) {
-          setState(() => _messages[idx] = event.message);
-        }
+      final allIdx = _allMessages.indexWhere((m) => m.id == event.message.id);
+      if (allIdx >= 0) {
+        _allMessages[allIdx] = event.message;
       } else {
-        setState(() => _messages.add(event.message));
+        _allMessages.add(event.message);
+        _displayCount++;
       }
+      setState(() => _rebuildVisible());
       _scrollToBottom();
     });
 
+    _scroll.addListener(_onScroll);
     if (!_connected) _connect();
     _loadHistory();
   }
@@ -107,19 +121,43 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _loadHistory() async {
     final stored = await widget.store.load(_peerId);
     if (!mounted) return;
-    final existingIds = _messages.map((m) => m.id).toSet();
-    setState(() {
-      for (final m in stored) {
-        if (!existingIds.contains(m.id)) _messages.add(m);
-      }
-      _messages.sort((a, b) => a.timestamp.compareTo(b.timestamp));
-      _loading = false;
-    });
+    final existingIds = _allMessages.map((m) => m.id).toSet();
+    for (final m in stored) {
+      if (!existingIds.contains(m.id)) _allMessages.add(m);
+    }
+    _allMessages.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+    _displayCount = _pageSize;
+    _rebuildVisible();
+    setState(() => _loading = false);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_scroll.hasClients) {
         _scroll.jumpTo(_scroll.position.maxScrollExtent);
       }
     });
+  }
+
+  void _rebuildVisible() {
+    final start =
+        (_allMessages.length - _displayCount).clamp(0, _allMessages.length);
+    _messages = _allMessages.sublist(start);
+  }
+
+  void _onScroll() {
+    if (_scroll.position.pixels <= 50 &&
+        _displayCount < _allMessages.length) {
+      final prevMax = _scroll.position.maxScrollExtent;
+      setState(() {
+        _displayCount =
+            (_displayCount + _pageSize).clamp(0, _allMessages.length);
+        _rebuildVisible();
+      });
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (_scroll.hasClients) {
+          final newMax = _scroll.position.maxScrollExtent;
+          _scroll.jumpTo(_scroll.position.pixels + (newMax - prevMax));
+        }
+      });
+    }
   }
 
   Future<void> _connect() async {
@@ -131,8 +169,10 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void dispose() {
+    _scroll.removeListener(_onScroll);
     widget.connections.onMessage = _prevOnMessage;
     widget.connections.onDisconnected = _prevOnDisconnected;
+    widget.connections.onIncomingConnection = _prevOnIncoming;
     _transferSub?.cancel();
     _fileMsgSub?.cancel();
     _transferThrottle?.cancel();
@@ -146,8 +186,10 @@ class _ChatScreenState extends State<ChatScreen> {
     final msg = ChatMessage.fromJson(json, widget.me.userId);
     if (msg == null) return;
     if (!mounted) return;
-    if (_messages.any((m) => m.id == msg.id)) return;
-    setState(() => _messages.add(msg));
+    if (_allMessages.any((m) => m.id == msg.id)) return;
+    _allMessages.add(msg);
+    _displayCount++;
+    setState(() => _rebuildVisible());
     _scrollToBottom();
   }
 
@@ -245,7 +287,9 @@ class _ChatScreenState extends State<ChatScreen> {
         isMine: true,
       );
       widget.connections.sendJson(_peerId, msg.toJson());
-      setState(() => _messages.add(msg));
+      _allMessages.add(msg);
+      _displayCount++;
+      setState(() => _rebuildVisible());
       widget.store.add(_peerId, msg);
       _input.clear();
     }
@@ -293,6 +337,11 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  void _locateFileAndroid(String filePath) {
+    final dir = File(filePath).parent.path;
+    OpenFilex.open(dir);
+  }
+
   // -----------------------------------------------------------------------
   // Clear chat
   // -----------------------------------------------------------------------
@@ -312,7 +361,13 @@ class _ChatScreenState extends State<ChatScreen> {
             onPressed: () async {
               Navigator.pop(ctx);
               await widget.store.clear(_peerId);
-              if (mounted) setState(() => _messages.clear());
+              if (mounted) {
+                setState(() {
+                  _allMessages.clear();
+                  _messages.clear();
+                  _displayCount = _pageSize;
+                });
+              }
             },
             style: FilledButton.styleFrom(
                 backgroundColor: Theme.of(context).colorScheme.error),
@@ -336,7 +391,10 @@ class _ChatScreenState extends State<ChatScreen> {
 
   String _fmtTime(int ms) {
     final dt = DateTime.fromMillisecondsSinceEpoch(ms);
-    return '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+    final h = dt.hour == 0 ? 12 : (dt.hour > 12 ? dt.hour - 12 : dt.hour);
+    final m = dt.minute.toString().padLeft(2, '0');
+    final period = dt.hour >= 12 ? 'PM' : 'AM';
+    return '$h:$m $period';
   }
 
   String _fmtDate(DateTime dt) {
@@ -447,8 +505,7 @@ class _ChatScreenState extends State<ChatScreen> {
             style: TextStyle(color: color, fontSize: 15, height: 1.3)));
       }
       final link = m.group(0)!;
-      final linkColor =
-          mine ? cs.onPrimary.withValues(alpha: 0.85) : cs.primary;
+      final linkColor = mine ? Colors.white : cs.primary;
       spans.add(TextSpan(
         text: link,
         style: TextStyle(
@@ -789,7 +846,14 @@ class _ChatScreenState extends State<ChatScreen> {
   // Bubbles — reads transfer state from TransferManager
   // -----------------------------------------------------------------------
   void _copyMessage(ChatMessage m) {
-    final text = m.attachmentName != null ? m.attachmentName! : m.text;
+    String text;
+    if (m.attachmentPath != null && _isImage(m.attachmentName ?? '')) {
+      text = m.attachmentPath!;
+    } else if (m.attachmentName != null) {
+      text = m.attachmentPath ?? m.attachmentName!;
+    } else {
+      text = m.text;
+    }
     Clipboard.setData(ClipboardData(text: text));
     if (mounted) {
       ScaffoldMessenger.of(context)
@@ -815,10 +879,40 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
+  static const _iMessageBlue = Color(0xFF007AFF);
+  static const _iMessageGray = Color(0xFFE5E5EA);
+  static const _iMessageDarkGray = Color(0xFF3A3A3C);
+
+  static const _failedRed = Color(0xFFFF3B30);
+  static const _cancelledAmber = Color(0xFFFF9500);
+
   Widget _buildBubble(BuildContext context, ChatMessage m) {
     final cs = Theme.of(context).colorScheme;
     final mine = m.isMine;
     final t = _tm.transfers[m.id];
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    final bool isFailed = t != null && t.error != null && !t.cancelled;
+    final bool isCancelled = t != null && t.cancelled;
+
+    Color bubbleColor;
+    if (isFailed) {
+      bubbleColor = _failedRed.withValues(alpha: 0.15);
+    } else if (isCancelled) {
+      bubbleColor = _cancelledAmber.withValues(alpha: 0.12);
+    } else {
+      bubbleColor =
+          mine ? _iMessageBlue : (isDark ? _iMessageDarkGray : _iMessageGray);
+    }
+
+    final textColor = (isFailed || isCancelled)
+        ? (isDark ? Colors.white : Colors.black87)
+        : (mine ? Colors.white : (isDark ? Colors.white : Colors.black));
+    final subtleColor = (isFailed || isCancelled)
+        ? (isDark ? Colors.white60 : Colors.black54)
+        : (mine
+            ? Colors.white.withValues(alpha: 0.6)
+            : (isDark ? Colors.white60 : Colors.black54));
 
     return Align(
       alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
@@ -831,13 +925,12 @@ class _ChatScreenState extends State<ChatScreen> {
         margin: const EdgeInsets.symmetric(vertical: 3),
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
         decoration: BoxDecoration(
-          color: mine
-              ? cs.primary
-              : cs.surfaceContainerHighest.withValues(alpha: 0.8),
-          border: mine
-              ? null
-              : Border.all(
-                  color: cs.outlineVariant.withValues(alpha: 0.3), width: 0.5),
+          color: bubbleColor,
+          border: (isFailed || isCancelled)
+              ? Border.all(
+                  color: isFailed ? _failedRed : _cancelledAmber,
+                  width: 1.2)
+              : null,
           borderRadius: BorderRadius.only(
             topLeft: const Radius.circular(18),
             topRight: const Radius.circular(18),
@@ -846,56 +939,96 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
         ),
         child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+          crossAxisAlignment:
+              mine ? CrossAxisAlignment.end : CrossAxisAlignment.start,
           children: [
             if (m.attachmentName != null)
               _buildAttachment(context, m, mine)
             else
-              _buildRichText(
-                  m.text, mine ? cs.onPrimary : cs.onSurface, mine),
+              _buildRichText(m.text, textColor, mine),
 
             if (t != null) ...[
               const SizedBox(height: 8),
-              LinearProgressIndicator(
-                value: t.progress.clamp(0, 1).toDouble(),
-                minHeight: 4,
-                borderRadius: BorderRadius.circular(99),
-              ),
-              const SizedBox(height: 4),
-              Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      t.error != null
-                          ? 'Failed'
-                          : '${(t.progress * 100).toStringAsFixed(0)}%'
-                              ' \u2022 ${_fmtBytes(t.transferredBytes)}/${_fmtBytes(t.totalBytes)}'
-                              ' \u2022 ${_fmtSpeed(t.currentSpeed)}',
-                      style: TextStyle(
-                        fontSize: 11,
-                        fontWeight: FontWeight.w600,
-                        color: mine ? cs.onPrimary : cs.onSurfaceVariant,
+              if (isFailed || isCancelled) ...[
+                Row(
+                  children: [
+                    Icon(
+                      isFailed ? Icons.error_outline : Icons.cancel_outlined,
+                      size: 16,
+                      color: isFailed ? _failedRed : _cancelledAmber,
+                    ),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        isFailed ? 'Transfer Failed' : 'Cancelled',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w700,
+                          color: isFailed ? _failedRed : _cancelledAmber,
+                        ),
                       ),
                     ),
-                  ),
-                  if (t.error != null && t.isSending)
-                    _bubbleButton('Retry', () => _retryTransfer(m.id)),
-                  _bubbleButton('Cancel', () => _cancelTransfer(m.id)),
-                ],
-              ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (t.isSending)
+                      _actionButton(
+                        label: 'Retry',
+                        icon: Icons.refresh,
+                        color: _iMessageBlue,
+                        onTap: () => _retryTransfer(m.id),
+                      ),
+                    if (t.isSending) const SizedBox(width: 8),
+                    _actionButton(
+                      label: 'Dismiss',
+                      icon: Icons.close,
+                      color: cs.outline,
+                      onTap: () => _tm.dismiss(m.id),
+                    ),
+                  ],
+                ),
+              ] else ...[
+                LinearProgressIndicator(
+                  value: t.progress.clamp(0, 1).toDouble(),
+                  minHeight: 5,
+                  borderRadius: BorderRadius.circular(99),
+                  backgroundColor: mine ? Colors.white24 : cs.outlineVariant,
+                  color: mine ? Colors.white : _iMessageBlue,
+                ),
+                const SizedBox(height: 6),
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        '${(t.progress * 100).toStringAsFixed(0)}%'
+                        ' \u2022 ${_fmtBytes(t.transferredBytes)}/${_fmtBytes(t.totalBytes)}'
+                        ' \u2022 ${_fmtSpeed(t.currentSpeed)}',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          color: subtleColor,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    _actionButton(
+                      label: 'Cancel',
+                      icon: Icons.stop_circle_outlined,
+                      color: _failedRed,
+                      onTap: () => _cancelTransfer(m.id),
+                    ),
+                  ],
+                ),
+              ],
             ],
 
             const SizedBox(height: 4),
-            Align(
-              alignment: Alignment.centerRight,
-              child: Text(
-                _fmtTime(m.timestamp),
-                style: TextStyle(
-                  fontSize: 11,
-                  color: (mine ? cs.onPrimary : cs.onSurfaceVariant)
-                      .withValues(alpha: 0.6),
-                ),
-              ),
+            Text(
+              _fmtTime(m.timestamp),
+              style: TextStyle(fontSize: 11, color: subtleColor),
             ),
           ],
         ),
@@ -904,30 +1037,46 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  Widget _bubbleButton(String label, VoidCallback onTap) {
-    return Padding(
-      padding: const EdgeInsets.only(left: 4),
+  Widget _actionButton({
+    required String label,
+    required IconData icon,
+    required Color color,
+    required VoidCallback onTap,
+  }) {
+    return Material(
+      color: color.withValues(alpha: 0.15),
+      borderRadius: BorderRadius.circular(8),
       child: InkWell(
         onTap: onTap,
         borderRadius: BorderRadius.circular(8),
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-          child: Text(label,
-              style:
-                  const TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, size: 15, color: color),
+              const SizedBox(width: 4),
+              Text(label,
+                  style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                      color: color)),
+            ],
+          ),
         ),
       ),
     );
   }
 
   Widget _buildAttachment(BuildContext context, ChatMessage m, bool mine) {
-    final cs = Theme.of(context).colorScheme;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
     final hasPath = m.attachmentPath != null;
     final isImg = hasPath && _isImage(m.attachmentName!);
     final isTransferring = _tm.transfers.containsKey(m.id);
-    final fgColor = mine ? cs.onPrimary : cs.onSurface;
-    final subtleColor =
-        (mine ? cs.onPrimary : cs.onSurfaceVariant).withValues(alpha: 0.7);
+    final fgColor = mine ? Colors.white : (isDark ? Colors.white : Colors.black);
+    final subtleColor = mine
+        ? Colors.white.withValues(alpha: 0.7)
+        : (isDark ? Colors.white60 : Colors.black54);
 
     final typeLabel = _fileTypeLabel(m.attachmentName!);
     final sizeLabel =
@@ -1010,6 +1159,33 @@ class _ChatScreenState extends State<ChatScreen> {
                     const SizedBox(width: 4),
                     Text(
                       'View In Explorer',
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: subtleColor,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        if (hasPath && !isTransferring && !kIsWeb && Platform.isAndroid)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(8),
+              onTap: () => _locateFileAndroid(m.attachmentPath!),
+              child: Padding(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.file_open_outlined, size: 14, color: subtleColor),
+                    const SizedBox(width: 4),
+                    Text(
+                      'Locate File',
                       style: TextStyle(
                         fontSize: 11,
                         color: subtleColor,

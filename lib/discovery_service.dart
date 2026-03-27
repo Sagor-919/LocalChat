@@ -23,7 +23,7 @@ class DiscoveryService {
 
   Future<void> start() async {
     _socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, udpPort,
-        reuseAddress: true, reusePort: true);
+        reuseAddress: true, reusePort: !Platform.isWindows);
     _socket!.broadcastEnabled = true;
 
     _socket!.listen((event) {

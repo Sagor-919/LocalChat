@@ -237,18 +237,34 @@ class FileReceiver {
   }
 
   static Future<String> _resolveSavePath(String safeName) async {
-    final stamp = DateTime.now().millisecondsSinceEpoch;
     final dlPath = AppSettings.instance.downloadPath.value;
+    Directory dir;
     if (dlPath.isNotEmpty) {
+      dir = Directory(dlPath);
       try {
-        final dir = Directory(dlPath);
         if (!await dir.exists()) await dir.create(recursive: true);
-        final path = '${dir.path}${Platform.pathSeparator}$stamp-$safeName';
-        await File(path).create();
-        return path;
-      } catch (_) {}
+      } catch (_) {
+        dir = Directory.systemTemp;
+      }
+    } else {
+      dir = Directory.systemTemp;
     }
-    return '${Directory.systemTemp.path}${Platform.pathSeparator}$stamp-$safeName';
+
+    final sep = Platform.pathSeparator;
+    var path = '${dir.path}$sep$safeName';
+    if (!await File(path).exists()) return path;
+
+    final dot = safeName.lastIndexOf('.');
+    final baseName = dot > 0 ? safeName.substring(0, dot) : safeName;
+    final ext = dot > 0 ? safeName.substring(dot) : '';
+
+    for (var i = 1; i < 10000; i++) {
+      path = '${dir.path}$sep$baseName ($i)$ext';
+      if (!await File(path).exists()) return path;
+    }
+
+    final stamp = DateTime.now().millisecondsSinceEpoch;
+    return '${dir.path}$sep$stamp-$safeName';
   }
 
   Future<void> stop() async {

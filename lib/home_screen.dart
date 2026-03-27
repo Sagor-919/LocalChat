@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import 'chat_screen.dart';
@@ -27,6 +29,8 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   final Map<String, int> _unread = {};
+  final Map<String, String> _lastMsg = {};
+  final Map<String, int> _lastMsgTime = {};
   void Function(String, Map<String, dynamic>)? _prevOnMessage;
 
   List<_PeerEntry> _peerList = [];
@@ -48,9 +52,20 @@ class _HomeScreenState extends State<HomeScreen> {
     _prevOnMessage = widget.connections.onMessage;
     widget.connections.onMessage = (peerId, json) {
       _prevOnMessage?.call(peerId, json);
-      if (json['type'] == 'message' || json['type'] == 'file_notify') {
+      final type = json['type'] as String?;
+      if (type == 'message' || type == 'file_notify') {
         if (mounted) {
-          setState(() => _unread[peerId] = (_unread[peerId] ?? 0) + 1);
+          setState(() {
+            _unread[peerId] = (_unread[peerId] ?? 0) + 1;
+            if (type == 'message') {
+              _lastMsg[peerId] = json['text'] as String? ?? '';
+              _lastMsgTime[peerId] = (json['time'] as num?)?.toInt() ??
+                  DateTime.now().millisecondsSinceEpoch;
+            } else {
+              _lastMsg[peerId] = 'Sending file...';
+              _lastMsgTime[peerId] = DateTime.now().millisecondsSinceEpoch;
+            }
+          });
         }
       }
     };
@@ -101,8 +116,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _editProfile() {
-    final controller =
-        TextEditingController(text: widget.me.displayName);
+    final controller = TextEditingController(text: widget.me.displayName);
 
     showDialog(
       context: context,
@@ -119,18 +133,7 @@ class _HomeScreenState extends State<HomeScreen> {
             content: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                CircleAvatar(
-                  radius: 40,
-                  backgroundColor: widget.me.avatarColor,
-                  child: Text(
-                    initial,
-                    style: const TextStyle(
-                      fontSize: 32,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.white,
-                    ),
-                  ),
-                ),
+                _GradientAvatar(letter: initial, radius: 40, fontSize: 32),
                 const SizedBox(height: 20),
                 TextField(
                   controller: controller,
@@ -172,18 +175,155 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  String _timeAgo(int ms) {
+    final diff = DateTime.now().millisecondsSinceEpoch - ms;
+    final mins = diff ~/ 60000;
+    if (mins < 1) return 'now';
+    if (mins < 60) return '${mins}m ago';
+    final hours = mins ~/ 60;
+    if (hours < 24) return '${hours}h ago';
+    final days = hours ~/ 24;
+    return '${days}d ago';
+  }
+
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
 
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Local Chat'),
-        centerTitle: true,
-        actions: [
+      backgroundColor: isDark ? cs.surface : const Color(0xFFF5F5FA),
+      body: SafeArea(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
+              child: _buildProfileCard(context),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(24, 24, 24, 8),
+              child: Text(
+                'Chats',
+                style: TextStyle(
+                  fontSize: 22,
+                  fontWeight: FontWeight.w800,
+                  color: cs.onSurface,
+                ),
+              ),
+            ),
+            Expanded(
+              child: _peerList.isEmpty
+                  ? Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.wifi_find,
+                              size: 56,
+                              color: cs.outline.withValues(alpha: 0.4)),
+                          const SizedBox(height: 12),
+                          Text('Searching for devices\u2026',
+                              style: TextStyle(
+                                  color: cs.outline,
+                                  fontSize: 15,
+                                  fontWeight: FontWeight.w500)),
+                          const SizedBox(height: 10),
+                          SizedBox(
+                            width: 100,
+                            child: LinearProgressIndicator(
+                              borderRadius: BorderRadius.circular(99),
+                            ),
+                          ),
+                        ],
+                      ),
+                    )
+                  : ListView.builder(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 16, vertical: 4),
+                      itemCount: _peerList.length,
+                      itemBuilder: (context, index) {
+                        final entry = _peerList[index];
+                        return _buildChatTile(context, entry);
+                      },
+                    ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildProfileCard(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: isDark ? cs.surfaceContainerHigh : Colors.white,
+        borderRadius: BorderRadius.circular(20),
+        boxShadow: [
+          if (!isDark)
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.06),
+              blurRadius: 16,
+              offset: const Offset(0, 4),
+            ),
+        ],
+      ),
+      child: Row(
+        children: [
+          _GradientAvatar(
+            letter: widget.me.displayName.isNotEmpty
+                ? widget.me.displayName[0].toUpperCase()
+                : '?',
+            radius: 28,
+            fontSize: 22,
+          ),
+          const SizedBox(width: 14),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  widget.me.displayName,
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700,
+                    color: cs.onSurface,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                GestureDetector(
+                  onTap: _editProfile,
+                  child: Row(
+                    children: [
+                      Container(
+                        width: 8,
+                        height: 8,
+                        decoration: const BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: Colors.green,
+                        ),
+                      ),
+                      const SizedBox(width: 5),
+                      Text(
+                        'Online',
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w500,
+                          color: cs.outline,
+                        ),
+                      ),
+                      const SizedBox(width: 4),
+                      Icon(Icons.edit, size: 13, color: cs.outline),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
           IconButton(
-            icon: const Icon(Icons.settings),
-            tooltip: 'Settings',
             onPressed: () {
               Navigator.of(context).push(
                 MaterialPageRoute(
@@ -191,157 +331,148 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
               );
             },
+            icon: Icon(Icons.settings, color: cs.onSurfaceVariant),
+            tooltip: 'Settings',
           ),
         ],
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(28),
+      ),
+    );
+  }
+
+  Widget _buildChatTile(BuildContext context, _PeerEntry entry) {
+    final cs = Theme.of(context).colorScheme;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final unread = _unread[entry.userId] ?? 0;
+    final lastMsg = _lastMsg[entry.userId];
+    final lastTime = _lastMsgTime[entry.userId];
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Material(
+        color: isDark ? cs.surfaceContainerHigh : Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        elevation: isDark ? 0 : 1,
+        shadowColor: Colors.black12,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(16),
+          onTap: () => _openChat(entry),
           child: Padding(
-            padding: const EdgeInsets.only(bottom: 10),
-            child: GestureDetector(
-              onTap: _editProfile,
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  CircleAvatar(
-                    radius: 10,
-                    backgroundColor: widget.me.avatarColor,
-                    child: Text(
-                      widget.me.displayName.isNotEmpty
-                          ? widget.me.displayName[0].toUpperCase()
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            child: Row(
+              children: [
+                Stack(
+                  children: [
+                    _GradientAvatar(
+                      letter: entry.name.isNotEmpty
+                          ? entry.name[0].toUpperCase()
                           : '?',
-                      style: const TextStyle(
-                        fontSize: 10,
-                        fontWeight: FontWeight.bold,
-                        color: Colors.white,
+                      radius: 24,
+                      fontSize: 18,
+                    ),
+                    Positioned(
+                      right: 0,
+                      bottom: 0,
+                      child: Container(
+                        width: 13,
+                        height: 13,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: entry.online ? Colors.green : cs.outline,
+                          border: Border.all(
+                            color: isDark
+                                ? cs.surfaceContainerHigh
+                                : Colors.white,
+                            width: 2,
+                          ),
+                        ),
                       ),
                     ),
+                  ],
+                ),
+                const SizedBox(width: 14),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        entry.name,
+                        style: TextStyle(
+                          fontSize: 15,
+                          fontWeight:
+                              unread > 0 ? FontWeight.w800 : FontWeight.w600,
+                          color:
+                              entry.online ? cs.onSurface : cs.onSurfaceVariant,
+                        ),
+                      ),
+                      if (lastMsg != null) ...[
+                        const SizedBox(height: 2),
+                        Text(
+                          lastMsg,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 13,
+                            color: cs.outline,
+                            fontWeight: unread > 0
+                                ? FontWeight.w600
+                                : FontWeight.normal,
+                          ),
+                        ),
+                      ] else if (!entry.online) ...[
+                        const SizedBox(height: 2),
+                        Text(
+                          'Offline',
+                          style: TextStyle(
+                            fontSize: 13,
+                            color: cs.outline.withValues(alpha: 0.5),
+                            fontStyle: FontStyle.italic,
+                          ),
+                        ),
+                      ],
+                    ],
                   ),
-                  const SizedBox(width: 6),
-                  Text(
-                    widget.me.displayName,
-                    style: TextStyle(
-                      color: cs.onSurfaceVariant,
-                      fontWeight: FontWeight.w600,
-                      fontSize: 14,
-                    ),
-                  ),
-                  const SizedBox(width: 4),
-                  Icon(Icons.edit, size: 14, color: cs.onSurfaceVariant),
-                ],
-              ),
+                ),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    if (lastTime != null)
+                      Text(
+                        _timeAgo(lastTime),
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: cs.outline,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    if (unread > 0) ...[
+                      const SizedBox(height: 4),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 7, vertical: 3),
+                        decoration: BoxDecoration(
+                          color: cs.primary,
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Text(
+                          unread > 99 ? '99+' : '$unread',
+                          style: TextStyle(
+                            color: cs.onPrimary,
+                            fontSize: 11,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+                const SizedBox(width: 4),
+                Icon(Icons.chevron_right,
+                    size: 20, color: cs.outline.withValues(alpha: 0.5)),
+              ],
             ),
           ),
         ),
       ),
-      body: _peerList.isEmpty
-          ? Center(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(Icons.wifi_find,
-                      size: 64, color: cs.outline.withValues(alpha: 0.5)),
-                  const SizedBox(height: 16),
-                  Text('Searching for devices\u2026',
-                      style: TextStyle(
-                          color: cs.outline,
-                          fontSize: 16,
-                          fontWeight: FontWeight.w500)),
-                  const SizedBox(height: 8),
-                  SizedBox(
-                    width: 120,
-                    child: LinearProgressIndicator(
-                      borderRadius: BorderRadius.circular(99),
-                    ),
-                  ),
-                ],
-              ),
-            )
-          : ListView.separated(
-              padding:
-                  const EdgeInsets.symmetric(vertical: 8, horizontal: 8),
-              itemCount: _peerList.length,
-              separatorBuilder: (_, i) =>
-                  const Divider(height: 1, indent: 72),
-              itemBuilder: (context, index) {
-                final entry = _peerList[index];
-                final unread = _unread[entry.userId] ?? 0;
-
-                return ListTile(
-                  shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12)),
-                  leading: Stack(
-                    children: [
-                      CircleAvatar(
-                        radius: 22,
-                        backgroundColor: entry.avatarColor,
-                        child: Text(
-                          entry.name.isNotEmpty
-                              ? entry.name[0].toUpperCase()
-                              : '?',
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontWeight: FontWeight.bold,
-                            fontSize: 18,
-                          ),
-                        ),
-                      ),
-                      Positioned(
-                        right: 0,
-                        bottom: 0,
-                        child: Container(
-                          width: 12,
-                          height: 12,
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            color: entry.online ? Colors.green : cs.outline,
-                            border:
-                                Border.all(color: cs.surface, width: 2),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                  title: Text(entry.name,
-                      style: TextStyle(
-                        fontWeight:
-                            unread > 0 ? FontWeight.w800 : FontWeight.w600,
-                        color: entry.online ? null : cs.onSurfaceVariant,
-                      )),
-                  subtitle: Text(
-                      entry.online ? entry.ip : 'Offline',
-                      style: TextStyle(
-                        color: entry.online ? cs.outline : cs.outline.withValues(alpha: 0.5),
-                        fontSize: 13,
-                        fontStyle: entry.online ? FontStyle.normal : FontStyle.italic,
-                      )),
-                  trailing: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      if (unread > 0)
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 8, vertical: 4),
-                          decoration: BoxDecoration(
-                            color: cs.primary,
-                            borderRadius: BorderRadius.circular(12),
-                          ),
-                          child: Text(
-                            unread > 99 ? '99+' : '$unread',
-                            style: TextStyle(
-                              color: cs.onPrimary,
-                              fontSize: 12,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                        ),
-                      const SizedBox(width: 4),
-                      Icon(Icons.chevron_right, color: cs.outline),
-                    ],
-                  ),
-                  onTap: () => _openChat(entry),
-                );
-              },
-            ),
     );
   }
 
@@ -370,7 +501,44 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 }
 
-// ---------------------------------------------------------------------------
+class _GradientAvatar extends StatelessWidget {
+  final String letter;
+  final double radius;
+  final double fontSize;
+
+  const _GradientAvatar({
+    required this.letter,
+    required this.radius,
+    required this.fontSize,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: radius * 2,
+      height: radius * 2,
+      decoration: const BoxDecoration(
+        shape: BoxShape.circle,
+        gradient: LinearGradient(
+          colors: [Color(0xFF00C9FF), Color(0xFF92FE9D)],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+      ),
+      child: Center(
+        child: Text(
+          letter,
+          style: TextStyle(
+            color: Colors.white,
+            fontWeight: FontWeight.bold,
+            fontSize: fontSize,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _PeerEntry {
   final String userId;
   final String name;
@@ -387,20 +555,4 @@ class _PeerEntry {
     required this.online,
     this.peer,
   });
-
-  Color get avatarColor {
-    const palette = [
-      Colors.blue,
-      Colors.red,
-      Colors.green,
-      Colors.purple,
-      Colors.orange,
-      Colors.teal,
-      Colors.pink,
-      Colors.indigo,
-      Colors.cyan,
-      Colors.amber,
-    ];
-    return palette[userId.hashCode.abs() % palette.length];
-  }
 }

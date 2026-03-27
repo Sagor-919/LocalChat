@@ -12,6 +12,7 @@ class AppSettings {
   final themeMode = ValueNotifier<ThemeMode>(ThemeMode.system);
   final notificationsMuted = ValueNotifier<bool>(false);
   final downloadPath = ValueNotifier<String>('');
+  final startWithWindows = ValueNotifier<bool>(false);
 
   Future<void> init() async {
     _prefs = await SharedPreferences.getInstance();
@@ -27,6 +28,10 @@ class AppSettings {
 
     downloadPath.value =
         _prefs.getString('download_path') ?? _defaultDownloadPath();
+
+    if (Platform.isWindows) {
+      startWithWindows.value = await _readStartupRegistry();
+    }
   }
 
   Future<void> setThemeMode(ThemeMode mode) async {
@@ -47,6 +52,42 @@ class AppSettings {
   Future<void> setDownloadPath(String path) async {
     downloadPath.value = path;
     await _prefs.setString('download_path', path);
+  }
+
+  Future<void> setStartWithWindows(bool enabled) async {
+    if (!Platform.isWindows) return;
+    startWithWindows.value = enabled;
+    final exe = Platform.resolvedExecutable;
+    if (enabled) {
+      await Process.run('reg', [
+        'add',
+        r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
+        '/v', 'LocalChat',
+        '/t', 'REG_SZ',
+        '/d', exe,
+        '/f',
+      ]);
+    } else {
+      await Process.run('reg', [
+        'delete',
+        r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
+        '/v', 'LocalChat',
+        '/f',
+      ]);
+    }
+  }
+
+  static Future<bool> _readStartupRegistry() async {
+    try {
+      final result = await Process.run('reg', [
+        'query',
+        r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
+        '/v', 'LocalChat',
+      ]);
+      return result.exitCode == 0;
+    } catch (_) {
+      return false;
+    }
   }
 
   static String _defaultDownloadPath() {

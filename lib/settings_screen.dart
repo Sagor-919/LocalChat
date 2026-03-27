@@ -27,18 +27,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Settings'), centerTitle: true),
+      backgroundColor: isDark ? cs.surface : const Color(0xFFF5F5FA),
+      appBar: AppBar(
+        title: const Text('Settings'),
+        centerTitle: true,
+        backgroundColor: Colors.transparent,
+        surfaceTintColor: Colors.transparent,
+      ),
       body: ListView(
-        padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
+        padding: const EdgeInsets.fromLTRB(16, 4, 16, 32),
         children: [
           _sectionLabel(context, 'APPEARANCE'),
-          Card(
-            elevation: 0,
-            shape:
-                RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-            color: cs.surfaceContainerHighest.withValues(alpha: 0.5),
+          _card(
+            isDark: isDark,
+            cs: cs,
             child: Padding(
               padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 8),
               child: ValueListenableBuilder<ThemeMode>(
@@ -79,11 +84,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
           const SizedBox(height: 16),
 
           _sectionLabel(context, 'NOTIFICATIONS'),
-          Card(
-            elevation: 0,
-            shape:
-                RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-            color: cs.surfaceContainerHighest.withValues(alpha: 0.5),
+          _card(
+            isDark: isDark,
+            cs: cs,
             child: ValueListenableBuilder<bool>(
               valueListenable: _settings.notificationsMuted,
               builder: (_, muted, child) {
@@ -107,12 +110,34 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
           const SizedBox(height: 16),
 
+          if (_isDesktop) ...[
+            _sectionLabel(context, 'STARTUP'),
+            _card(
+              isDark: isDark,
+              cs: cs,
+              child: ValueListenableBuilder<bool>(
+                valueListenable: _settings.startWithWindows,
+                builder: (_, enabled, child) {
+                  return SwitchListTile(
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16)),
+                    secondary: Icon(Icons.launch, color: cs.primary),
+                    title: const Text('Start with Windows'),
+                    subtitle: const Text(
+                        'Launch Local Chat when you sign in'),
+                    value: enabled,
+                    onChanged: (v) => _settings.setStartWithWindows(v),
+                  );
+                },
+              ),
+            ),
+            const SizedBox(height: 16),
+          ],
+
           _sectionLabel(context, 'DOWNLOADS'),
-          Card(
-            elevation: 0,
-            shape:
-                RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-            color: cs.surfaceContainerHighest.withValues(alpha: 0.5),
+          _card(
+            isDark: isDark,
+            cs: cs,
             child: ValueListenableBuilder<String>(
               valueListenable: _settings.downloadPath,
               builder: (_, path, child) {
@@ -149,11 +174,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
           const SizedBox(height: 16),
 
           _sectionLabel(context, 'DATA'),
-          Card(
-            elevation: 0,
-            shape:
-                RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-            color: cs.surfaceContainerHighest.withValues(alpha: 0.5),
+          _card(
+            isDark: isDark,
+            cs: cs,
             child: ListTile(
               shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(16)),
@@ -167,42 +190,73 @@ class _SettingsScreenState extends State<SettingsScreen> {
           const SizedBox(height: 24),
 
           _sectionLabel(context, 'ABOUT'),
-          Card(
-            elevation: 0,
-            shape:
-                RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-            color: cs.surfaceContainerHighest.withValues(alpha: 0.5),
+          _card(
+            isDark: isDark,
+            cs: cs,
             child: Column(
               children: [
-                const SizedBox(height: 20),
-                CircleAvatar(
-                  radius: 36,
-                  backgroundColor: cs.primaryContainer,
-                  child: Text('S',
-                      style: TextStyle(
-                          color: cs.onPrimaryContainer,
-                          fontWeight: FontWeight.bold,
-                          fontSize: 28)),
+                const SizedBox(height: 24),
+                Container(
+                  width: 56,
+                  height: 56,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    gradient: LinearGradient(
+                      colors: [cs.primary, cs.tertiary],
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                    ),
+                  ),
+                  child: const Icon(Icons.chat_bubble_rounded,
+                      size: 28, color: Colors.white),
                 ),
-                const SizedBox(height: 12),
+                const SizedBox(height: 10),
+                Text('Local Chat',
+                    style: TextStyle(
+                        fontWeight: FontWeight.w800,
+                        fontSize: 22,
+                        color: cs.onSurface)),
+                Text('v1.0.0',
+                    style: TextStyle(
+                        color: cs.outline,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w500)),
+                const SizedBox(height: 20),
+                const Divider(height: 1, indent: 20, endIndent: 20),
+                const SizedBox(height: 16),
+                Container(
+                  width: 48,
+                  height: 48,
+                  decoration: const BoxDecoration(
+                    shape: BoxShape.circle,
+                    gradient: LinearGradient(
+                      colors: [Color(0xFF00C9FF), Color(0xFF92FE9D)],
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                    ),
+                  ),
+                  child: const Center(
+                    child: Text('S',
+                        style: TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 20)),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text('Developed By',
+                    style: TextStyle(
+                        color: cs.outline,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        letterSpacing: 0.5)),
                 Text('Sagor Hossen',
                     style: TextStyle(
                         fontWeight: FontWeight.w700,
-                        fontSize: 18,
+                        fontSize: 17,
                         color: cs.onSurface)),
-                Text('Developer',
-                    style: TextStyle(color: cs.outline, fontSize: 14)),
                 const SizedBox(height: 16),
-                const Divider(height: 1, indent: 16, endIndent: 16),
-                ListTile(
-                  leading: Icon(Icons.info_outline, color: cs.primary),
-                  title: const Text('Version'),
-                  trailing: Text('1.0.0',
-                      style: TextStyle(
-                          color: cs.outline,
-                          fontSize: 14,
-                          fontWeight: FontWeight.w500)),
-                ),
+                const Divider(height: 1, indent: 20, endIndent: 20),
                 ListTile(
                   leading: Icon(Icons.language, color: cs.primary),
                   title: const Text('Website'),
@@ -231,6 +285,29 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
         ],
       ),
+    );
+  }
+
+  Widget _card({
+    required bool isDark,
+    required ColorScheme cs,
+    required Widget child,
+  }) {
+    return Container(
+      decoration: BoxDecoration(
+        color: isDark ? cs.surfaceContainerHigh : Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: [
+          if (!isDark)
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.05),
+              blurRadius: 12,
+              offset: const Offset(0, 2),
+            ),
+        ],
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: child,
     );
   }
 
