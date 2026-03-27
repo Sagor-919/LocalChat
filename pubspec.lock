@@ -50,7 +50,7 @@ packages:
     source: hosted
     version: "1.19.1"
   cross_file:
-    dependency: "direct main"
+    dependency: transitive
     description:
       name: cross_file
       sha256: "28bb3ae56f117b5aec029d702a90f57d285cd975c3c5c281eaca38dbc47c5937"
@@ -248,14 +248,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "0.13.0"
-  mdns_dart:
-    dependency: "direct main"
-    description:
-      name: mdns_dart
-      sha256: "65d9112c22afd67571bb5e04fa775e621ec2b67374faf79093de8f715d0a26c3"
-      url: "https://pub.dev"
-    source: hosted
-    version: "2.2.1"
   meta:
     dependency: transitive
     description:
@@ -264,14 +256,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.17.0"
-  multicast_dns:
-    dependency: "direct main"
-    description:
-      name: multicast_dns
-      sha256: de72ada5c3db6fdd6ad4ae99452fe05fb403c4bb37c67ceb255ddd37d2b5b1eb
-      url: "https://pub.dev"
-    source: hosted
-    version: "0.3.3"
   open_filex:
     dependency: "direct main"
     description:

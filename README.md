@@ -1,238 +1,180 @@
-# DriveChat — Project Overview
+GOAL:
+Build a simple, fast, peer-to-peer LAN messaging app using Flutter that automatically discovers nearby devices, allows one-tap chat, and supports file/image sharing with a Messenger-style UI.
 
-## Summary
+CORE PRINCIPLES:
 
-DriveChat is a **cross-platform local network (LAN) messaging and file transfer app**.
-It works without internet by connecting devices on the same WiFi network.
+No server (pure LAN / P2P)
+Fast and lightweight
+Stable file transfer (chunked streaming)
+Clean, modern UI (Messenger-like)
+Cross-platform (Android + Desktop)
+PHASE 1 — PROJECT SETUP
+Create Flutter project
+Enable desktop support (Windows)
+Setup folder structure:
+/core (networking, models)
+/features (chat, discovery, transfer)
+/ui (screens, widgets)
+Add dependencies:
+provider / riverpod (state)
+file_picker
+desktop_drop (desktop only)
+Setup basic navigation
 
-The app is designed to feel like **Facebook Messenger**, but powered by **peer-to-peer communication**.
+OUTPUT:
 
----
+App launches with empty home screen
+PHASE 2 — DEVICE DISCOVERY (UDP)
 
-## Core Goals
+GOAL: Automatically detect nearby devices on LAN
 
-* Simple and clean messaging UI (Messenger-style)
-* Instant device discovery on local network
-* Realtime messaging (no refresh, no delay)
-* Fast file transfer between devices
-* Lightweight and reliable
-* Works across **iOS and Windows**
+IMPLEMENT:
 
----
+Use UDP broadcast (e.g., port 45454)
+Send DISCOVER message every few seconds:
+{ "type": "DISCOVER", "name": deviceName }
+Listen for incoming DISCOVER messages
+Respond with:
+{ "type": "RESPONSE", "name": deviceName, "ip": localIP }
+Maintain in-memory list of active devices
+Remove inactive devices after timeout
 
-## Key Features
+UI:
 
-* 💬 Realtime chat
-* 📁 File sharing (images, videos, documents)
-* 👀 Online/offline presence
-* 🔔 Local notifications
-* 📡 Auto device discovery (no manual IP input)
-* 📞 Press & hold “Ring” (attention ping)
+Home screen shows list of nearby devices
+Auto-refresh list
 
----
+OUTPUT:
 
-## Tech Overview
+Devices appear/disappear in real-time
+PHASE 3 — CONNECTION + CHAT (TCP)
 
-### Frontend
+GOAL: Tap device → start chat session
 
-* Flutter (single codebase for UI)
+IMPLEMENT:
 
-### Networking
+On tap → create TCP connection (fixed port)
+Exchange handshake:
+{ "type": "HELLO", "name": deviceName }
+Maintain persistent socket per peer
+Send/receive messages as JSON:
+{ "type": "MESSAGE", "text": "...", "timestamp": ... }
 
-* WebSocket (realtime communication)
-* mDNS / Zeroconf (device discovery)
+UI:
 
-### Storage
+Messenger-style chat screen
+Message bubbles (left/right)
+Input field + send button
 
-* Local database (SQLite)
+OUTPUT:
 
-### Architecture
+Real-time messaging between devices
+PHASE 4 — FILE TRANSFER (CORE FEATURE)
 
-* Peer-to-peer (each device acts as both client and server)
+GOAL: Send files reliably (like LAN Messenger)
 
----
+IMPLEMENT:
 
-# Development Phases
+Separate TCP channel OR reuse connection
+Handshake before transfer:
+{ "type": "FILE_META", "name": "...", "size": ... }
+Receiver replies: "START"
 
----
+SENDING LOGIC:
 
-## Phase 1 — Device Discovery
+Read file in 64KB chunks
+Send chunk
+WAIT for socket flush before next
+Repeat until done
 
-### Goal
+RECEIVING LOGIC:
 
-Detect and display devices on the same network.
+Continuously read bytes
+Append to file
+Track progress
 
-### Tasks
+FAILSAFE:
 
-* Implement mDNS service broadcasting
-* Discover nearby devices
-* Show list of available users
+Timeout if no progress (10–15 sec)
+Cancel and clean partial file
 
-### Output
+OUTPUT:
 
-* "Nearby Devices" screen
-* Devices appear/disappear in realtime
+Stable large file transfer (no freezing)
+PHASE 5 — IMAGE PREVIEW
 
----
+GOAL: Show images inside chat
 
-## Phase 2 — Connection System
+IMPLEMENT:
 
-### Goal
+Detect file type (image vs other)
+If image:
+Show thumbnail in chat bubble
+Tap to open full-screen preview
+Cache received images locally
 
-Establish connection between devices.
+UI:
 
-### Tasks
+Messenger-style image bubble
+Fullscreen viewer
 
-* Start WebSocket server on each device
-* Connect to selected device
-* Exchange user identity (name, ID)
+OUTPUT:
 
-### Output
+Smooth image preview experience
+PHASE 6 — DRAG & DROP + PICKER
 
-* Tap device → connect
-* Basic connection status (Connected / Disconnected)
+GOAL: Easy file sending
 
----
+DESKTOP:
 
-## Phase 3 — Realtime Messaging
+Drag & drop files into chat (desktop_drop)
 
-### Goal
+ANDROID:
 
-Send and receive messages instantly.
+File picker button
 
-### Tasks
+COMMON:
 
-* Design message format (JSON)
-* Send text messages via WebSocket
-* Receive and display messages
-* Store messages locally
+Show selected file preview before sending
 
-### Output
+OUTPUT:
 
-* Chat screen (Messenger-style)
-* Messages update instantly
+Simple and intuitive file sharing
+PHASE 7 — STABILITY & PERFORMANCE
 
----
+IMPLEMENT:
 
-## Phase 4 — Notifications
+Chunk-based transfer (64KB)
+Backpressure handling (await socket flush)
+Prevent UI blocking (async / isolate if needed)
+Connection retry logic
+Proper error handling
 
-### Goal
+OUTPUT:
 
-Notify users of new messages.
+No freeze, no crash on large files
+PHASE 8 — POLISH
+Show online/offline status
+Progress bar for file transfer
+Typing indicator (optional)
+Dark/light theme
+Device rename
 
-### Tasks
+OUTPUT:
 
-* Trigger local notification on message receive
-* Handle app foreground/background states
+Production-like experience
+FUTURE UPGRADES (OPTIONAL)
+Resume interrupted transfer
+Multi-device group chat
+Encryption (AES)
+QR code connection fallback
+WebRTC upgrade
+FINAL RESULT:
 
-### Output
+A clean, stable LAN messenger with:
 
-* Notification appears for new messages
-* Tap → opens chat
-
----
-
-## Phase 5 — File Transfer
-
-### Goal
-
-Send files between devices.
-
-### Tasks
-
-* File picker integration
-* Send file metadata (name, size)
-* Transfer file in chunks
-* Save file on receiver side
-
-### Output
-
-* Send/receive files in chat
-* Progress indicator
-
----
-
-## Phase 6 — Ring Feature
-
-### Goal
-
-Allow users to “ping” others.
-
-### Tasks
-
-* Detect press & hold gesture
-* Send "ring" event
-* Play sound/vibration on receiver
-
-### Output
-
-* Incoming ring alert UI
-* Quick attention system
-
----
-
-## Phase 7 — Sync System
-
-### Goal
-
-Keep messages consistent after reconnect.
-
-### Tasks
-
-* Assign unique IDs to messages
-* Track last synced state
-* Sync missing messages on reconnect
-
-### Output
-
-* Messages recover after disconnect
-* No duplicates
-
----
-
-## Phase 8 — UI Polish
-
-### Goal
-
-Make app feel smooth and modern.
-
-### Tasks
-
-* Clean Messenger-style UI
-* Animations (message send, receive)
-* Dark mode
-* Profile avatars
-
-### Output
-
-* Production-ready interface
-
----
-
-# Design Principles
-
-* Keep UI minimal and familiar
-* Prioritize speed over complexity
-* Avoid unnecessary features early
-* Build small → test → expand
-
----
-
-# Future Ideas (Optional)
-
-* Group chats
-* Public file sharing
-* Password-protected files
-* Cross-network relay (internet fallback)
-
----
-
-# First Milestone
-
-👉 Successfully:
-
-* Discover devices
-* Connect
-* Send 1 message
-
-If this works, the foundation is complete.
+Auto device discovery
+1-tap chat
+Messenger UI
+Reliable file transfer
+Image preview
