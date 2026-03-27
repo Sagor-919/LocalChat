@@ -296,39 +296,7 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
             Expanded(
-              child: _peerList.isEmpty
-                  ? Center(
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(Icons.wifi_find,
-                              size: 56,
-                              color: cs.outline.withValues(alpha: 0.4)),
-                          const SizedBox(height: 12),
-                          Text('Searching for devices\u2026',
-                              style: TextStyle(
-                                  color: cs.outline,
-                                  fontSize: 15,
-                                  fontWeight: FontWeight.w500)),
-                          const SizedBox(height: 10),
-                          SizedBox(
-                            width: 100,
-                            child: LinearProgressIndicator(
-                              borderRadius: BorderRadius.circular(99),
-                            ),
-                          ),
-                        ],
-                      ),
-                    )
-                  : ListView.builder(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 16, vertical: 4),
-                      itemCount: _peerList.length,
-                      itemBuilder: (context, index) {
-                        final entry = _peerList[index];
-                        return _buildChatTile(context, entry);
-                      },
-                    ),
+              child: _buildChatsBody(context, cs),
             ),
           ],
         ),
@@ -346,6 +314,129 @@ class _HomeScreenState extends State<HomeScreen> {
         unawaited(moveAndroidTaskToBackground());
       },
       child: home,
+    );
+  }
+
+  Widget _buildChatsBody(BuildContext context, ColorScheme cs) {
+    int nameCmp(_PeerEntry a, _PeerEntry b) =>
+        a.name.toLowerCase().compareTo(b.name.toLowerCase());
+
+    final online = _peerList.where((e) => e.online).toList()..sort(nameCmp);
+    final offline = _peerList.where((e) => !e.online).toList()..sort(nameCmp);
+
+    if (online.isEmpty && offline.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.wifi_find,
+                size: 56, color: cs.outline.withValues(alpha: 0.4)),
+            const SizedBox(height: 12),
+            Text(
+              'Searching for devices\u2026',
+              style: TextStyle(
+                color: cs.outline,
+                fontSize: 15,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+            const SizedBox(height: 10),
+            SizedBox(
+              width: 100,
+              child: LinearProgressIndicator(
+                borderRadius: BorderRadius.circular(99),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final children = <Widget>[];
+
+    if (online.isNotEmpty && offline.isNotEmpty) {
+      children.add(_buildChatsSectionHeader(context, 'Online', cs, isDark));
+    }
+    if (online.isNotEmpty) {
+      for (final e in online) {
+        children.add(_buildChatTile(context, e, showPresenceDot: true));
+      }
+    }
+
+    if (offline.isNotEmpty) {
+      if (online.isNotEmpty) {
+        children.add(_buildChatsSectionDivider(cs));
+      }
+      children.add(
+        _buildChatsSectionHeader(context, 'Offline', cs, isDark, muted: true),
+      );
+      for (final e in offline) {
+        children.add(_buildChatTile(context, e, showPresenceDot: false));
+      }
+    }
+
+    return ListView(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      children: children,
+    );
+  }
+
+  Widget _buildChatsSectionHeader(
+    BuildContext context,
+    String title,
+    ColorScheme cs,
+    bool isDark, {
+    bool muted = false,
+  }) {
+    final onlineStyle = isDark
+        ? cs.primaryContainer.withValues(alpha: 0.45)
+        : const Color(0xFF2E7D32).withValues(alpha: 0.14);
+    final onlineFg =
+        isDark ? cs.onPrimaryContainer : const Color(0xFF1B5E20);
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(4, 4, 4, 8),
+      child: Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+            decoration: BoxDecoration(
+              color: muted
+                  ? cs.surfaceContainerHighest.withValues(alpha: 0.75)
+                  : onlineStyle,
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(
+                color: muted
+                    ? cs.outlineVariant.withValues(alpha: 0.35)
+                    : (isDark
+                        ? cs.primary.withValues(alpha: 0.35)
+                        : const Color(0xFF2E7D32).withValues(alpha: 0.25)),
+              ),
+            ),
+            child: Text(
+              title.toUpperCase(),
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w800,
+                letterSpacing: 0.9,
+                color: muted ? cs.outline : onlineFg,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildChatsSectionDivider(ColorScheme cs) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(4, 16, 4, 4),
+      child: Divider(
+        height: 1,
+        thickness: 1,
+        color: cs.outlineVariant.withValues(alpha: 0.45),
+      ),
     );
   }
 
@@ -400,7 +491,7 @@ class _HomeScreenState extends State<HomeScreen> {
                         height: 8,
                         decoration: const BoxDecoration(
                           shape: BoxShape.circle,
-                          color: Colors.green,
+                          color: _RingAvatar._onlineGreen,
                         ),
                       ),
                       const SizedBox(width: 5),
@@ -436,7 +527,11 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildChatTile(BuildContext context, _PeerEntry entry) {
+  Widget _buildChatTile(
+    BuildContext context,
+    _PeerEntry entry, {
+    bool showPresenceDot = false,
+  }) {
     final cs = Theme.of(context).colorScheme;
     final isDark = Theme.of(context).brightness == Brightness.dark;
     final unread = _unread[entry.userId] ?? 0;
@@ -465,6 +560,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   fontSize: 18,
                   online: entry.online,
                   isDark: isDark,
+                  showPresenceDot: showPresenceDot && entry.online,
                 ),
                 const SizedBox(width: 14),
                 Expanded(
@@ -590,7 +686,7 @@ class _HomeScreenState extends State<HomeScreen> {
 }
 
 class _RingAvatar extends StatelessWidget {
-  static const _onlineGreen = Color(0xFF2E7D32);
+  static const _onlineGreen = Color(0xFF43A047);
   static const _offlineGreyLight = Color(0xFF9E9E9E);
   static const _offlineGreyDark = Color(0xFF757575);
 
@@ -599,6 +695,7 @@ class _RingAvatar extends StatelessWidget {
   final double fontSize;
   final bool online;
   final bool isDark;
+  final bool showPresenceDot;
 
   const _RingAvatar({
     required this.letter,
@@ -606,6 +703,7 @@ class _RingAvatar extends StatelessWidget {
     required this.fontSize,
     required this.online,
     this.isDark = false,
+    this.showPresenceDot = false,
   });
 
   @override
@@ -616,7 +714,7 @@ class _RingAvatar extends StatelessWidget {
     final ring =
         online ? _onlineGreen : (dark ? _offlineGreyDark : _offlineGreyLight);
 
-    return Container(
+    final circle = Container(
       width: radius * 2,
       height: radius * 2,
       decoration: BoxDecoration(
@@ -641,6 +739,42 @@ class _RingAvatar extends StatelessWidget {
             fontSize: fontSize,
           ),
         ),
+      ),
+    );
+
+    if (!showPresenceDot || !online) {
+      return circle;
+    }
+
+    final dotSize = (radius * 0.5).clamp(8.0, 14.0);
+    return SizedBox(
+      width: radius * 2,
+      height: radius * 2,
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          circle,
+          Positioned(
+            right: -0.5,
+            bottom: -0.5,
+            child: Container(
+              width: dotSize,
+              height: dotSize,
+              decoration: BoxDecoration(
+                color: _onlineGreen,
+                shape: BoxShape.circle,
+                border: Border.all(color: fill, width: 2),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.2),
+                    blurRadius: 3,
+                    offset: const Offset(0, 1),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
