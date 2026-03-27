@@ -49,12 +49,17 @@ class _PendingReceive {
   const _PendingReceive(this.peerId, this.fileName, this.fileSize);
 }
 
+class _PendingWaiter {
+  final Completer<_PendingReceive> completer = Completer();
+}
+
 class TransferManager {
   static final instance = TransferManager._();
   TransferManager._();
 
   final Map<String, TransferState> transfers = {};
   final Map<String, _PendingReceive> _pending = {};
+  final Map<String, _PendingWaiter> _waiters = {};
 
   final _transferUpdates = StreamController<void>.broadcast();
   final _fileMessages = StreamController<FileMessageEvent>.broadcast();
@@ -85,10 +90,16 @@ class TransferManager {
   }
 
   /// Called from main.dart when a file_notify arrives over the chat TCP.
-  /// Pre-registers the expected incoming transfer so we can map fileId → peerId.
+  /// Pre-registers the expected incoming transfer so we can map fileId -> peerId.
   void registerIncoming(
       String peerId, String fileId, String fileName, int fileSize) {
-    _pending[fileId] = _PendingReceive(peerId, fileName, fileSize);
+    final pending = _PendingReceive(peerId, fileName, fileSize);
+    final waiter = _waiters.remove(fileId);
+    if (waiter != null) {
+      waiter.completer.complete(pending);
+    } else {
+      _pending[fileId] = pending;
+    }
   }
 
   /// Initiate sending a file to a peer. Creates the ChatMessage, stores it,
@@ -198,8 +209,19 @@ class TransferManager {
   // ---------------------------------------------------------------------------
   // FileReceiver callbacks
   // ---------------------------------------------------------------------------
-  void _onReceiveStarted(String fileId, String fileName, int fileSize) {
-    final pending = _pending.remove(fileId);
+  Future<void> _onReceiveStarted(
+      String fileId, String fileName, int fileSize) async {
+    var pending = _pending.remove(fileId);
+    if (pending == null) {
+      final waiter = _PendingWaiter();
+      _waiters[fileId] = waiter;
+      try {
+        pending = await waiter.completer.future
+            .timeout(const Duration(seconds: 3));
+      } catch (_) {
+        _waiters.remove(fileId);
+      }
+    }
     final peerId = pending?.peerId ?? 'unknown';
 
     final msg = ChatMessage(

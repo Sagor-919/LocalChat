@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
+import 'app_settings.dart';
 import 'connection_service.dart';
 import 'device.dart';
 import 'discovery_service.dart';
@@ -21,6 +22,7 @@ bool _appInForeground = true;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await AppSettings.instance.init();
   _me = await DeviceInfo.load();
   _store = await MessageStore.init();
   _discovery = DiscoveryService(me: _me);
@@ -72,7 +74,9 @@ Future<void> main() async {
       );
     }
 
-    if (!_appInForeground && type == 'message') {
+    if (!_appInForeground &&
+        !AppSettings.instance.notificationsMuted.value &&
+        type == 'message') {
       final text = json['text'] as String? ?? '';
       final from = json['from'] as String? ?? 'Someone';
       final peer =
@@ -96,7 +100,8 @@ Future<void> main() async {
   };
 
   TransferManager.instance.fileMessages.listen((event) {
-    if (!_appInForeground) {
+    if (!_appInForeground &&
+        !AppSettings.instance.notificationsMuted.value) {
       final peer =
           _discovery.peers.where((p) => p.userId == event.peerId).firstOrNull;
       final name = peer?.name ?? 'Someone';
@@ -150,26 +155,31 @@ class _LocalChatAppState extends State<LocalChatApp>
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Local Chat',
-      debugShowCheckedModeBanner: false,
-      themeMode: ThemeMode.system,
-      theme: ThemeData(
-        colorSchemeSeed: Colors.indigo,
-        brightness: Brightness.light,
-        useMaterial3: true,
-      ),
-      darkTheme: ThemeData(
-        colorSchemeSeed: Colors.indigo,
-        brightness: Brightness.dark,
-        useMaterial3: true,
-      ),
-      home: HomeScreen(
-        me: _me,
-        discovery: _discovery,
-        connections: _connections,
-        store: _store,
-      ),
+    return ValueListenableBuilder<ThemeMode>(
+      valueListenable: AppSettings.instance.themeMode,
+      builder: (_, mode, child) {
+        return MaterialApp(
+          title: 'Local Chat',
+          debugShowCheckedModeBanner: false,
+          themeMode: mode,
+          theme: ThemeData(
+            colorSchemeSeed: Colors.indigo,
+            brightness: Brightness.light,
+            useMaterial3: true,
+          ),
+          darkTheme: ThemeData(
+            colorSchemeSeed: Colors.indigo,
+            brightness: Brightness.dark,
+            useMaterial3: true,
+          ),
+          home: HomeScreen(
+            me: _me,
+            discovery: _discovery,
+            connections: _connections,
+            store: _store,
+          ),
+        );
+      },
     );
   }
 }

@@ -5,6 +5,7 @@ import 'connection_service.dart';
 import 'device.dart';
 import 'discovery_service.dart';
 import 'message_store.dart';
+import 'settings_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   final DeviceInfo me;
@@ -179,6 +180,19 @@ class _HomeScreenState extends State<HomeScreen> {
       appBar: AppBar(
         title: const Text('Local Chat'),
         centerTitle: true,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.settings),
+            tooltip: 'Settings',
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => SettingsScreen(store: widget.store),
+                ),
+              );
+            },
+          ),
+        ],
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(28),
           child: Padding(

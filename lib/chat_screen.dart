@@ -4,10 +4,12 @@ import 'dart:io';
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:open_filex/open_filex.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'package:uuid/uuid.dart';
 
 import 'connection_service.dart';
@@ -50,6 +52,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   StreamSubscription<void>? _transferSub;
   StreamSubscription<FileMessageEvent>? _fileMsgSub;
+  Timer? _transferThrottle;
 
   String get _peerId => widget.peer.userId;
   TransferManager get _tm => TransferManager.instance;
@@ -75,7 +78,10 @@ class _ChatScreenState extends State<ChatScreen> {
     };
 
     _transferSub = _tm.transferUpdates.listen((_) {
-      if (mounted) setState(() {});
+      if (_transferThrottle?.isActive ?? false) return;
+      _transferThrottle = Timer(const Duration(milliseconds: 200), () {
+        if (mounted) setState(() {});
+      });
     });
 
     _fileMsgSub = _tm.fileMessages.listen((event) {
@@ -101,11 +107,19 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _loadHistory() async {
     final stored = await widget.store.load(_peerId);
     if (!mounted) return;
+    final existingIds = _messages.map((m) => m.id).toSet();
     setState(() {
-      _messages.addAll(stored);
+      for (final m in stored) {
+        if (!existingIds.contains(m.id)) _messages.add(m);
+      }
+      _messages.sort((a, b) => a.timestamp.compareTo(b.timestamp));
       _loading = false;
     });
-    _scrollToBottom();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scroll.hasClients) {
+        _scroll.jumpTo(_scroll.position.maxScrollExtent);
+      }
+    });
   }
 
   Future<void> _connect() async {
@@ -121,6 +135,7 @@ class _ChatScreenState extends State<ChatScreen> {
     widget.connections.onDisconnected = _prevOnDisconnected;
     _transferSub?.cancel();
     _fileMsgSub?.cancel();
+    _transferThrottle?.cancel();
     _input.dispose();
     _focus.dispose();
     _scroll.dispose();
@@ -145,10 +160,6 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _pickFiles() async {
-    if (_isDesktop) {
-      _showDesktopAttachMenu();
-      return;
-    }
     final picked = await FilePicker.platform.pickFiles(
       type: FileType.any,
       allowMultiple: true,
@@ -161,68 +172,45 @@ class _ChatScreenState extends State<ChatScreen> {
         .toList());
   }
 
-  void _showDesktopAttachMenu() {
-    final box = context.findRenderObject() as RenderBox?;
-    if (box == null) return;
-    final overlay =
-        Overlay.of(context).context.findRenderObject() as RenderBox?;
-    if (overlay == null) return;
-
-    showMenu<String>(
-      context: context,
-      position: RelativeRect.fromRect(
-        Rect.fromLTWH(12, box.size.height - 120, 180, 48),
-        Offset.zero & overlay.size,
-      ),
-      items: const [
-        PopupMenuItem(
-            value: 'files',
-            child: ListTile(
-              leading: Icon(Icons.description),
-              title: Text('Select Files'),
-              dense: true,
-              visualDensity: VisualDensity.compact,
-            )),
-        PopupMenuItem(
-            value: 'folder',
-            child: ListTile(
-              leading: Icon(Icons.folder),
-              title: Text('Select Folder'),
-              dense: true,
-              visualDensity: VisualDensity.compact,
-            )),
-      ],
-    ).then((value) {
-      if (value == 'files') _pickDesktopFiles();
-      if (value == 'folder') _pickDesktopFolder();
-    });
-  }
-
-  Future<void> _pickDesktopFiles() async {
-    final picked = await FilePicker.platform.pickFiles(
-      type: FileType.any,
-      allowMultiple: true,
-      withData: false,
-    );
-    if (picked == null) return;
-    _stageFiles(picked.files
-        .where((f) => f.path != null)
-        .map((f) => _StagedFile(f.path!, f.name))
-        .toList());
-  }
-
-  Future<void> _pickDesktopFolder() async {
+  Future<void> _pickFolder() async {
     final dirPath = await FilePicker.platform.getDirectoryPath();
     if (dirPath == null) return;
-    final dir = Directory(dirPath);
-    final files = <_StagedFile>[];
-    await for (final entity in dir.list(recursive: false)) {
-      if (entity is File) {
-        final name = entity.path.split(Platform.pathSeparator).last;
-        files.add(_StagedFile(entity.path, name));
+
+    final folderName = dirPath.split(Platform.pathSeparator).last;
+    final zipPath =
+        '${Directory.systemTemp.path}${Platform.pathSeparator}$folderName.zip';
+
+    try {
+      final zipFile = File(zipPath);
+      if (await zipFile.exists()) await zipFile.delete();
+
+      final parentDir = Directory(dirPath).parent.path;
+      final result = await Process.run(
+        'tar',
+        ['-a', '-cf', zipPath, '-C', parentDir, folderName],
+      );
+      if (result.exitCode != 0) {
+        if (mounted) {
+          ScaffoldMessenger.of(context)
+            ..clearSnackBars()
+            ..showSnackBar(SnackBar(
+              content: Text('Failed to compress folder: ${result.stderr}'),
+              behavior: SnackBarBehavior.floating,
+            ));
+        }
+        return;
+      }
+      _stageFiles([_StagedFile(zipPath, '$folderName.zip')]);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+          ..clearSnackBars()
+          ..showSnackBar(SnackBar(
+            content: Text('Failed to compress folder: $e'),
+            behavior: SnackBarBehavior.floating,
+          ));
       }
     }
-    _stageFiles(files);
   }
 
   Future<void> _pickGallery() async {
@@ -351,6 +339,52 @@ class _ChatScreenState extends State<ChatScreen> {
     return '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
   }
 
+  String _fmtDate(DateTime dt) {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final msgDay = DateTime(dt.year, dt.month, dt.day);
+    if (msgDay == today) return 'Today';
+    if (msgDay == today.subtract(const Duration(days: 1))) return 'Yesterday';
+    const months = [
+      '', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+    ];
+    return '${months[dt.month]} ${dt.day}, ${dt.year}';
+  }
+
+  bool _needsDateSeparator(int index) {
+    if (index == 0) return true;
+    final prev = DateTime.fromMillisecondsSinceEpoch(_messages[index - 1].timestamp);
+    final curr = DateTime.fromMillisecondsSinceEpoch(_messages[index].timestamp);
+    return prev.year != curr.year ||
+        prev.month != curr.month ||
+        prev.day != curr.day;
+  }
+
+  Widget _buildDateSeparator(BuildContext context, DateTime dt) {
+    final cs = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 12),
+      child: Row(
+        children: [
+          Expanded(child: Divider(color: cs.outlineVariant.withValues(alpha: 0.4))),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            child: Text(
+              _fmtDate(dt),
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: cs.outline,
+              ),
+            ),
+          ),
+          Expanded(child: Divider(color: cs.outlineVariant.withValues(alpha: 0.4))),
+        ],
+      ),
+    );
+  }
+
   static String _fmtBytes(int bytes) {
     if (bytes < 1024) return '$bytes B';
     final kb = bytes / 1024;
@@ -381,6 +415,104 @@ class _ChatScreenState extends State<ChatScreen> {
 
   bool get _isDesktop =>
       !kIsWeb && (Platform.isWindows || Platform.isLinux || Platform.isMacOS);
+
+  static final _linkRe = RegExp(
+    r'(https?://[^\s]+)|([\w.+-]+@[\w-]+\.\w[\w.]*)',
+    caseSensitive: false,
+  );
+
+  void _openUrl(String raw) async {
+    final uri = raw.contains('@') && !raw.startsWith('http')
+        ? Uri.parse('mailto:$raw')
+        : Uri.parse(raw);
+    try {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    } catch (_) {}
+  }
+
+  Widget _buildRichText(String text, Color color, bool mine) {
+    final cs = Theme.of(context).colorScheme;
+    final matches = _linkRe.allMatches(text).toList();
+    if (matches.isEmpty) {
+      return Text(text,
+          style: TextStyle(color: color, fontSize: 15, height: 1.3));
+    }
+
+    final spans = <InlineSpan>[];
+    int last = 0;
+    for (final m in matches) {
+      if (m.start > last) {
+        spans.add(TextSpan(
+            text: text.substring(last, m.start),
+            style: TextStyle(color: color, fontSize: 15, height: 1.3)));
+      }
+      final link = m.group(0)!;
+      final linkColor =
+          mine ? cs.onPrimary.withValues(alpha: 0.85) : cs.primary;
+      spans.add(TextSpan(
+        text: link,
+        style: TextStyle(
+          color: linkColor,
+          fontSize: 15,
+          height: 1.3,
+          decoration: TextDecoration.underline,
+          decorationColor: linkColor,
+          fontWeight: FontWeight.w600,
+        ),
+        recognizer: TapGestureRecognizer()
+          ..onTap = () {
+            if (!kIsWeb && Platform.isAndroid) {
+              _showLinkMenu(link);
+            } else {
+              _openUrl(link);
+            }
+          },
+      ));
+      last = m.end;
+    }
+    if (last < text.length) {
+      spans.add(TextSpan(
+          text: text.substring(last),
+          style: TextStyle(color: color, fontSize: 15, height: 1.3)));
+    }
+    return Text.rich(TextSpan(children: spans));
+  }
+
+  void _showLinkMenu(String link) {
+    showModalBottomSheet(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.open_in_browser),
+              title: Text(link.contains('@') ? 'Send Email' : 'Open in Browser'),
+              onTap: () {
+                Navigator.pop(ctx);
+                _openUrl(link);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.copy),
+              title: const Text('Copy'),
+              onTap: () {
+                Navigator.pop(ctx);
+                Clipboard.setData(ClipboardData(text: link));
+                ScaffoldMessenger.of(context)
+                  ..clearSnackBars()
+                  ..showSnackBar(const SnackBar(
+                    content: Text('Copied to clipboard'),
+                    duration: Duration(seconds: 1),
+                    behavior: SnackBarBehavior.floating,
+                  ));
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 
   static String _fileTypeLabel(String name) {
     final dot = name.lastIndexOf('.');
@@ -422,7 +554,56 @@ class _ChatScreenState extends State<ChatScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: Text(widget.peer.name),
+        titleSpacing: 0,
+        title: Row(
+          children: [
+            CircleAvatar(
+              radius: 18,
+              backgroundColor: widget.peer.avatarColor,
+              child: Text(
+                widget.peer.name.isNotEmpty
+                    ? widget.peer.name[0].toUpperCase()
+                    : '?',
+                style: const TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 16),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(widget.peer.name,
+                    style: const TextStyle(
+                        fontSize: 16, fontWeight: FontWeight.w700)),
+                Row(
+                  children: [
+                    Container(
+                      width: 7,
+                      height: 7,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: _connected ? Colors.green : cs.error,
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      _connected ? 'Connected' : 'Disconnected',
+                      style: TextStyle(
+                        color: _connected
+                            ? Colors.green
+                            : cs.error,
+                        fontWeight: FontWeight.w500,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ],
+        ),
         actions: [
           PopupMenuButton<String>(
             onSelected: (value) {
@@ -441,34 +622,6 @@ class _ChatScreenState extends State<ChatScreen> {
             ],
           ),
         ],
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(24),
-          child: Padding(
-            padding: const EdgeInsets.only(bottom: 8),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Container(
-                  width: 8,
-                  height: 8,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: _connected ? Colors.green : cs.error,
-                  ),
-                ),
-                const SizedBox(width: 6),
-                Text(
-                  _connected ? 'Connected' : 'Disconnected',
-                  style: TextStyle(
-                    color: _connected ? Colors.green : cs.error,
-                    fontWeight: FontWeight.w600,
-                    fontSize: 13,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
       ),
       body: SafeArea(
         child: DropTarget(
@@ -485,10 +638,21 @@ class _ChatScreenState extends State<ChatScreen> {
                                 style: TextStyle(color: cs.outline)))
                         : ListView.builder(
                             controller: _scroll,
-                            padding: const EdgeInsets.all(12),
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 14, vertical: 8),
                             itemCount: _messages.length,
-                            itemBuilder: (ctx, i) =>
-                                _buildBubble(ctx, _messages[i]),
+                            itemBuilder: (ctx, i) {
+                              final widgets = <Widget>[];
+                              if (_needsDateSeparator(i)) {
+                                widgets.add(_buildDateSeparator(ctx,
+                                    DateTime.fromMillisecondsSinceEpoch(
+                                        _messages[i].timestamp)));
+                              }
+                              widgets.add(_buildBubble(ctx, _messages[i]));
+                              return Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: widgets);
+                            },
                           ),
               ),
               if (_staged.isNotEmpty) _buildStagedPreview(context),
@@ -667,7 +831,13 @@ class _ChatScreenState extends State<ChatScreen> {
         margin: const EdgeInsets.symmetric(vertical: 3),
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
         decoration: BoxDecoration(
-          color: mine ? cs.primary : cs.surfaceContainerHighest,
+          color: mine
+              ? cs.primary
+              : cs.surfaceContainerHighest.withValues(alpha: 0.8),
+          border: mine
+              ? null
+              : Border.all(
+                  color: cs.outlineVariant.withValues(alpha: 0.3), width: 0.5),
           borderRadius: BorderRadius.only(
             topLeft: const Radius.circular(18),
             topRight: const Radius.circular(18),
@@ -681,14 +851,8 @@ class _ChatScreenState extends State<ChatScreen> {
             if (m.attachmentName != null)
               _buildAttachment(context, m, mine)
             else
-              Text(
-                m.text,
-                style: TextStyle(
-                  color: mine ? cs.onPrimary : cs.onSurface,
-                  fontSize: 15,
-                  height: 1.3,
-                ),
-              ),
+              _buildRichText(
+                  m.text, mine ? cs.onPrimary : cs.onSurface, mine),
 
             if (t != null) ...[
               const SizedBox(height: 8),
@@ -845,7 +1009,7 @@ class _ChatScreenState extends State<ChatScreen> {
                     Icon(Icons.folder_open, size: 14, color: subtleColor),
                     const SizedBox(width: 4),
                     Text(
-                      'Open Folder',
+                      'View In Explorer',
                       style: TextStyle(
                         fontSize: 11,
                         color: subtleColor,
@@ -875,9 +1039,21 @@ class _ChatScreenState extends State<ChatScreen> {
         children: [
           IconButton.filled(
             onPressed: _pickFiles,
-            tooltip: _isDesktop ? 'Attach Files / Folder' : 'Attach Files',
+            tooltip: 'Attach Files',
             icon: const Icon(Icons.attach_file),
           ),
+          if (_isDesktop) ...[
+            const SizedBox(width: 4),
+            IconButton.filled(
+              onPressed: _pickFolder,
+              tooltip: 'Attach Folder',
+              style: IconButton.styleFrom(
+                backgroundColor: cs.secondaryContainer,
+                foregroundColor: cs.onSecondaryContainer,
+              ),
+              icon: const Icon(Icons.folder),
+            ),
+          ],
           if (!kIsWeb && Platform.isAndroid) ...[
             const SizedBox(width: 4),
             IconButton.filled(

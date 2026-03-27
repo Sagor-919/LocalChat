@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'app_settings.dart';
+
 const int kFileTransferPort = 4042;
 const int kChunkSize = 65536; // 64 KB
 
@@ -104,7 +106,7 @@ class FileReceiver {
   ServerSocket? _server;
   final Set<String> _cancelledIds = {};
 
-  void Function(String fileId, String fileName, int fileSize)? onFileStarted;
+  Future<void> Function(String fileId, String fileName, int fileSize)? onFileStarted;
   void Function(String fileId, int received, int total)? onProgress;
   void Function(String fileId, String savedPath)? onFileComplete;
   void Function(String fileId, String error)? onFileError;
@@ -191,14 +193,12 @@ class FileReceiver {
       final fileName = header['name'] as String? ?? 'file';
       totalBytes = (header['size'] as num?)?.toInt() ?? 0;
 
-      final dir = Directory.systemTemp;
       final safeName = fileName.replaceAll(RegExp(r'[/\\]'), '_');
-      final savePath =
-          '${dir.path}/${DateTime.now().millisecondsSinceEpoch}-$safeName';
+      final savePath = await _resolveSavePath(safeName);
       final saveFile = File(savePath);
       raf = await saveFile.open(mode: FileMode.write);
 
-      onFileStarted?.call(fileId, fileName, totalBytes);
+      await onFileStarted?.call(fileId, fileName, totalBytes);
       received = 0;
 
       socket.write('START\n');
@@ -234,6 +234,21 @@ class FileReceiver {
         await socket.close();
       } catch (_) {}
     }
+  }
+
+  static Future<String> _resolveSavePath(String safeName) async {
+    final stamp = DateTime.now().millisecondsSinceEpoch;
+    final dlPath = AppSettings.instance.downloadPath.value;
+    if (dlPath.isNotEmpty) {
+      try {
+        final dir = Directory(dlPath);
+        if (!await dir.exists()) await dir.create(recursive: true);
+        final path = '${dir.path}${Platform.pathSeparator}$stamp-$safeName';
+        await File(path).create();
+        return path;
+      } catch (_) {}
+    }
+    return '${Directory.systemTemp.path}${Platform.pathSeparator}$stamp-$safeName';
   }
 
   Future<void> stop() async {
