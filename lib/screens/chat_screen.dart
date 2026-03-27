@@ -181,12 +181,13 @@ class _ChatScreenState extends State<ChatScreen> {
 
         if (!mounted) return;
         final previousVisible = _messages.length;
+        final target = previousVisible > 0 ? previousVisible + 1 : _pageSize;
         setState(() {
           _allMessages.add(chat);
           _allMessages.sort((a, b) => a.sentAtMs.compareTo(b.sentAtMs));
           _messages
             ..clear()
-            ..addAll(_tail(_allMessages, previousVisible + 1));
+            ..addAll(_tail(_allMessages, target));
         });
         _scrollToBottomSoon();
       };
@@ -365,13 +366,15 @@ class _ChatScreenState extends State<ChatScreen> {
       );
 
       if (!mounted) return;
+      final previousVisible = _messages.length;
+      final target = previousVisible > 0 ? previousVisible + 1 : _pageSize;
       setState(() {
         _activeOutgoingTransfer = null;
         _allMessages.add(chat);
         _allMessages.sort((a, b) => a.sentAtMs.compareTo(b.sentAtMs));
         _messages
           ..clear()
-          ..addAll(_tail(_allMessages, _messages.length + 1));
+          ..addAll(_tail(_allMessages, target));
       });
       _scrollToBottomSoon();
     } catch (e) {
@@ -410,13 +413,14 @@ class _ChatScreenState extends State<ChatScreen> {
 
       if (!mounted) return;
       final previousVisible = _messages.length;
+      final target = previousVisible > 0 ? previousVisible + 1 : _pageSize;
       setState(() {
         _activeIncomingTransfer = null;
         _allMessages.add(chat);
         _allMessages.sort((a, b) => a.sentAtMs.compareTo(b.sentAtMs));
         _messages
           ..clear()
-          ..addAll(_tail(_allMessages, previousVisible + 1));
+          ..addAll(_tail(_allMessages, target));
       });
       _scrollToBottomSoon();
     } catch (e) {
