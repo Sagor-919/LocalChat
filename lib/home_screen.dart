@@ -198,7 +198,7 @@ class _HomeScreenState extends State<HomeScreen> {
             content: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                _GradientAvatar(letter: initial, radius: 40, fontSize: 32),
+                _RingAvatar(letter: initial, radius: 40, fontSize: 32, online: true),
                 const SizedBox(height: 20),
                 TextField(
                   controller: controller,
@@ -351,12 +351,13 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
       child: Row(
         children: [
-          _GradientAvatar(
+          _RingAvatar(
             letter: widget.me.displayName.isNotEmpty
                 ? widget.me.displayName[0].toUpperCase()
                 : '?',
             radius: 28,
             fontSize: 22,
+            online: true,
           ),
           const SizedBox(width: 14),
           Expanded(
@@ -438,34 +439,14 @@ class _HomeScreenState extends State<HomeScreen> {
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
             child: Row(
               children: [
-                Stack(
-                  children: [
-                    _GradientAvatar(
-                      letter: entry.name.isNotEmpty
-                          ? entry.name[0].toUpperCase()
-                          : '?',
-                      radius: 24,
-                      fontSize: 18,
-                    ),
-                    Positioned(
-                      right: 0,
-                      bottom: 0,
-                      child: Container(
-                        width: 13,
-                        height: 13,
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: entry.online ? Colors.green : cs.outline,
-                          border: Border.all(
-                            color: isDark
-                                ? cs.surfaceContainerHigh
-                                : Colors.white,
-                            width: 2,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
+                _RingAvatar(
+                  letter: entry.name.isNotEmpty
+                      ? entry.name[0].toUpperCase()
+                      : '?',
+                  radius: 24,
+                  fontSize: 18,
+                  online: entry.online,
+                  isDark: isDark,
                 ),
                 const SizedBox(width: 14),
                 Expanded(
@@ -590,36 +571,55 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 }
 
-class _GradientAvatar extends StatelessWidget {
+class _RingAvatar extends StatelessWidget {
+  static const _onlineGreen = Color(0xFF2E7D32);
+  static const _offlineGreyLight = Color(0xFF9E9E9E);
+  static const _offlineGreyDark = Color(0xFF757575);
+
   final String letter;
   final double radius;
   final double fontSize;
+  final bool online;
+  final bool isDark;
 
-  const _GradientAvatar({
+  const _RingAvatar({
     required this.letter,
     required this.radius,
     required this.fontSize,
+    required this.online,
+    this.isDark = false,
   });
 
   @override
   Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final dark = isDark || Theme.of(context).brightness == Brightness.dark;
+    final fill = dark ? cs.surfaceContainerHighest : const Color(0xFFE8E8EF);
+    final ring =
+        online ? _onlineGreen : (dark ? _offlineGreyDark : _offlineGreyLight);
+
     return Container(
       width: radius * 2,
       height: radius * 2,
-      decoration: const BoxDecoration(
+      decoration: BoxDecoration(
         shape: BoxShape.circle,
-        gradient: LinearGradient(
-          colors: [Color(0xFF00C9FF), Color(0xFF92FE9D)],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
+        color: fill,
+        border: Border.all(color: ring, width: 2.5),
+        boxShadow: [
+          if (!dark)
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.06),
+              blurRadius: 6,
+              offset: const Offset(0, 2),
+            ),
+        ],
       ),
       child: Center(
         child: Text(
           letter,
           style: TextStyle(
-            color: Colors.white,
-            fontWeight: FontWeight.bold,
+            color: cs.onSurface,
+            fontWeight: FontWeight.w700,
             fontSize: fontSize,
           ),
         ),

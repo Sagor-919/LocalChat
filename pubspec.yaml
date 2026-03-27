@@ -31,6 +31,7 @@ flutter:
   uses-material-design: true
   assets:
     - assets/app_icon.png
+    - assets/developer_avatar.png
     - windows/runner/resources/app_icon.ico
 
 flutter_launcher_icons:

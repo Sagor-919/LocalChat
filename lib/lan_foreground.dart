@@ -3,6 +3,8 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
+import 'app_settings.dart';
+
 void registerLanForegroundPort() {
   if (kIsWeb || !Platform.isAndroid) return;
   FlutterForegroundTask.initCommunicationPort();
@@ -60,6 +62,7 @@ void initLanForegroundTask() {
 
 Future<void> startLanForegroundIfNeeded() async {
   if (kIsWeb || !Platform.isAndroid) return;
+  if (!AppSettings.instance.backgroundRunningEnabled.value) return;
   if (await FlutterForegroundTask.isRunningService) return;
   final perm = await FlutterForegroundTask.checkNotificationPermission();
   if (perm != NotificationPermission.granted) {

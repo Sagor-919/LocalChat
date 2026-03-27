@@ -13,6 +13,8 @@ class AppSettings {
   final notificationsMuted = ValueNotifier<bool>(false);
   final downloadPath = ValueNotifier<String>('');
   final startWithWindows = ValueNotifier<bool>(false);
+  /// Android: keep discovery/chat active via foreground service when app is in background.
+  final backgroundRunningEnabled = ValueNotifier<bool>(true);
 
   Future<void> init() async {
     _prefs = await SharedPreferences.getInstance();
@@ -25,6 +27,9 @@ class AppSettings {
     };
 
     notificationsMuted.value = _prefs.getBool('notifications_muted') ?? false;
+
+    backgroundRunningEnabled.value =
+        _prefs.getBool('background_running') ?? true;
 
     downloadPath.value =
         _prefs.getString('download_path') ?? _defaultDownloadPath();
@@ -47,6 +52,11 @@ class AppSettings {
   Future<void> setNotificationsMuted(bool muted) async {
     notificationsMuted.value = muted;
     await _prefs.setBool('notifications_muted', muted);
+  }
+
+  Future<void> setBackgroundRunningEnabled(bool enabled) async {
+    backgroundRunningEnabled.value = enabled;
+    await _prefs.setBool('background_running', enabled);
   }
 
   Future<void> setDownloadPath(String path) async {

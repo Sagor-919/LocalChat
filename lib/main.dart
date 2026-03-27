@@ -29,8 +29,41 @@ final FlutterLocalNotificationsPlugin _notifications =
     FlutterLocalNotificationsPlugin();
 bool _appInForeground = true;
 
+/// Desktop: show message toasts when the window is hidden or minimized.
+bool _desktopNotifyIncomingMessages = false;
+
 bool get _isDesktop =>
     !kIsWeb && (Platform.isWindows || Platform.isLinux || Platform.isMacOS);
+
+Future<void> _syncDesktopNotifyForIncomingMessages() async {
+  if (!_isDesktop) return;
+  try {
+    final vis = await windowManager.isVisible();
+    final min = await windowManager.isMinimized();
+    final focused = await windowManager.isFocused();
+    _desktopNotifyIncomingMessages = !vis || min || !focused;
+  } catch (_) {}
+}
+
+bool _shouldAlertIncomingMessage() {
+  if (_isDesktop) return _desktopNotifyIncomingMessages;
+  return !_appInForeground;
+}
+
+NotificationDetails _incomingMessageNotificationDetails() {
+  return NotificationDetails(
+    android: const AndroidNotificationDetails(
+      'messages',
+      'Messages',
+      importance: Importance.high,
+      priority: Priority.high,
+    ),
+    linux: const LinuxNotificationDetails(),
+    windows: const WindowsNotificationDetails(
+      duration: WindowsNotificationDuration.long,
+    ),
+  );
+}
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -101,7 +134,7 @@ Future<void> main() async {
       );
     }
 
-    if (!_appInForeground &&
+    if (_shouldAlertIncomingMessage() &&
         !AppSettings.instance.notificationsMuted.value &&
         type == 'message') {
       final text = json['text'] as String? ?? '';
@@ -114,13 +147,7 @@ Future<void> main() async {
         peerId.hashCode,
         name,
         text,
-        const NotificationDetails(
-          android: AndroidNotificationDetails(
-            'messages', 'Messages',
-            importance: Importance.high,
-            priority: Priority.high,
-          ),
-        ),
+        _incomingMessageNotificationDetails(),
         payload: jsonEncode({'peerId': peerId}),
       );
     }
@@ -128,7 +155,7 @@ Future<void> main() async {
 
   TransferManager.instance.fileMessages.listen((event) {
     if (event.message.isMine) return;
-    if (!_appInForeground &&
+    if (_shouldAlertIncomingMessage() &&
         !AppSettings.instance.notificationsMuted.value) {
       final peer =
           _discovery.peers.where((p) => p.userId == event.peerId).firstOrNull;
@@ -139,13 +166,7 @@ Future<void> main() async {
         event.peerId.hashCode,
         name,
         'Sent you $fileName',
-        const NotificationDetails(
-          android: AndroidNotificationDetails(
-            'messages', 'Messages',
-            importance: Importance.high,
-            priority: Priority.high,
-          ),
-        ),
+        _incomingMessageNotificationDetails(),
         payload: jsonEncode({'peerId': event.peerId}),
       );
     }
@@ -181,7 +202,10 @@ class _LocalChatAppState extends State<LocalChatApp>
     if (_isDesktop) {
       windowManager.addListener(this);
       trayManager.addListener(this);
-      WidgetsBinding.instance.addPostFrameCallback((_) => _initTray());
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        await _initTray();
+        await _syncDesktopNotifyForIncomingMessages();
+      });
     }
   }
 
@@ -233,14 +257,41 @@ class _LocalChatAppState extends State<LocalChatApp>
   void onWindowClose() {
     if (_isDesktop) {
       unawaited(windowManager.hide());
+      Future<void>.delayed(const Duration(milliseconds: 120), () {
+        unawaited(_syncDesktopNotifyForIncomingMessages());
+      });
     }
+  }
+
+  @override
+  void onWindowMinimize() {
+    if (_isDesktop) unawaited(_syncDesktopNotifyForIncomingMessages());
+  }
+
+  @override
+  void onWindowRestore() {
+    if (_isDesktop) unawaited(_syncDesktopNotifyForIncomingMessages());
+  }
+
+  @override
+  void onWindowFocus() {
+    if (_isDesktop) unawaited(_syncDesktopNotifyForIncomingMessages());
+  }
+
+  @override
+  void onWindowBlur() {
+    if (_isDesktop) unawaited(_syncDesktopNotifyForIncomingMessages());
   }
 
   @override
   void onTrayIconMouseDown() {
     if (!_isDesktop) return;
-    unawaited(windowManager.show());
-    unawaited(windowManager.focus());
+    unawaited(() async {
+      await windowManager.show();
+      await windowManager.focus();
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+      await _syncDesktopNotifyForIncomingMessages();
+    }());
   }
 
   @override
@@ -253,8 +304,12 @@ class _LocalChatAppState extends State<LocalChatApp>
   void onTrayMenuItemClick(MenuItem menuItem) {
     switch (menuItem.key) {
       case 'show':
-        unawaited(windowManager.show());
-        unawaited(windowManager.focus());
+        unawaited(() async {
+          await windowManager.show();
+          await windowManager.focus();
+          await Future<void>.delayed(const Duration(milliseconds: 80));
+          await _syncDesktopNotifyForIncomingMessages();
+        }());
         break;
       case 'settings':
         _openSettingsFromTray();
@@ -271,7 +326,9 @@ class _LocalChatAppState extends State<LocalChatApp>
         state == AppLifecycleState.inactive;
     if (!kIsWeb && Platform.isAndroid) {
       if (state == AppLifecycleState.paused) {
-        unawaited(startLanForegroundIfNeeded());
+        if (AppSettings.instance.backgroundRunningEnabled.value) {
+          unawaited(startLanForegroundIfNeeded());
+        }
       } else if (state == AppLifecycleState.resumed) {
         unawaited(stopLanForeground());
       }

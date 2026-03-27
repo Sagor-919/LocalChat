@@ -7,6 +7,7 @@ import 'package:open_filex/open_filex.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import 'app_settings.dart';
+import 'lan_foreground.dart';
 import 'message_store.dart';
 
 class SettingsScreen extends StatefulWidget {
@@ -23,6 +24,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   bool get _isDesktop =>
       !kIsWeb && (Platform.isWindows || Platform.isLinux || Platform.isMacOS);
+
+  bool get _isAndroid => !kIsWeb && Platform.isAndroid;
 
   @override
   Widget build(BuildContext context) {
@@ -110,6 +113,45 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
           const SizedBox(height: 16),
 
+          if (_isAndroid) ...[
+            _sectionLabel(context, 'BACKGROUND'),
+            _card(
+              isDark: isDark,
+              cs: cs,
+              child: ValueListenableBuilder<bool>(
+                valueListenable: _settings.backgroundRunningEnabled,
+                builder: (_, enabled, __) {
+                  return SwitchListTile(
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16)),
+                    secondary: Icon(Icons.cloud_sync_outlined, color: cs.primary),
+                    title: const Text('Run in background'),
+                    subtitle: const Text(
+                      'Keep LAN discovery, chat, and file transfer active when the app is off-screen. Shows a silent ongoing notification while enabled.',
+                    ),
+                    value: enabled,
+                    onChanged: (v) async {
+                      await _settings.setBackgroundRunningEnabled(v);
+                      if (!v) {
+                        await stopLanForeground();
+                      } else {
+                        final life =
+                            WidgetsBinding.instance.lifecycleState;
+                        if (life == AppLifecycleState.paused ||
+                            life == AppLifecycleState.inactive ||
+                            life == AppLifecycleState.hidden) {
+                          await startLanForegroundIfNeeded();
+                        }
+                      }
+                      if (mounted) setState(() {});
+                    },
+                  );
+                },
+              ),
+            ),
+            const SizedBox(height: 16),
+          ],
+
           if (_isDesktop) ...[
             _sectionLabel(context, 'STARTUP'),
             _card(
@@ -196,19 +238,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
             child: Column(
               children: [
                 const SizedBox(height: 24),
-                Container(
-                  width: 56,
-                  height: 56,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    gradient: LinearGradient(
-                      colors: [cs.primary, cs.tertiary],
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(14),
+                  child: Image.asset(
+                    'assets/app_icon.png',
+                    width: 56,
+                    height: 56,
+                    fit: BoxFit.cover,
+                    errorBuilder: (_, __, ___) => Container(
+                      width: 56,
+                      height: 56,
+                      decoration: BoxDecoration(
+                        color: cs.primaryContainer,
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                      child: Icon(Icons.chat_bubble_rounded,
+                          size: 28, color: cs.onPrimaryContainer),
                     ),
                   ),
-                  child: const Icon(Icons.chat_bubble_rounded,
-                      size: 28, color: Colors.white),
                 ),
                 const SizedBox(height: 10),
                 Text('Local Chat',
@@ -224,23 +271,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 const SizedBox(height: 20),
                 const Divider(height: 1, indent: 20, endIndent: 20),
                 const SizedBox(height: 16),
-                Container(
-                  width: 48,
-                  height: 48,
-                  decoration: const BoxDecoration(
-                    shape: BoxShape.circle,
-                    gradient: LinearGradient(
-                      colors: [Color(0xFF00C9FF), Color(0xFF92FE9D)],
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
-                    ),
-                  ),
-                  child: const Center(
-                    child: Text('S',
+                ClipOval(
+                  child: Image.asset(
+                    'assets/developer_avatar.png',
+                    width: 48,
+                    height: 48,
+                    fit: BoxFit.cover,
+                    errorBuilder: (_, __, ___) => CircleAvatar(
+                      radius: 24,
+                      backgroundColor: cs.surfaceContainerHighest,
+                      child: Text(
+                        'S',
                         style: TextStyle(
-                            color: Colors.white,
-                            fontWeight: FontWeight.bold,
-                            fontSize: 20)),
+                          fontWeight: FontWeight.bold,
+                          fontSize: 20,
+                          color: cs.onSurface,
+                        ),
+                      ),
+                    ),
                   ),
                 ),
                 const SizedBox(height: 8),
