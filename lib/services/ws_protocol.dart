@@ -65,24 +65,21 @@ sealed class WsMessage {
           fromDisplayName: map['fromName'] as String? ?? 'Unknown',
           fileName: map['name'] as String,
           fileSize: (map['size'] as num).toInt(),
-          totalChunks: (map['total'] as num).toInt(),
           sentAtMs: (map['ts'] as num?)?.toInt() ??
               DateTime.now().millisecondsSinceEpoch,
-          version: (map['v'] as num?)?.toInt() ?? 1,
-        );
-      case ChatFileChunkMessage.typeValue:
-        return ChatFileChunkMessage(
-          fileId: map['fid'] as String,
-          fromUserId: map['from'] as String,
-          index: (map['idx'] as num).toInt(),
-          totalChunks: (map['total'] as num).toInt(),
-          base64Data: map['data'] as String,
           version: (map['v'] as num?)?.toInt() ?? 1,
         );
       case ChatFileCompleteMessage.typeValue:
         return ChatFileCompleteMessage(
           fileId: map['fid'] as String,
           fromUserId: map['from'] as String,
+          version: (map['v'] as num?)?.toInt() ?? 1,
+        );
+      case ChatFileResumeMessage.typeValue:
+        return ChatFileResumeMessage(
+          fileId: map['fid'] as String,
+          fromUserId: map['from'] as String,
+          receivedBytes: (map['offset'] as num).toInt(),
           version: (map['v'] as num?)?.toInt() ?? 1,
         );
       case ChatFileCancelMessage.typeValue:
@@ -102,10 +99,7 @@ class UnknownMessage extends WsMessage {
   final String type;
   final Map<String, Object?> payload;
 
-  const UnknownMessage({
-    required this.type,
-    required this.payload,
-  });
+  const UnknownMessage({required this.type, required this.payload});
 
   @override
   Map<String, Object?> toJson() => payload;
@@ -158,10 +152,7 @@ class ConnectRejectMessage extends WsMessage {
   final String reason;
   final int version;
 
-  const ConnectRejectMessage({
-    required this.reason,
-    this.version = 1,
-  });
+  const ConnectRejectMessage({required this.reason, this.version = 1});
 
   @override
   Map<String, Object?> toJson() => {
@@ -197,10 +188,7 @@ class ChatLeaveMessage extends WsMessage {
   final String fromUserId;
   final int version;
 
-  const ChatLeaveMessage({
-    required this.fromUserId,
-    this.version = 1,
-  });
+  const ChatLeaveMessage({required this.fromUserId, this.version = 1});
 
   @override
   Map<String, Object?> toJson() => {
@@ -212,7 +200,6 @@ class ChatLeaveMessage extends WsMessage {
 
 class ChatTextMessage extends WsMessage {
   static const String typeValue = 'chat_text';
-
   final String messageId;
   final String fromUserId;
   final String fromDisplayName;
@@ -243,13 +230,11 @@ class ChatTextMessage extends WsMessage {
 
 class ChatFileMetaMessage extends WsMessage {
   static const String typeValue = 'chat_file_meta';
-
   final String fileId;
   final String fromUserId;
   final String fromDisplayName;
   final String fileName;
   final int fileSize;
-  final int totalChunks;
   final int sentAtMs;
   final int version;
 
@@ -259,7 +244,6 @@ class ChatFileMetaMessage extends WsMessage {
     required this.fromDisplayName,
     required this.fileName,
     required this.fileSize,
-    required this.totalChunks,
     required this.sentAtMs,
     this.version = 1,
   });
@@ -272,46 +256,13 @@ class ChatFileMetaMessage extends WsMessage {
         'fromName': fromDisplayName,
         'name': fileName,
         'size': fileSize,
-        'total': totalChunks,
         'ts': sentAtMs,
-        'v': version,
-      };
-}
-
-class ChatFileChunkMessage extends WsMessage {
-  static const String typeValue = 'chat_file_chunk';
-
-  final String fileId;
-  final String fromUserId;
-  final int index;
-  final int totalChunks;
-  final String base64Data;
-  final int version;
-
-  const ChatFileChunkMessage({
-    required this.fileId,
-    required this.fromUserId,
-    required this.index,
-    required this.totalChunks,
-    required this.base64Data,
-    this.version = 1,
-  });
-
-  @override
-  Map<String, Object?> toJson() => {
-        'type': typeValue,
-        'fid': fileId,
-        'from': fromUserId,
-        'idx': index,
-        'total': totalChunks,
-        'data': base64Data,
         'v': version,
       };
 }
 
 class ChatFileCompleteMessage extends WsMessage {
   static const String typeValue = 'chat_file_complete';
-
   final String fileId;
   final String fromUserId;
   final int version;
@@ -331,9 +282,32 @@ class ChatFileCompleteMessage extends WsMessage {
       };
 }
 
+class ChatFileResumeMessage extends WsMessage {
+  static const String typeValue = 'chat_file_resume';
+  final String fileId;
+  final String fromUserId;
+  final int receivedBytes;
+  final int version;
+
+  const ChatFileResumeMessage({
+    required this.fileId,
+    required this.fromUserId,
+    required this.receivedBytes,
+    this.version = 1,
+  });
+
+  @override
+  Map<String, Object?> toJson() => {
+        'type': typeValue,
+        'fid': fileId,
+        'from': fromUserId,
+        'offset': receivedBytes,
+        'v': version,
+      };
+}
+
 class ChatFileCancelMessage extends WsMessage {
   static const String typeValue = 'chat_file_cancel';
-
   final String fileId;
   final String fromUserId;
   final String reason;
@@ -355,4 +329,3 @@ class ChatFileCancelMessage extends WsMessage {
         'v': version,
       };
 }
-

@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:uuid/uuid.dart';
 
@@ -47,14 +46,6 @@ typedef IncomingConnectionRequested = void Function(
   PeerConnectionState state,
 );
 
-typedef FileChunkReceived = void Function(
-  String peerId,
-  String fileId,
-  int index,
-  int totalChunks,
-  Uint8List data,
-);
-
 class WsConnectionService {
   final DeviceIdentity identity;
   final int listenPort;
@@ -70,7 +61,10 @@ class WsConnectionService {
   ConnectionChanged? onConnectionChanged;
   MessageReceived? onMessageReceived;
   IncomingConnectionRequested? onIncomingConnectionRequested;
-  FileChunkReceived? onFileChunkReceived;
+
+  /// Raw TCP socket callback — the receiver (chat screen) handles header
+  /// reading and data streaming itself via FileReceiver.
+  void Function(Socket socket)? onIncomingFileSocket;
 
   WsConnectionService({
     required this.identity,
@@ -78,75 +72,45 @@ class WsConnectionService {
     this.onConnectionChanged,
     this.onMessageReceived,
     this.onIncomingConnectionRequested,
-    this.onFileChunkReceived,
+    this.onIncomingFileSocket,
   }) {
     fileTransferPort = listenPort + 1;
   }
 
+  // -------------------------------------------------------------------------
+  // Server start
+  // -------------------------------------------------------------------------
   Future<void> startServer() async {
     if (_server != null) return;
 
-    // Bind on all interfaces (LAN). Phase 2 wants each device to be a server too.
     final server = await HttpServer.bind(InternetAddress.anyIPv4, listenPort);
     _server = server;
 
     unawaited(_acceptLoop(server));
-    _fileServer = await ServerSocket.bind(InternetAddress.anyIPv4, fileTransferPort);
+    _fileServer =
+        await ServerSocket.bind(InternetAddress.anyIPv4, fileTransferPort);
     unawaited(_acceptFileLoop(_fileServer!));
   }
 
+  // -------------------------------------------------------------------------
+  // TCP file server — just accept and pass through
+  // -------------------------------------------------------------------------
   Future<void> _acceptFileLoop(ServerSocket server) async {
     try {
       await for (final socket in server) {
-        unawaited(_handleIncomingFileSocket(socket));
+        final cb = onIncomingFileSocket;
+        if (cb != null) {
+          cb(socket);
+        } else {
+          socket.close();
+        }
       }
-    } catch (_) {
-      // File server closed.
-    }
+    } catch (_) {}
   }
 
-  Future<void> _handleIncomingFileSocket(Socket socket) async {
-    try {
-      final bytes = await socket.fold<BytesBuilder>(
-        BytesBuilder(copy: false),
-        (b, data) => b..add(data),
-      );
-      final all = bytes.takeBytes();
-      if (all.isEmpty) return;
-      final headerEnd = all.indexOf(10); // '\n'
-      if (headerEnd <= 0) return;
-
-      final headerRaw = utf8.decode(all.sublist(0, headerEnd));
-      final header = jsonDecode(headerRaw);
-      if (header is! Map) return;
-      final map = header.cast<String, dynamic>();
-      if (map['type'] != 'file_chunk') return;
-
-      final peerId = map['from'] as String?;
-      final fileId = map['fid'] as String?;
-      final index = (map['idx'] as num?)?.toInt();
-      final total = (map['total'] as num?)?.toInt();
-      final expectedLen = (map['len'] as num?)?.toInt();
-      if (peerId == null ||
-          fileId == null ||
-          index == null ||
-          total == null ||
-          expectedLen == null) {
-        return;
-      }
-
-      final payload = Uint8List.sublistView(all, headerEnd + 1);
-      if (payload.length != expectedLen) return;
-      onFileChunkReceived?.call(peerId, fileId, index, total, payload);
-    } catch (_) {
-      // Ignore malformed TCP chunk packets.
-    } finally {
-      try {
-        await socket.close();
-      } catch (_) {}
-    }
-  }
-
+  // -------------------------------------------------------------------------
+  // WS accept loop
+  // -------------------------------------------------------------------------
   Future<void> _acceptLoop(HttpServer server) async {
     try {
       await for (final req in server) {
@@ -160,13 +124,10 @@ class WsConnectionService {
           await req.response.close();
         }
       }
-    } catch (_) {
-      // Server closed.
-    }
+    } catch (_) {}
   }
 
   Future<void> _handleIncomingSocket(WebSocket ws, String remoteIp) async {
-    // Wait for hello.
     String? peerId;
     try {
       final stream = ws.asBroadcastStream();
@@ -211,7 +172,6 @@ class WsConnectionService {
           return;
         }
 
-        // Reply with ack (consent granted).
         final ack = HelloAckMessage(
           userId: identity.userId,
           displayName: identity.displayName,
@@ -223,8 +183,6 @@ class WsConnectionService {
         onConnectionChanged?.call(peerId, state);
 
         _attachMessageListener(peerId, stream);
-
-        // Keep listening until closed.
         await ws.done;
       } else {
         throw const FormatException('Expected hello');
@@ -271,24 +229,22 @@ class WsConnectionService {
     _socketSubscriptions[peerId] = stream.listen(
       (raw) {
         try {
-          final rawString = raw is String ? raw : utf8.decode(raw as List<int>);
+          final rawString =
+              raw is String ? raw : utf8.decode(raw as List<int>);
           final msg = WsMessage.decode(rawString);
           if (msg is HelloMessage || msg is HelloAckMessage) return;
           onMessageReceived?.call(peerId, msg);
-        } catch (_) {
-          // Ignore malformed messages (best-effort LAN transport).
-        }
+        } catch (_) {}
       },
-      onDone: () {
-        _socketSubscriptions.remove(peerId)?.cancel();
-      },
-      onError: (_) {
-        _socketSubscriptions.remove(peerId)?.cancel();
-      },
+      onDone: () { _socketSubscriptions.remove(peerId)?.cancel(); },
+      onError: (_) { _socketSubscriptions.remove(peerId)?.cancel(); },
       cancelOnError: true,
     );
   }
 
+  // -------------------------------------------------------------------------
+  // Connect to peer
+  // -------------------------------------------------------------------------
   Future<PeerConnectionState> connectToPeer(PeerDevice peer) async {
     final existing = _connections[peer.userId];
     if (existing != null &&
@@ -305,8 +261,9 @@ class WsConnectionService {
     onConnectionChanged?.call(peer.userId, state);
 
     try {
-      final ws = await WebSocket.connect('ws://${peer.ipAddress}:${peer.wsPort}')
-          .timeout(const Duration(seconds: 5));
+      final ws =
+          await WebSocket.connect('ws://${peer.ipAddress}:${peer.wsPort}')
+              .timeout(const Duration(seconds: 5));
       final stream = ws.asBroadcastStream();
 
       state.socket = ws;
@@ -316,7 +273,6 @@ class WsConnectionService {
       );
       ws.add(hello.encode());
 
-      // Wait for ack.
       final raw = await stream.first.timeout(const Duration(seconds: 4));
       final rawString = raw is String ? raw : utf8.decode(raw as List<int>);
       final msg = WsMessage.decode(rawString);
@@ -351,6 +307,9 @@ class WsConnectionService {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // WS message helpers
+  // -------------------------------------------------------------------------
   ChatTextMessage? sendChatText(String peerId, String text) {
     final state = _connections[peerId];
     final ws = state?.socket;
@@ -401,50 +360,6 @@ class WsConnectionService {
     }
   }
 
-  Future<bool> sendFileChunkTcp({
-    required String peerId,
-    required String fileId,
-    required int index,
-    required int totalChunks,
-    required Uint8List data,
-  }) async {
-    final state = _connections[peerId];
-    final peer = state?.peer;
-    if (state == null || peer == null || state.status != PeerConnectionStatus.connected) {
-      return false;
-    }
-
-    Socket? socket;
-    try {
-      socket = await Socket.connect(
-        peer.ipAddress,
-        fileTransferPort,
-        timeout: const Duration(seconds: 6),
-      );
-      final header = jsonEncode({
-        'type': 'file_chunk',
-        'from': identity.userId,
-        'fid': fileId,
-        'idx': index,
-        'total': totalChunks,
-        'len': data.length,
-      });
-      socket.add(utf8.encode('$header\n'));
-      socket.add(data);
-      await socket.flush();
-      await socket.close();
-      return true;
-    } catch (e) {
-      if (state.status == PeerConnectionStatus.connected) {
-        state.error = e.toString();
-      }
-      try {
-        await socket?.close();
-      } catch (_) {}
-      return false;
-    }
-  }
-
   bool sendTyping(String peerId, {required bool isTyping}) {
     final state = _connections[peerId];
     final ws = state?.socket;
@@ -456,12 +371,10 @@ class WsConnectionService {
     }
 
     try {
-      ws.add(
-        ChatTypingMessage(
-          fromUserId: identity.userId,
-          isTyping: isTyping,
-        ).encode(),
-      );
+      ws.add(ChatTypingMessage(
+        fromUserId: identity.userId,
+        isTyping: isTyping,
+      ).encode());
       return true;
     } catch (_) {
       state.status = PeerConnectionStatus.disconnected;
@@ -481,11 +394,7 @@ class WsConnectionService {
     }
 
     try {
-      ws.add(
-        ChatLeaveMessage(
-          fromUserId: identity.userId,
-        ).encode(),
-      );
+      ws.add(ChatLeaveMessage(fromUserId: identity.userId).encode());
       return true;
     } catch (_) {
       state.status = PeerConnectionStatus.disconnected;
@@ -494,6 +403,9 @@ class WsConnectionService {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Lifecycle
+  // -------------------------------------------------------------------------
   Future<void> stopServer() async {
     final server = _server;
     _server = null;
@@ -505,18 +417,13 @@ class WsConnectionService {
 
   Future<void> close() async {
     for (final entry in _connections.values) {
-      try {
-        await entry.socket?.close();
-      } catch (_) {}
+      try { await entry.socket?.close(); } catch (_) {}
     }
     for (final sub in _socketSubscriptions.values) {
-      try {
-        await sub.cancel();
-      } catch (_) {}
+      try { await sub.cancel(); } catch (_) {}
     }
     _socketSubscriptions.clear();
     _connections.clear();
     await stopServer();
   }
 }
-
