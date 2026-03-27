@@ -85,6 +85,13 @@ sealed class WsMessage {
           fromUserId: map['from'] as String,
           version: (map['v'] as num?)?.toInt() ?? 1,
         );
+      case ChatFileCancelMessage.typeValue:
+        return ChatFileCancelMessage(
+          fileId: map['fid'] as String,
+          fromUserId: map['from'] as String,
+          reason: map['reason'] as String? ?? 'cancelled',
+          version: (map['v'] as num?)?.toInt() ?? 1,
+        );
       default:
         return UnknownMessage(type: type, payload: map);
     }
@@ -320,6 +327,31 @@ class ChatFileCompleteMessage extends WsMessage {
         'type': typeValue,
         'fid': fileId,
         'from': fromUserId,
+        'v': version,
+      };
+}
+
+class ChatFileCancelMessage extends WsMessage {
+  static const String typeValue = 'chat_file_cancel';
+
+  final String fileId;
+  final String fromUserId;
+  final String reason;
+  final int version;
+
+  const ChatFileCancelMessage({
+    required this.fileId,
+    required this.fromUserId,
+    required this.reason,
+    this.version = 1,
+  });
+
+  @override
+  Map<String, Object?> toJson() => {
+        'type': typeValue,
+        'fid': fileId,
+        'from': fromUserId,
+        'reason': reason,
         'v': version,
       };
 }

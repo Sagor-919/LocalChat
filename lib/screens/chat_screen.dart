@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -53,11 +52,11 @@ class _ChatScreenState extends State<ChatScreen> {
   int? _peerLeftAtMs;
   ConnectionChanged? _prevOnConnectionChanged;
   MessageReceived? _prevOnMessageReceived;
+  FileChunkReceived? _prevOnFileChunkReceived;
 
   final Map<String, _IncomingFileTransfer> _incomingTransfersById = {};
   final Map<String, _OutgoingFileTransfer> _outgoingTransfersById = {};
-  String? _activeIncomingFileId;
-  String? _activeOutgoingFileId;
+  final Map<String, int> _preferredChunkSizeByPeer = {};
   PlatformFile? _pendingAttachment;
   Uint8List? _pendingAttachmentPreviewBytes;
 
@@ -135,35 +134,55 @@ class _ChatScreenState extends State<ChatScreen> {
             fileSize: msg.fileSize,
             totalChunks: msg.totalChunks,
             sentAtMs: msg.sentAtMs,
-            chunkBase64: List<String?>.filled(msg.totalChunks, null),
+            chunks: List<Uint8List?>.filled(msg.totalChunks, null),
+          );
+          final existing = _allMessages.indexWhere((m) => m.messageId == msg.fileId);
+          final placeholder = ChatMessage(
+            messageId: msg.fileId,
+            peerUserId: widget.peer.userId,
+            senderUserId: msg.fromUserId,
+            senderDisplayName: msg.fromDisplayName,
+            text: 'Attachment',
+            attachmentName: msg.fileName,
+            sentAtMs: msg.sentAtMs,
+            isMine: msg.fromUserId == widget.me.userId,
           );
           setState(() {
             _incomingTransfersById[msg.fileId] = transfer;
-            _activeIncomingFileId = msg.fileId;
+            if (existing >= 0) {
+              _allMessages[existing] = placeholder;
+            } else {
+              _allMessages.add(placeholder);
+              _allMessages.sort((a, b) => a.sentAtMs.compareTo(b.sentAtMs));
+            }
+            _messages
+              ..clear()
+              ..addAll(_tail(_allMessages, _messages.isEmpty ? _pageSize : (_messages.length + 1)));
           });
-          // If it's a file we sent ourselves, we still treat it as incoming.
-          return;
-        }
-        if (msg is ChatFileChunkMessage) {
-          final t = _incomingTransfersById[msg.fileId];
-          if (t == null || t.fileId != msg.fileId) return;
-          if (msg.index < 0 || msg.index >= t.totalChunks) return;
-          if (t.chunkBase64[msg.index] == null) {
-            // Keep exact payload immediately to avoid races with file_complete.
-            t.chunkBase64[msg.index] = msg.base64Data;
-            t.receivedChunks++;
-            final prog = t.receivedChunks / t.totalChunks;
-            setState(() {
-              t._lastProgress = prog;
-              _incomingTransfersById[msg.fileId] = t;
-            });
-          }
           return;
         }
         if (msg is ChatFileCompleteMessage) {
           final t = _incomingTransfersById[msg.fileId];
           if (t == null || t.fileId != msg.fileId) return;
-          unawaited(_handleIncomingFileComplete(t));
+          t.isCompleteSignalReceived = true;
+          unawaited(_tryFinalizeIncoming(t));
+          return;
+        }
+        if (msg is ChatFileCancelMessage) {
+          final t = _incomingTransfersById[msg.fileId];
+          if (t != null) {
+            t.isCancelled = true;
+            _incomingTransfersById.remove(msg.fileId);
+          }
+          final out = _outgoingTransfersById[msg.fileId];
+          if (out != null) {
+            out.isCancelled = true;
+            _outgoingTransfersById.remove(msg.fileId);
+          }
+          if (!mounted) return;
+          setState(() {
+            _error = 'Transfer cancelled: ${msg.reason}';
+          });
           return;
         }
         if (msg is! ChatTextMessage) return;
@@ -198,6 +217,28 @@ class _ChatScreenState extends State<ChatScreen> {
         });
         _scrollToBottomSoon();
       };
+      final prevFileChunk = connections.onFileChunkReceived;
+      _prevOnFileChunkReceived = prevFileChunk;
+      connections.onFileChunkReceived = (peerId, fileId, index, totalChunks, data) {
+        prevFileChunk?.call(peerId, fileId, index, totalChunks, data);
+        if (peerId != widget.peer.userId) return;
+        final t = _incomingTransfersById[fileId];
+        if (t == null || t.fileId != fileId) return;
+        if (t.isCancelled) return;
+        if (index < 0 || index >= t.totalChunks) return;
+        if (t.chunks[index] != null) return;
+        t.chunks[index] = data;
+        t.receivedChunks++;
+        final prog = t.receivedChunks / (t.totalChunks == 0 ? 1 : t.totalChunks);
+        if (!mounted) return;
+        setState(() {
+          t._lastProgress = prog;
+          _incomingTransfersById[fileId] = t;
+        });
+        if (t.isCompleteSignalReceived && t.receivedChunks == t.totalChunks) {
+          unawaited(_tryFinalizeIncoming(t));
+        }
+      };
 
       if (!mounted) return;
       setState(() => _loading = false);
@@ -224,14 +265,14 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Uint8List _assembleFileBytes(_IncomingFileTransfer t) {
     // WebSocket guarantees ordering per connection, but we still fill by index.
-    if (t.chunkBase64.any((c) => c == null)) {
+    if (t.chunks.any((c) => c == null)) {
       throw StateError('Missing chunks for ${t.fileId}');
     }
 
     final out = Uint8List(t.fileSize);
     var offset = 0;
-    for (final chunkB64 in t.chunkBase64) {
-      final c = base64Decode(chunkB64!);
+    for (final chunk in t.chunks) {
+      final c = chunk!;
       out.setRange(offset, offset + c.length, c);
       offset += c.length;
     }
@@ -299,7 +340,9 @@ class _ChatScreenState extends State<ChatScreen> {
     }
 
     final fileId = _uuid.v4();
-    const int chunkSize = 64 * 1024;
+    final preferred = _preferredChunkSizeByPeer[widget.peer.userId] ?? (64 * 1024);
+    final chunkSize = preferred.clamp(64 * 1024, 256 * 1024);
+    const int maxParallelSends = 4;
     int len = 0;
     if (filePath != null) {
       len = await File(filePath).length();
@@ -308,6 +351,17 @@ class _ChatScreenState extends State<ChatScreen> {
     }
     final totalChunks = len == 0 ? 0 : ((len + chunkSize - 1) ~/ chunkSize);
 
+    final placeholder = ChatMessage(
+      messageId: fileId,
+      peerUserId: widget.peer.userId,
+      senderUserId: widget.me.userId,
+      senderDisplayName: widget.me.displayName,
+      text: 'Attachment',
+      attachmentName: fileName,
+      attachmentPath: filePath,
+      sentAtMs: DateTime.now().millisecondsSinceEpoch,
+      isMine: true,
+    );
     setState(() {
       _outgoingTransfersById[fileId] = _OutgoingFileTransfer(
         fileId: fileId,
@@ -315,10 +369,14 @@ class _ChatScreenState extends State<ChatScreen> {
         totalChunks: totalChunks,
         totalBytes: len,
       ).._lastProgress = 0;
-      _activeOutgoingFileId = fileId;
       _pendingAttachment = null;
       _pendingAttachmentPreviewBytes = null;
       _error = null;
+      _allMessages.add(placeholder);
+      _allMessages.sort((a, b) => a.sentAtMs.compareTo(b.sentAtMs));
+      _messages
+        ..clear()
+        ..addAll(_tail(_allMessages, _messages.isEmpty ? _pageSize : (_messages.length + 1)));
     });
 
     try {
@@ -339,76 +397,63 @@ class _ChatScreenState extends State<ChatScreen> {
       final sw = Stopwatch()..start();
       var sentBytes = 0;
 
-      if (filePath != null) {
-        final raf = await File(filePath).open();
-        try {
-          for (var i = 0; i < totalChunks; i++) {
-            final chunk = await raf.read(chunkSize);
-            if (chunk.isEmpty) break;
-            sentBytes += chunk.length;
-
-            final b64 = base64Encode(chunk);
-            final ok = widget.connections.sendWsMessage(
-              widget.peer.userId,
-              ChatFileChunkMessage(
-                fileId: fileId,
-                fromUserId: widget.me.userId,
-                index: i,
-                totalChunks: totalChunks,
-                base64Data: b64,
-              ),
-            );
-            if (!ok) throw StateError('Socket closed while sending.');
-
-            final prog = sentBytes / (len == 0 ? 1 : len);
-            if (i % 2 == 0 || i == totalChunks - 1) {
-              final t = _outgoingTransfersById[fileId];
-              if (t != null) {
-                t._lastProgress = prog.clamp(0, 1);
-                t.sentBytes = sentBytes;
-                t.elapsedMs = sw.elapsedMilliseconds;
-              }
-              if (mounted) setState(() {});
-              await Future<void>.delayed(Duration.zero);
+      var allStable = true;
+      if (filePath != null || file.bytes != null) {
+        Future<Uint8List> readChunk(int i) async {
+          if (filePath != null) {
+            final start = i * chunkSize;
+            if (start >= len) return Uint8List(0);
+            final readLen = ((start + chunkSize) > len) ? (len - start) : chunkSize;
+            final raf = await File(filePath).open();
+            try {
+              await raf.setPosition(start);
+              final bytes = await raf.read(readLen);
+              return Uint8List.fromList(bytes);
+            } finally {
+              await raf.close();
             }
           }
-        } finally {
-          await raf.close();
-        }
-      } else if (file.bytes != null) {
-        final bytes = file.bytes!;
-        for (var i = 0; i < totalChunks; i++) {
+          final bytes = file.bytes!;
           final start = i * chunkSize;
-          if (start >= bytes.length) break;
-          final end = (start + chunkSize) > bytes.length
-              ? bytes.length
-              : (start + chunkSize);
-          final chunk = bytes.sublist(start, end);
-          sentBytes += chunk.length;
-          final b64 = base64Encode(chunk);
-          final ok = widget.connections.sendWsMessage(
-            widget.peer.userId,
-            ChatFileChunkMessage(
-              fileId: fileId,
-              fromUserId: widget.me.userId,
-              index: i,
-              totalChunks: totalChunks,
-              base64Data: b64,
-            ),
+          if (start >= bytes.length) return Uint8List(0);
+          final end = (start + chunkSize) > bytes.length ? bytes.length : (start + chunkSize);
+          return Uint8List.sublistView(bytes, start, end);
+        }
+
+        final inFlight = <Future<void>>[];
+        Future<void> sendOne(int i) async {
+          final t = _outgoingTransfersById[fileId];
+          if (t == null || t.isCancelled) {
+            throw const _TransferCancelledException();
+          }
+          final startedAt = DateTime.now().millisecondsSinceEpoch;
+          final chunk = await readChunk(i);
+          if (chunk.isEmpty) return;
+          final ok = await widget.connections.sendFileChunkTcp(
+            peerId: widget.peer.userId,
+            fileId: fileId,
+            index: i,
+            totalChunks: totalChunks,
+            data: chunk,
           );
-          if (!ok) throw StateError('Socket closed while sending.');
-          final prog = sentBytes / (len == 0 ? 1 : len);
-          if (i % 2 == 0 || i == totalChunks - 1) {
-            final t = _outgoingTransfersById[fileId];
-            if (t != null) {
-              t._lastProgress = prog.clamp(0, 1);
-              t.sentBytes = sentBytes;
-              t.elapsedMs = sw.elapsedMilliseconds;
-            }
-            if (mounted) setState(() {});
-            await Future<void>.delayed(Duration.zero);
+          if (!ok) throw StateError('TCP chunk send failed.');
+          final dt = DateTime.now().millisecondsSinceEpoch - startedAt;
+          if (dt > 300) allStable = false;
+          sentBytes += chunk.length;
+          t._lastProgress = (sentBytes / (len == 0 ? 1 : len)).clamp(0, 1);
+          t.sentBytes = sentBytes;
+          t.elapsedMs = sw.elapsedMilliseconds;
+          if (mounted) setState(() {});
+        }
+
+        for (var i = 0; i < totalChunks; i++) {
+          final f = sendOne(i);
+          inFlight.add(f);
+          if (inFlight.length >= maxParallelSends) {
+            await inFlight.removeAt(0);
           }
         }
+        await Future.wait(inFlight);
       } else {
         throw StateError('No file path/bytes available.');
       }
@@ -421,53 +466,78 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
       );
       if (!ok) throw StateError('Failed to send completion.');
-
-      // Optimistic chat bubble.
-      final chat = ChatMessage(
-        messageId: fileId,
-        peerUserId: widget.peer.userId,
-        senderUserId: widget.me.userId,
-        senderDisplayName: widget.me.displayName,
-        text: 'Attachment',
-        attachmentName: fileName,
-        attachmentPath: filePath,
-        sentAtMs: DateTime.now().millisecondsSinceEpoch,
-        isMine: true,
-      );
+      final chat = placeholder;
       await _storage?.appendMessage(widget.peer.userId, chat);
       await _storage?.setLastReadAtMs(
         widget.peer.userId,
         DateTime.now().millisecondsSinceEpoch,
       );
+      // Adaptive chunk sizing for next transfers on this peer.
+      final avgMs = totalChunks == 0 ? 0 : (sw.elapsedMilliseconds ~/ totalChunks);
+      if (allStable && avgMs > 0 && avgMs < 70) {
+        _preferredChunkSizeByPeer[widget.peer.userId] = (chunkSize * 2).clamp(64 * 1024, 256 * 1024);
+      } else if (!allStable || avgMs > 200) {
+        _preferredChunkSizeByPeer[widget.peer.userId] = 64 * 1024;
+      }
 
       if (!mounted) return;
-      final previousVisible = _messages.length;
-      final target = previousVisible > 0 ? previousVisible + 1 : _pageSize;
       setState(() {
         _outgoingTransfersById.remove(fileId);
-        if (_activeOutgoingFileId == fileId) _activeOutgoingFileId = null;
-        _allMessages.add(chat);
-        _allMessages.sort((a, b) => a.sentAtMs.compareTo(b.sentAtMs));
-        _messages
-          ..clear()
-          ..addAll(_tail(_allMessages, target));
       });
       _scrollToBottomSoon();
+    } on _TransferCancelledException {
+      widget.connections.sendWsMessage(
+        widget.peer.userId,
+        ChatFileCancelMessage(
+          fileId: fileId,
+          fromUserId: widget.me.userId,
+          reason: 'Cancelled by sender',
+        ),
+      );
+      if (!mounted) return;
+      setState(() {
+        _outgoingTransfersById.remove(fileId);
+      });
     } catch (e) {
       if (!mounted) return;
       setState(() {
         _error = 'File send failed: $e';
         _outgoingTransfersById.remove(fileId);
-        if (_activeOutgoingFileId == fileId) _activeOutgoingFileId = null;
+        _preferredChunkSizeByPeer[widget.peer.userId] = 64 * 1024;
       });
     }
   }
 
-  Future<void> _handleIncomingFileComplete(_IncomingFileTransfer t) async {
+  Future<void> _tryFinalizeIncoming(_IncomingFileTransfer t) async {
+    if (t.isFinalizing || t.isCancelled) return;
+    if (!t.isCompleteSignalReceived) return;
+    if (t.receivedChunks != t.totalChunks) {
+      // Give late TCP sockets a small grace window.
+      if (!t.graceTimerScheduled) {
+        t.graceTimerScheduled = true;
+        Future<void>.delayed(const Duration(seconds: 3), () {
+          t.graceTimerScheduled = false;
+          if (!mounted) return;
+          final latest = _incomingTransfersById[t.fileId];
+          if (latest == null || latest.isCancelled) return;
+          if (latest.receivedChunks == latest.totalChunks) {
+            unawaited(_tryFinalizeIncoming(latest));
+          } else {
+            setState(() {
+              _error = 'File receive failed: missing chunks.';
+              _incomingTransfersById.remove(latest.fileId);
+            });
+          }
+        });
+      }
+      return;
+    }
+    t.isFinalizing = true;
     try {
       final bytes = _assembleFileBytes(t);
       final savedPath = await _saveReceivedFile(bytes, t.fileName);
 
+      final existingIdx = _allMessages.indexWhere((m) => m.messageId == t.fileId);
       final chat = ChatMessage(
         messageId: t.fileId,
         peerUserId: widget.peer.userId,
@@ -493,8 +563,11 @@ class _ChatScreenState extends State<ChatScreen> {
       final target = previousVisible > 0 ? previousVisible + 1 : _pageSize;
       setState(() {
         _incomingTransfersById.remove(t.fileId);
-        if (_activeIncomingFileId == t.fileId) _activeIncomingFileId = null;
-        _allMessages.add(chat);
+        if (existingIdx >= 0) {
+          _allMessages[existingIdx] = chat;
+        } else {
+          _allMessages.add(chat);
+        }
         _allMessages.sort((a, b) => a.sentAtMs.compareTo(b.sentAtMs));
         _messages
           ..clear()
@@ -506,9 +579,34 @@ class _ChatScreenState extends State<ChatScreen> {
       setState(() {
         _error = 'File receive failed: $e';
         _incomingTransfersById.remove(t.fileId);
-        if (_activeIncomingFileId == t.fileId) _activeIncomingFileId = null;
       });
     }
+  }
+
+  void _cancelOutgoingTransfer(String fileId) {
+    final t = _outgoingTransfersById[fileId];
+    if (t == null) return;
+    setState(() {
+      t.isCancelled = true;
+      _outgoingTransfersById[fileId] = t;
+    });
+  }
+
+  void _cancelIncomingTransfer(String fileId) {
+    final t = _incomingTransfersById[fileId];
+    if (t == null) return;
+    t.isCancelled = true;
+    widget.connections.sendWsMessage(
+      widget.peer.userId,
+      ChatFileCancelMessage(
+        fileId: fileId,
+        fromUserId: widget.me.userId,
+        reason: 'Cancelled by receiver',
+      ),
+    );
+    setState(() {
+      _incomingTransfersById.remove(fileId);
+    });
   }
 
   bool _isImageFileName(String name) {
@@ -651,6 +749,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _messageSub?.cancel();
     widget.connections.onConnectionChanged = _prevOnConnectionChanged;
     widget.connections.onMessageReceived = _prevOnMessageReceived;
+    widget.connections.onFileChunkReceived = _prevOnFileChunkReceived;
     _typingDebounce?.cancel();
     _typingStopTimer?.cancel();
     _typingKeepAlive?.cancel();
@@ -699,53 +798,6 @@ class _ChatScreenState extends State<ChatScreen> {
                   style: TextStyle(color: Theme.of(context).colorScheme.error),
                 ),
               ),
-            if (_activeIncomingFileId != null &&
-                _incomingTransfersById[_activeIncomingFileId] != null)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
-                child: Align(
-                  alignment: Alignment.centerLeft,
-                  child: Text(
-                    () {
-                      final id = _activeIncomingFileId;
-                      final t = id == null ? null : _incomingTransfersById[id];
-                      if (t == null) return '';
-                      return 'Receiving ${t.fileName} '
-                          '(${(t._lastProgress * 100).toStringAsFixed(0)}%)';
-                    }(),
-                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                          color: Theme.of(context).colorScheme.onSurfaceVariant,
-                          fontWeight: FontWeight.w600,
-                        ),
-                  ),
-                ),
-              ),
-            if (_activeOutgoingFileId != null &&
-                _outgoingTransfersById[_activeOutgoingFileId] != null)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
-                child: Align(
-                  alignment: Alignment.centerRight,
-                  child: Text(
-                    () {
-                      final id = _activeOutgoingFileId;
-                      final t = id == null ? null : _outgoingTransfersById[id];
-                      if (t == null) return '';
-                      final elapsed = (t.elapsedMs <= 0) ? 1 : t.elapsedMs;
-                      final speedBps = (t.sentBytes * 1000) ~/ elapsed;
-                      final remaining = (t.totalBytes - t.sentBytes).clamp(0, t.totalBytes);
-                      return 'Sending ${t.fileName} '
-                          '(${(t._lastProgress * 100).toStringAsFixed(0)}%) • '
-                          '${_formatBytes(speedBps)}/s • '
-                          '${_formatBytes(remaining)} left';
-                    }(),
-                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                          color: Theme.of(context).colorScheme.onSurfaceVariant,
-                          fontWeight: FontWeight.w600,
-                        ),
-                  ),
-                ),
-              ),
             Expanded(
               child: _loading
                   ? const Center(child: CircularProgressIndicator())
@@ -781,6 +833,14 @@ class _ChatScreenState extends State<ChatScreen> {
 
                         final m = _messages[actualIndex];
                         final isMine = m.isMine;
+                        final outgoingTransfer = _outgoingTransfersById[m.messageId];
+                        final incomingTransfer = _incomingTransfersById[m.messageId];
+                        final isOutgoingTransfer = outgoingTransfer != null;
+                        final isIncomingTransfer = incomingTransfer != null;
+                        final hasTransfer = isOutgoingTransfer || isIncomingTransfer;
+                        final transferProgress = isOutgoingTransfer
+                            ? outgoingTransfer._lastProgress
+                            : (isIncomingTransfer ? incomingTransfer._lastProgress : 0.0);
 
                         return Align(
                           alignment:
@@ -892,6 +952,57 @@ class _ChatScreenState extends State<ChatScreen> {
                                       height: 1.25,
                                     ),
                                   ),
+                                if (hasTransfer) ...[
+                                  const SizedBox(height: 8),
+                                  LinearProgressIndicator(
+                                    value: transferProgress.clamp(0, 1),
+                                    minHeight: 5,
+                                    borderRadius: BorderRadius.circular(99),
+                                  ),
+                                  const SizedBox(height: 6),
+                                  Row(
+                                    children: [
+                                      Expanded(
+                                        child: Text(
+                                          () {
+                                            if (isOutgoingTransfer) {
+                                              final t = outgoingTransfer;
+                                              final elapsed = (t.elapsedMs <= 0) ? 1 : t.elapsedMs;
+                                              final speedBps = (t.sentBytes * 1000) ~/ elapsed;
+                                              final remaining =
+                                                  (t.totalBytes - t.sentBytes).clamp(0, t.totalBytes);
+                                              return 'Sending ${(t._lastProgress * 100).toStringAsFixed(0)}% • '
+                                                  '${_formatBytes(speedBps)}/s • '
+                                                  '${_formatBytes(remaining)} left';
+                                            }
+                                            final t = incomingTransfer;
+                                            if (t == null) return '';
+                                            return 'Receiving ${(t._lastProgress * 100).toStringAsFixed(0)}% '
+                                                '(${t.receivedChunks}/${t.totalChunks})';
+                                          }(),
+                                          style: TextStyle(
+                                            fontSize: 11,
+                                            fontWeight: FontWeight.w600,
+                                            color: isMine
+                                                ? Theme.of(context).colorScheme.onPrimary
+                                                : Theme.of(context).colorScheme.onSurfaceVariant,
+                                          ),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      TextButton(
+                                        onPressed: () {
+                                          if (isOutgoingTransfer) {
+                                            _cancelOutgoingTransfer(m.messageId);
+                                          } else if (isIncomingTransfer) {
+                                            _cancelIncomingTransfer(m.messageId);
+                                          }
+                                        },
+                                        child: const Text('Cancel'),
+                                      ),
+                                    ],
+                                  ),
+                                ],
                                 const SizedBox(height: 4),
                                 Align(
                                   alignment: Alignment.centerRight,
@@ -1056,10 +1167,14 @@ class _IncomingFileTransfer {
   final int fileSize;
   final int totalChunks;
   final int sentAtMs;
-  final List<String?> chunkBase64;
+  final List<Uint8List?> chunks;
 
   int receivedChunks = 0;
   double _lastProgress = 0.0;
+  bool isCompleteSignalReceived = false;
+  bool graceTimerScheduled = false;
+  bool isFinalizing = false;
+  bool isCancelled = false;
 
   _IncomingFileTransfer({
     required this.fileId,
@@ -1069,7 +1184,7 @@ class _IncomingFileTransfer {
     required this.fileSize,
     required this.totalChunks,
     required this.sentAtMs,
-    required this.chunkBase64,
+    required this.chunks,
   });
 }
 
@@ -1082,6 +1197,7 @@ class _OutgoingFileTransfer {
   double _lastProgress = 0.0;
   int sentBytes = 0;
   int elapsedMs = 0;
+  bool isCancelled = false;
 
   _OutgoingFileTransfer({
     required this.fileId,
@@ -1089,5 +1205,9 @@ class _OutgoingFileTransfer {
     required this.totalChunks,
     required this.totalBytes,
   });
+}
+
+class _TransferCancelledException implements Exception {
+  const _TransferCancelledException();
 }
 
