@@ -9,6 +9,8 @@ class AppSettings {
   static final instance = AppSettings._();
   AppSettings._();
 
+  static const _kFirstLaunchOnboardingComplete = 'first_launch_onboarding_complete';
+  /// Legacy key from notification-only first run; counts as onboarding done.
   static const _kFirstLaunchPermissionsDone = 'first_launch_permissions_done';
 
   late SharedPreferences _prefs;
@@ -82,10 +84,13 @@ class AppSettings {
     await _prefs.setString('download_path', path);
   }
 
-  bool get firstLaunchPermissionsDone =>
-      _prefs.getBool(_kFirstLaunchPermissionsDone) ?? false;
+  /// True after first-run welcome (notifications, storage on Android, download location).
+  bool get firstLaunchOnboardingComplete =>
+      _prefs.getBool(_kFirstLaunchOnboardingComplete) == true ||
+      _prefs.getBool(_kFirstLaunchPermissionsDone) == true;
 
-  Future<void> setFirstLaunchPermissionsDone() async {
+  Future<void> setFirstLaunchOnboardingComplete() async {
+    await _prefs.setBool(_kFirstLaunchOnboardingComplete, true);
     await _prefs.setBool(_kFirstLaunchPermissionsDone, true);
   }
 
@@ -125,24 +130,31 @@ class AppSettings {
     }
   }
 
-  /// Default save folder: `Downloads/LocalChat Folder` (desktop) or app `Documents/LocalChat Folder` (Android).
+  /// Default save folder: `…/LocalChat Folder/Downloads` (received files live under Downloads).
   static Future<String> ensureLocalChatDownloadDirectory() async {
-    const folderName = 'LocalChat Folder';
+    const rootName = 'LocalChat Folder';
+    const downloadsName = 'Downloads';
     if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
       final downloads = await getDownloadsDirectory();
       final base = downloads?.path ?? Directory.systemTemp.path;
-      final dir = Directory(p.join(base, folderName));
+      final root = Directory(p.join(base, rootName));
+      await root.create(recursive: true);
+      final dir = Directory(p.join(root.path, downloadsName));
       await dir.create(recursive: true);
       return dir.path;
     }
     if (Platform.isAndroid || Platform.isIOS) {
       final docDir = await getApplicationDocumentsDirectory();
-      final dir = Directory(p.join(docDir.path, folderName));
+      final root = Directory(p.join(docDir.path, rootName));
+      await root.create(recursive: true);
+      final dir = Directory(p.join(root.path, downloadsName));
       await dir.create(recursive: true);
       return dir.path;
     }
-    final fallback = Directory(p.join(Directory.systemTemp.path, folderName));
-    await fallback.create(recursive: true);
-    return fallback.path;
+    final root = Directory(p.join(Directory.systemTemp.path, rootName));
+    await root.create(recursive: true);
+    final dir = Directory(p.join(root.path, downloadsName));
+    await dir.create(recursive: true);
+    return dir.path;
   }
 }

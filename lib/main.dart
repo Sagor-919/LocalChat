@@ -335,17 +335,19 @@ class _LocalChatAppState extends State<LocalChatApp>
       WidgetsBinding.instance.addPostFrameCallback((_) async {
         await _initTray();
         await _syncDesktopNotifyForIncomingMessages();
-        WidgetsBinding.instance.addPostFrameCallback((_) {
+        WidgetsBinding.instance.addPostFrameCallback((_) async {
+          final ctx = appNavigatorKey.currentContext;
+          if (ctx != null && ctx.mounted) {
+            await showFirstLaunchOnboardingIfNeeded(ctx);
+          }
           unawaited(_tryOpenChatFromColdStartNotification());
         });
       });
     } else {
       WidgetsBinding.instance.addPostFrameCallback((_) async {
-        if (!kIsWeb && Platform.isAndroid) {
-          final ctx = appNavigatorKey.currentContext;
-          if (ctx != null && ctx.mounted) {
-            await showFirstLaunchPermissionsIfNeeded(ctx);
-          }
+        final ctx = appNavigatorKey.currentContext;
+        if (ctx != null && ctx.mounted) {
+          await showFirstLaunchOnboardingIfNeeded(ctx);
         }
         if (!mounted) return;
         unawaited(_tryOpenChatFromColdStartNotification());

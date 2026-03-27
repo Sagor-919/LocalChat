@@ -40,6 +40,9 @@ class _HomeScreenState extends State<HomeScreen> {
 
   List<_PeerEntry> _peerList = [];
   StreamSubscription<FileMessageEvent>? _fileMsgSub;
+  /// Serializes overlapping [_refreshPeerList] runs so a slower, older refresh
+  /// cannot overwrite the UI after a newer discovery snapshot.
+  int _peerRefreshGeneration = 0;
 
   void _onMessageHistoryRevision() {
     final sig = widget.store.consumePendingHistoryClear();
@@ -102,11 +105,16 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _refreshPeerList() async {
+    final gen = ++_peerRefreshGeneration;
     final onlinePeers = widget.discovery.peers;
     final onlineIds = onlinePeers.map((p) => p.userId).toSet();
 
     final storedInfos = await widget.store.loadAllPeerInfos();
+    if (!mounted || gen != _peerRefreshGeneration) return;
+
     final storedPeerIds = await widget.store.listPeerIds();
+    if (!mounted || gen != _peerRefreshGeneration) return;
+
     final offlineIds =
         storedPeerIds.where((id) => !onlineIds.contains(id)).toSet();
 
@@ -135,8 +143,9 @@ class _HomeScreenState extends State<HomeScreen> {
       ));
     }
 
-    if (mounted) setState(() => _peerList = list);
-    await _hydratePreviewsFromStore(list);
+    if (!mounted || gen != _peerRefreshGeneration) return;
+    setState(() => _peerList = list);
+    await _hydratePreviewsFromStore(list, gen);
   }
 
   String _subtitleForMessage(ChatMessage m) {
@@ -159,17 +168,19 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
-  Future<void> _hydratePreviewsFromStore(List<_PeerEntry> entries) async {
+  Future<void> _hydratePreviewsFromStore(
+      List<_PeerEntry> entries, int gen) async {
     for (final e in entries) {
       final list = await widget.store.load(e.userId);
-      if (!mounted) return;
+      if (!mounted || gen != _peerRefreshGeneration) return;
       if (list.isEmpty) continue;
       list.sort((a, b) => a.timestamp.compareTo(b.timestamp));
       final last = list.last;
       _lastMsg[e.userId] = _subtitleForMessage(last);
       _lastMsgTime[e.userId] = last.timestamp;
     }
-    if (mounted) setState(() {});
+    if (!mounted || gen != _peerRefreshGeneration) return;
+    setState(() {});
   }
 
   @override

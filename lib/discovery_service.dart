@@ -72,7 +72,9 @@ class DiscoveryService {
     final existing = _peers[userId];
     if (existing != null) {
       existing.lastSeen = DateTime.now();
-      if (existing.name != name || existing.ip != senderIp) {
+      if (existing.name != name ||
+          existing.ip != senderIp ||
+          existing.port != port) {
         _peers[userId] = PeerDevice(
           userId: userId,
           name: name,

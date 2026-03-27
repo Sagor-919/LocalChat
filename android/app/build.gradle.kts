@@ -1,8 +1,3 @@
-def keystoreProperties = new Properties()
-def keystorePropertiesFile = rootProject.file("key.properties")
-keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
-
-
 plugins {
     id("com.android.application")
     id("kotlin-android")
@@ -11,30 +6,6 @@ plugins {
 }
 
 android {
-
-
-
-
-signingConfigs {
-    release {
-        keyAlias keystoreProperties['keyAlias']
-        keyPassword keystoreProperties['keyPassword']
-        storeFile file("app/" + keystoreProperties['storeFile'])
-        storePassword keystoreProperties['storePassword']
-    }
-}
-
-buildTypes {
-    release {
-        signingConfig signingConfigs.release
-        minifyEnabled false
-        shrinkResources false
-    }
-}
-
-
-
-
     namespace = "com.example.local_chat"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
@@ -62,8 +33,8 @@ buildTypes {
 
     buildTypes {
         release {
-            // Play Store / sideload: configure a release keystore (key.properties +
-            // signingConfigs.release). Debug signing is fine for local `flutter build apk --release` tests only.
+            // TODO: Add your own signing config for the release build.
+            // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
         }
     }
