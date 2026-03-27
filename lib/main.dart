@@ -8,6 +8,7 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
+import 'android_share_receiver.dart';
 import 'app_branding.dart';
 import 'app_settings.dart';
 import 'chat_screen.dart';
@@ -195,6 +196,7 @@ NotificationDetails _incomingMessageNotificationDetails() {
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  AndroidShareReceiver.installPushHandler();
 
   if (_isDesktop) {
     await windowManager.ensureInitialized();
@@ -340,6 +342,9 @@ class _LocalChatAppState extends State<LocalChatApp>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    if (!kIsWeb && Platform.isAndroid) {
+      AndroidShareReceiver.onSharesPulled = _onAndroidSharesArrived;
+    }
     if (_isDesktop) {
       windowManager.addListener(this);
       trayManager.addListener(this);
@@ -361,6 +366,7 @@ class _LocalChatAppState extends State<LocalChatApp>
           await showFirstLaunchOnboardingIfNeeded(ctx);
         }
         if (!mounted) return;
+        await AndroidShareReceiver.pullPendingFromPlatform();
         unawaited(_tryOpenChatFromColdStartNotification());
       });
     }
@@ -368,6 +374,9 @@ class _LocalChatAppState extends State<LocalChatApp>
 
   @override
   void dispose() {
+    if (!kIsWeb && Platform.isAndroid) {
+      AndroidShareReceiver.onSharesPulled = null;
+    }
     if (_isDesktop) {
       windowManager.removeListener(this);
       trayManager.removeListener(this);
@@ -488,6 +497,38 @@ class _LocalChatAppState extends State<LocalChatApp>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     _appInForeground = state == AppLifecycleState.resumed ||
         state == AppLifecycleState.inactive;
+    if (state == AppLifecycleState.resumed && !kIsWeb && Platform.isAndroid) {
+      unawaited(AndroidShareReceiver.pullPendingFromPlatform());
+    }
+  }
+
+  void _onAndroidSharesArrived(int count) {
+    if (!mounted || count <= 0) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _showAndroidShareSnackBarForArrival(count);
+    });
+  }
+
+  void _showAndroidShareSnackBarForArrival(int count) {
+    if (kIsWeb || !Platform.isAndroid || count <= 0) return;
+    final ctx = appNavigatorKey.currentContext;
+    if (ctx == null || !ctx.mounted) return;
+    final inChat = ChatScreen.openChatSessions > 0;
+    ScaffoldMessenger.of(ctx).showSnackBar(
+      SnackBar(
+        behavior: SnackBarBehavior.floating,
+        content: Text(
+          inChat
+              ? (count == 1
+                  ? 'Shared file added to attachments.'
+                  : '$count shared files added to attachments.')
+              : (count == 1
+                  ? '1 shared file ready — open a chat to add it to the composer.'
+                  : '$count shared files ready — open a chat to add them to the composer.'),
+        ),
+      ),
+    );
   }
 
   @override

@@ -19,9 +19,13 @@ import 'device.dart';
 import 'discovery_service.dart';
 import 'message_model.dart';
 import 'message_store.dart';
+import 'pending_share_attachments.dart';
 import 'transfer_manager.dart';
 
 class ChatScreen extends StatefulWidget {
+  /// >0 while any chat screen is mounted (for share-intent snackbar wording).
+  static int openChatSessions = 0;
+
   final DeviceInfo me;
   final PeerDevice peer;
   final DiscoveryService discovery;
@@ -71,6 +75,10 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void initState() {
     super.initState();
+    if (!kIsWeb && Platform.isAndroid) {
+      PendingShareAttachments.instance.epoch.addListener(_onShareEpoch);
+    }
+    ChatScreen.openChatSessions++;
     _connected = widget.connections.isConnected(_peerId);
 
     _prevOnMessage = widget.connections.onMessage;
@@ -125,6 +133,25 @@ class _ChatScreenState extends State<ChatScreen> {
     _loadHistory();
 
     _connTimer = Timer.periodic(const Duration(seconds: 2), (_) => _syncConnection());
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _consumePendingSharesIntoStaged();
+    });
+  }
+
+  void _onShareEpoch() => _consumePendingSharesIntoStaged();
+
+  /// Android: attach files queued from “Share” / “Send to” into the composer.
+  void _consumePendingSharesIntoStaged() {
+    if (kIsWeb || !Platform.isAndroid) return;
+    final paths = PendingShareAttachments.instance.takeAll();
+    if (paths.isEmpty) return;
+    _stageFiles(
+      paths
+          .map((filePath) => _StagedFile(filePath, p.basename(filePath)))
+          .toList(),
+    );
+    if (mounted) setState(() {});
   }
 
   PeerDevice _resolveLivePeer() {
@@ -221,6 +248,11 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void dispose() {
+    if (!kIsWeb && Platform.isAndroid) {
+      PendingShareAttachments.instance.epoch.removeListener(_onShareEpoch);
+    }
+    ChatScreen.openChatSessions--;
+    if (ChatScreen.openChatSessions < 0) ChatScreen.openChatSessions = 0;
     _connTimer?.cancel();
     _scroll.removeListener(_onScroll);
     widget.connections.onMessage = _prevOnMessage;

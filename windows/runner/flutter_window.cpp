@@ -2,7 +2,13 @@
 
 #include <optional>
 
+#include <windows.h>
+
 #include "flutter/generated_plugin_registrant.h"
+
+#ifndef WM_COPYGLOBALDATA
+#define WM_COPYGLOBALDATA 0x0049
+#endif
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
     : project_(project) {}
@@ -26,6 +32,19 @@ bool FlutterWindow::OnCreate() {
   }
   RegisterPlugins(flutter_controller_->engine());
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
+
+  // Explorer runs at medium integrity; elevated apps block some drag/drop by
+  // default. Allowing WM_COPYGLOBALDATA on the Flutter view (and root frame)
+  // restores file drops from Explorer when "Run as administrator" is used.
+  if (HWND flutter_view = flutter_controller_->view()->GetNativeWindow()) {
+    ::ChangeWindowMessageFilterEx(flutter_view, WM_COPYGLOBALDATA, MSGFLT_ALLOW,
+                                  nullptr);
+    if (HWND root = ::GetAncestor(flutter_view, GA_ROOT);
+        root != nullptr && root != flutter_view) {
+      ::ChangeWindowMessageFilterEx(root, WM_COPYGLOBALDATA, MSGFLT_ALLOW,
+                                    nullptr);
+    }
+  }
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
     this->Show();

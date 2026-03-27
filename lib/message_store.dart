@@ -99,6 +99,16 @@ class MessageStore {
       final p = (prev['name'] as String?)?.trim() ?? '';
       if (p.isNotEmpty) resolvedName = p;
     }
+    // Discovery / reconnect sometimes reports "Unknown" or empty while we already
+    // have a real display name (e.g. offline peer opened from chat history).
+    if (prev != null) {
+      final prevName = (prev['name'] as String?)?.trim() ?? '';
+      final incomingWeak = resolvedName.isEmpty ||
+          resolvedName.toLowerCase() == 'unknown';
+      final prevGood =
+          prevName.isNotEmpty && prevName.toLowerCase() != 'unknown';
+      if (incomingWeak && prevGood) resolvedName = prevName;
+    }
     if (resolvedName.isEmpty) resolvedName = 'Unknown';
 
     var resolvedIp = ip.trim();
