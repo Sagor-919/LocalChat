@@ -102,6 +102,7 @@ class _ChatScreenState extends State<ChatScreen> {
         timestamp: DateTime.now().millisecondsSinceEpoch,
         isMine: false,
         attachmentName: fileName,
+        attachmentSize: fileSize,
       );
       setState(() {
         _transfers[fileId] = _TransferState(
@@ -141,6 +142,7 @@ class _ChatScreenState extends State<ChatScreen> {
             isMine: old.isMine,
             attachmentName: old.attachmentName,
             attachmentPath: savedPath,
+            attachmentSize: old.attachmentSize,
           );
         }
       });
@@ -232,6 +234,7 @@ class _ChatScreenState extends State<ChatScreen> {
       isMine: true,
       attachmentName: fileName,
       attachmentPath: filePath,
+      attachmentSize: fileSize,
     );
 
     final transfer = _TransferState(
@@ -314,8 +317,19 @@ class _ChatScreenState extends State<ChatScreen> {
     t.error = null;
     t.transferredBytes = 0;
     t.progress = 0;
+    t.stopwatch.reset();
+    t.stopwatch.start();
     setState(() {});
     unawaited(_runSend(t, filePath, t.totalBytes));
+  }
+
+  void _openFolder(String filePath) {
+    if (Platform.isWindows) {
+      Process.run('explorer.exe', ['/select,', filePath]);
+    } else {
+      final dir = File(filePath).parent.path;
+      OpenFilex.open(dir);
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -334,13 +348,22 @@ class _ChatScreenState extends State<ChatScreen> {
     return '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
   }
 
-  String _fmtBytes(int bytes) {
+  static String _fmtBytes(int bytes) {
     if (bytes < 1024) return '$bytes B';
     final kb = bytes / 1024;
     if (kb < 1024) return '${kb.toStringAsFixed(1)} KB';
     final mb = kb / 1024;
     if (mb < 1024) return '${mb.toStringAsFixed(1)} MB';
     return '${(mb / 1024).toStringAsFixed(1)} GB';
+  }
+
+  static String _fmtSpeed(double bytesPerSec) {
+    if (bytesPerSec < 1024) return '${bytesPerSec.toStringAsFixed(0)} B/s';
+    final kb = bytesPerSec / 1024;
+    if (kb < 1024) return '${kb.toStringAsFixed(1)} KB/s';
+    final mb = kb / 1024;
+    if (mb < 1024) return '${mb.toStringAsFixed(1)} MB/s';
+    return '${(mb / 1024).toStringAsFixed(1)} GB/s';
   }
 
   bool _isImage(String name) {
@@ -355,6 +378,28 @@ class _ChatScreenState extends State<ChatScreen> {
 
   bool get _isDesktop =>
       !kIsWeb && (Platform.isWindows || Platform.isLinux || Platform.isMacOS);
+
+  static String _fileTypeLabel(String name) {
+    final dot = name.lastIndexOf('.');
+    if (dot < 0) return 'File';
+    final ext = name.substring(dot + 1).toLowerCase();
+    return switch (ext) {
+      'png' || 'jpg' || 'jpeg' || 'gif' || 'webp' || 'bmp' || 'svg' => 'Image',
+      'mp4' || 'mkv' || 'avi' || 'mov' || 'wmv' || 'flv' => 'Video',
+      'mp3' || 'wav' || 'flac' || 'aac' || 'ogg' || 'wma' => 'Audio',
+      'pdf' => 'PDF Document',
+      'doc' || 'docx' => 'Word Document',
+      'xls' || 'xlsx' => 'Spreadsheet',
+      'ppt' || 'pptx' => 'Presentation',
+      'zip' || 'rar' || '7z' || 'tar' || 'gz' => 'Archive',
+      'txt' || 'log' || 'csv' => 'Text File',
+      'apk' => 'Android Package',
+      'exe' || 'msi' => 'Executable',
+      'dart' || 'py' || 'js' || 'ts' || 'java' || 'cpp' || 'c' || 'h' => 'Source Code',
+      'json' || 'xml' || 'yaml' || 'yml' => 'Data File',
+      _ => '${ext.toUpperCase()} File',
+    };
+  }
 
   // -----------------------------------------------------------------------
   // Build
@@ -459,6 +504,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 ),
               ),
 
+            // Active transfer progress
             if (t != null) ...[
               const SizedBox(height: 8),
               LinearProgressIndicator(
@@ -473,7 +519,9 @@ class _ChatScreenState extends State<ChatScreen> {
                     child: Text(
                       t.error != null
                           ? 'Failed'
-                          : '${(t.progress * 100).toStringAsFixed(0)}% \u2022 ${_fmtBytes(t.transferredBytes)}/${_fmtBytes(t.totalBytes)}',
+                          : '${(t.progress * 100).toStringAsFixed(0)}%'
+                              ' \u2022 ${_fmtBytes(t.transferredBytes)}/${_fmtBytes(t.totalBytes)}'
+                              ' \u2022 ${_fmtSpeed(t.currentSpeed)}',
                       style: TextStyle(
                         fontSize: 11,
                         fontWeight: FontWeight.w600,
@@ -526,15 +574,24 @@ class _ChatScreenState extends State<ChatScreen> {
     final cs = Theme.of(context).colorScheme;
     final hasPath = m.attachmentPath != null;
     final isImg = hasPath && _isImage(m.attachmentName!);
+    final isTransferring = _transfers.containsKey(m.id);
+    final fgColor = mine ? cs.onPrimary : cs.onSurface;
+    final subtleColor =
+        (mine ? cs.onPrimary : cs.onSurfaceVariant).withValues(alpha: 0.7);
 
-    return GestureDetector(
-      onTap: hasPath ? () => OpenFilex.open(m.attachmentPath!) : null,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          if (isImg)
-            Padding(
-              padding: const EdgeInsets.only(bottom: 6),
+    final typeLabel = _fileTypeLabel(m.attachmentName!);
+    final sizeLabel =
+        m.attachmentSize != null ? _fmtBytes(m.attachmentSize!) : null;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        // Image preview
+        if (isImg)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 6),
+            child: GestureDetector(
+              onTap: () => OpenFilex.open(m.attachmentPath!),
               child: ClipRRect(
                 borderRadius: BorderRadius.circular(12),
                 child: Image.file(
@@ -547,13 +604,18 @@ class _ChatScreenState extends State<ChatScreen> {
                 ),
               ),
             ),
-          Row(
+          ),
+
+        // File name row (tap to open file)
+        GestureDetector(
+          onTap: hasPath ? () => OpenFilex.open(m.attachmentPath!) : null,
+          child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
               Icon(
                 isImg ? Icons.image : Icons.insert_drive_file,
                 size: 18,
-                color: mine ? cs.onPrimary : cs.onSurface,
+                color: fgColor,
               ),
               const SizedBox(width: 6),
               Flexible(
@@ -561,19 +623,61 @@ class _ChatScreenState extends State<ChatScreen> {
                   m.attachmentName!,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
-                    color: mine ? cs.onPrimary : cs.onSurface,
+                    color: fgColor,
                     fontWeight: FontWeight.w700,
                     fontSize: 14,
-                    decoration: hasPath
-                        ? TextDecoration.underline
-                        : TextDecoration.none,
+                    decoration:
+                        hasPath ? TextDecoration.underline : TextDecoration.none,
                   ),
                 ),
               ),
             ],
           ),
-        ],
-      ),
+        ),
+
+        // File type + size (shown when not actively transferring)
+        if (!isTransferring && (sizeLabel != null || typeLabel.isNotEmpty))
+          Padding(
+            padding: const EdgeInsets.only(top: 3),
+            child: Text(
+              sizeLabel != null ? '$typeLabel \u2022 $sizeLabel' : typeLabel,
+              style: TextStyle(
+                fontSize: 11,
+                color: subtleColor,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ),
+
+        // Open folder button (desktop only, completed transfers only)
+        if (hasPath && !isTransferring && _isDesktop)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(8),
+              onTap: () => _openFolder(m.attachmentPath!),
+              child: Padding(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.folder_open, size: 14, color: subtleColor),
+                    const SizedBox(width: 4),
+                    Text(
+                      'Open Folder',
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: subtleColor,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+      ],
     );
   }
 
@@ -630,6 +734,7 @@ class _TransferState {
   double progress = 0;
   String? error;
   FileSender? sender;
+  final Stopwatch stopwatch = Stopwatch()..start();
 
   _TransferState({
     required this.fileId,
@@ -637,4 +742,10 @@ class _TransferState {
     required this.totalBytes,
     required this.isSending,
   });
+
+  double get currentSpeed {
+    final elapsed = stopwatch.elapsedMilliseconds;
+    if (elapsed < 300 || transferredBytes == 0) return 0;
+    return transferredBytes / (elapsed / 1000);
+  }
 }

@@ -6,6 +6,7 @@ class ChatMessage {
   final bool isMine;
   final String? attachmentName;
   final String? attachmentPath;
+  final int? attachmentSize;
 
   const ChatMessage({
     required this.id,
@@ -15,6 +16,7 @@ class ChatMessage {
     required this.isMine,
     this.attachmentName,
     this.attachmentPath,
+    this.attachmentSize,
   });
 
   /// For sending over TCP (text messages only).
@@ -47,6 +49,7 @@ class ChatMessage {
         'isMine': isMine,
         'attachmentName': attachmentName,
         'attachmentPath': attachmentPath,
+        'attachmentSize': attachmentSize,
       };
 
   static ChatMessage fromStore(Map<String, dynamic> json) {
@@ -58,6 +61,7 @@ class ChatMessage {
       isMine: json['isMine'] as bool,
       attachmentName: json['attachmentName'] as String?,
       attachmentPath: json['attachmentPath'] as String?,
+      attachmentSize: (json['attachmentSize'] as num?)?.toInt(),
     );
   }
 }
