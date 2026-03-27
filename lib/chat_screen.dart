@@ -5,6 +5,7 @@ import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:uuid/uuid.dart';
 
@@ -46,6 +47,8 @@ class _ChatScreenState extends State<ChatScreen> {
 
   final Map<String, _TransferState> _transfers = {};
   FileReceiver? _fileReceiver;
+
+  final List<_StagedFile> _staged = [];
 
   String get _peerId => widget.peer.userId;
 
@@ -185,41 +188,137 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   // -----------------------------------------------------------------------
-  // Send text
+  // Staging — pick files / images into preview, send all on press
   // -----------------------------------------------------------------------
-  void _send() {
-    final text = _input.text.trim();
-    if (text.isEmpty || !_connected) return;
+  void _stageFiles(List<_StagedFile> files) {
+    if (files.isEmpty) return;
+    setState(() => _staged.addAll(files));
+  }
 
-    final msg = ChatMessage(
-      id: _uuid.v4(),
-      senderId: widget.me.userId,
-      text: text,
-      timestamp: DateTime.now().millisecondsSinceEpoch,
-      isMine: true,
+  Future<void> _pickFiles() async {
+    if (_isDesktop) {
+      _showDesktopAttachMenu();
+      return;
+    }
+    final picked = await FilePicker.platform.pickFiles(
+      type: FileType.any,
+      allowMultiple: true,
+      withData: false,
     );
+    if (picked == null) return;
+    _stageFiles(picked.files
+        .where((f) => f.path != null)
+        .map((f) => _StagedFile(f.path!, f.name))
+        .toList());
+  }
 
-    widget.connections.sendJson(_peerId, msg.toJson());
-    setState(() => _messages.add(msg));
-    widget.store.add(_peerId, msg);
-    _input.clear();
-    _focus.requestFocus();
-    _scrollToBottom();
+  void _showDesktopAttachMenu() {
+    final box = context.findRenderObject() as RenderBox?;
+    if (box == null) return;
+    final overlay =
+        Overlay.of(context).context.findRenderObject() as RenderBox?;
+    if (overlay == null) return;
+
+    showMenu<String>(
+      context: context,
+      position: RelativeRect.fromRect(
+        Rect.fromLTWH(12, box.size.height - 120, 180, 48),
+        Offset.zero & overlay.size,
+      ),
+      items: const [
+        PopupMenuItem(value: 'files', child: ListTile(
+          leading: Icon(Icons.description),
+          title: Text('Select Files'),
+          dense: true, visualDensity: VisualDensity.compact,
+        )),
+        PopupMenuItem(value: 'folder', child: ListTile(
+          leading: Icon(Icons.folder),
+          title: Text('Select Folder'),
+          dense: true, visualDensity: VisualDensity.compact,
+        )),
+      ],
+    ).then((value) {
+      if (value == 'files') _pickDesktopFiles();
+      if (value == 'folder') _pickDesktopFolder();
+    });
+  }
+
+  Future<void> _pickDesktopFiles() async {
+    final picked = await FilePicker.platform.pickFiles(
+      type: FileType.any,
+      allowMultiple: true,
+      withData: false,
+    );
+    if (picked == null) return;
+    _stageFiles(picked.files
+        .where((f) => f.path != null)
+        .map((f) => _StagedFile(f.path!, f.name))
+        .toList());
+  }
+
+  Future<void> _pickDesktopFolder() async {
+    final dirPath = await FilePicker.platform.getDirectoryPath();
+    if (dirPath == null) return;
+    final dir = Directory(dirPath);
+    final files = <_StagedFile>[];
+    await for (final entity in dir.list(recursive: false)) {
+      if (entity is File) {
+        final name = entity.path.split(Platform.pathSeparator).last;
+        files.add(_StagedFile(entity.path, name));
+      }
+    }
+    _stageFiles(files);
+  }
+
+  Future<void> _pickGallery() async {
+    final picker = ImagePicker();
+    final images = await picker.pickMultiImage(limit: 20);
+    if (images.isEmpty) return;
+    _stageFiles(
+        images.map((x) => _StagedFile(x.path, x.name)).toList());
+  }
+
+  void _onDropDone(DropDoneDetails details) {
+    _stageFiles(details.files
+        .map((x) => _StagedFile(x.path, x.name))
+        .toList());
   }
 
   // -----------------------------------------------------------------------
-  // Pick & send file
+  // Send — text + all staged files
   // -----------------------------------------------------------------------
-  Future<void> _pickFile() async {
-    final picked = await FilePicker.platform
-        .pickFiles(type: FileType.any, allowMultiple: false, withData: false);
-    if (picked == null || picked.files.isEmpty) return;
+  void _sendAll() {
+    final text = _input.text.trim();
+    final hasText = text.isNotEmpty;
+    final hasFiles = _staged.isNotEmpty;
 
-    final pf = picked.files.single;
-    final filePath = pf.path;
-    if (filePath == null) return;
+    if (!hasText && !hasFiles) return;
+    if (!_connected) return;
 
-    await _sendFile(filePath, pf.name);
+    if (hasText) {
+      final msg = ChatMessage(
+        id: _uuid.v4(),
+        senderId: widget.me.userId,
+        text: text,
+        timestamp: DateTime.now().millisecondsSinceEpoch,
+        isMine: true,
+      );
+      widget.connections.sendJson(_peerId, msg.toJson());
+      setState(() => _messages.add(msg));
+      widget.store.add(_peerId, msg);
+      _input.clear();
+    }
+
+    if (hasFiles) {
+      final batch = List<_StagedFile>.from(_staged);
+      setState(() => _staged.clear());
+      for (final sf in batch) {
+        unawaited(_sendFile(sf.path, sf.name));
+      }
+    }
+
+    _focus.requestFocus();
+    _scrollToBottom();
   }
 
   Future<void> _sendFile(String filePath, String fileName) async {
@@ -259,14 +358,6 @@ class _ChatScreenState extends State<ChatScreen> {
     });
 
     unawaited(_runSend(transfer, filePath, fileSize));
-  }
-
-  void _onDropDone(DropDoneDetails details) {
-    for (final xFile in details.files) {
-      final path = xFile.path;
-      final name = xFile.name;
-      unawaited(_sendFile(path, name));
-    }
   }
 
   Future<void> _runSend(
@@ -384,7 +475,8 @@ class _ChatScreenState extends State<ChatScreen> {
     if (dot < 0) return 'File';
     final ext = name.substring(dot + 1).toLowerCase();
     return switch (ext) {
-      'png' || 'jpg' || 'jpeg' || 'gif' || 'webp' || 'bmp' || 'svg' => 'Image',
+      'png' || 'jpg' || 'jpeg' || 'gif' || 'webp' || 'bmp' || 'svg' =>
+        'Image',
       'mp4' || 'mkv' || 'avi' || 'mov' || 'wmv' || 'flv' => 'Video',
       'mp3' || 'wav' || 'flac' || 'aac' || 'ogg' || 'wma' => 'Audio',
       'pdf' => 'PDF Document',
@@ -395,7 +487,15 @@ class _ChatScreenState extends State<ChatScreen> {
       'txt' || 'log' || 'csv' => 'Text File',
       'apk' => 'Android Package',
       'exe' || 'msi' => 'Executable',
-      'dart' || 'py' || 'js' || 'ts' || 'java' || 'cpp' || 'c' || 'h' => 'Source Code',
+      'dart' ||
+      'py' ||
+      'js' ||
+      'ts' ||
+      'java' ||
+      'cpp' ||
+      'c' ||
+      'h' =>
+        'Source Code',
       'json' || 'xml' || 'yaml' || 'yml' => 'Data File',
       _ => '${ext.toUpperCase()} File',
     };
@@ -461,6 +561,7 @@ class _ChatScreenState extends State<ChatScreen> {
                                 _buildBubble(ctx, _messages[i]),
                           ),
               ),
+              if (_staged.isNotEmpty) _buildStagedPreview(context),
               _buildComposer(context),
             ],
           ),
@@ -469,6 +570,131 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  // -----------------------------------------------------------------------
+  // Staged files preview strip
+  // -----------------------------------------------------------------------
+  Widget _buildStagedPreview(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+
+    return Container(
+      decoration: BoxDecoration(
+        color: cs.surfaceContainerHigh,
+        border: Border(top: BorderSide(color: cs.outlineVariant, width: 0.5)),
+      ),
+      padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              Text(
+                '${_staged.length} file${_staged.length > 1 ? 's' : ''} ready to send',
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: cs.onSurfaceVariant,
+                ),
+              ),
+              const Spacer(),
+              GestureDetector(
+                onTap: () => setState(() => _staged.clear()),
+                child: Text(
+                  'Clear all',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: cs.error,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          SizedBox(
+            height: 72,
+            child: ListView.builder(
+              scrollDirection: Axis.horizontal,
+              itemCount: _staged.length,
+              itemBuilder: (ctx, i) {
+                final sf = _staged[i];
+                final isImg = _isImage(sf.name);
+                return Padding(
+                  padding: const EdgeInsets.only(right: 8),
+                  child: Stack(
+                    clipBehavior: Clip.none,
+                    children: [
+                      Container(
+                        width: 64,
+                        height: 64,
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(10),
+                          color: cs.surfaceContainerHighest,
+                        ),
+                        clipBehavior: Clip.antiAlias,
+                        child: isImg
+                            ? Image.file(File(sf.path),
+                                fit: BoxFit.cover,
+                                width: 64,
+                                height: 64,
+                                errorBuilder: (_, e, s) => Icon(
+                                    Icons.broken_image,
+                                    size: 24,
+                                    color: cs.outline))
+                            : Column(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  Icon(Icons.insert_drive_file,
+                                      size: 24, color: cs.onSurfaceVariant),
+                                  const SizedBox(height: 2),
+                                  Padding(
+                                    padding: const EdgeInsets.symmetric(
+                                        horizontal: 4),
+                                    child: Text(
+                                      sf.name,
+                                      maxLines: 2,
+                                      overflow: TextOverflow.ellipsis,
+                                      textAlign: TextAlign.center,
+                                      style: TextStyle(
+                                          fontSize: 8,
+                                          color: cs.onSurfaceVariant),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                      ),
+                      Positioned(
+                        top: -6,
+                        right: -6,
+                        child: GestureDetector(
+                          onTap: () =>
+                              setState(() => _staged.removeAt(i)),
+                          child: Container(
+                            width: 20,
+                            height: 20,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: cs.error,
+                            ),
+                            child: Icon(Icons.close,
+                                size: 12, color: cs.onError),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // -----------------------------------------------------------------------
+  // Bubbles
+  // -----------------------------------------------------------------------
   Widget _buildBubble(BuildContext context, ChatMessage m) {
     final cs = Theme.of(context).colorScheme;
     final mine = m.isMine;
@@ -504,7 +730,6 @@ class _ChatScreenState extends State<ChatScreen> {
                 ),
               ),
 
-            // Active transfer progress
             if (t != null) ...[
               const SizedBox(height: 8),
               LinearProgressIndicator(
@@ -563,8 +788,8 @@ class _ChatScreenState extends State<ChatScreen> {
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
           child: Text(label,
-              style: const TextStyle(
-                  fontSize: 12, fontWeight: FontWeight.w700)),
+              style:
+                  const TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
         ),
       ),
     );
@@ -586,7 +811,6 @@ class _ChatScreenState extends State<ChatScreen> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        // Image preview
         if (isImg)
           Padding(
             padding: const EdgeInsets.only(bottom: 6),
@@ -605,8 +829,6 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
             ),
           ),
-
-        // File name row (tap to open file)
         GestureDetector(
           onTap: hasPath ? () => OpenFilex.open(m.attachmentPath!) : null,
           child: Row(
@@ -626,16 +848,15 @@ class _ChatScreenState extends State<ChatScreen> {
                     color: fgColor,
                     fontWeight: FontWeight.w700,
                     fontSize: 14,
-                    decoration:
-                        hasPath ? TextDecoration.underline : TextDecoration.none,
+                    decoration: hasPath
+                        ? TextDecoration.underline
+                        : TextDecoration.none,
                   ),
                 ),
               ),
             ],
           ),
         ),
-
-        // File type + size (shown when not actively transferring)
         if (!isTransferring && (sizeLabel != null || typeLabel.isNotEmpty))
           Padding(
             padding: const EdgeInsets.only(top: 3),
@@ -648,8 +869,6 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
             ),
           ),
-
-        // Open folder button (desktop only, completed transfers only)
         if (hasPath && !isTransferring && _isDesktop)
           Padding(
             padding: const EdgeInsets.only(top: 4),
@@ -681,26 +900,47 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  // -----------------------------------------------------------------------
+  // Composer
+  // -----------------------------------------------------------------------
   Widget _buildComposer(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    final canSend =
+        _connected && (_input.text.trim().isNotEmpty || _staged.isNotEmpty);
 
     return Padding(
       padding: const EdgeInsets.fromLTRB(12, 6, 12, 12),
       child: Row(
         children: [
           IconButton.filled(
-            onPressed: _pickFile,
+            onPressed: _pickFiles,
+            tooltip: _isDesktop ? 'Attach Files / Folder' : 'Attach Files',
             icon: const Icon(Icons.attach_file),
           ),
+          if (!kIsWeb && Platform.isAndroid) ...[
+            const SizedBox(width: 4),
+            IconButton.filled(
+              onPressed: _pickGallery,
+              tooltip: 'Gallery',
+              style: IconButton.styleFrom(
+                backgroundColor: cs.secondaryContainer,
+                foregroundColor: cs.onSecondaryContainer,
+              ),
+              icon: const Icon(Icons.photo_library),
+            ),
+          ],
           const SizedBox(width: 8),
           Expanded(
             child: TextField(
               controller: _input,
               focusNode: _focus,
               textInputAction: TextInputAction.send,
-              onSubmitted: (_) => _send(),
+              onSubmitted: (_) => _sendAll(),
+              onChanged: (_) => setState(() {}),
               decoration: InputDecoration(
-                hintText: 'Message',
+                hintText: _staged.isNotEmpty
+                    ? 'Add a message (optional)...'
+                    : 'Message',
                 filled: true,
                 fillColor: cs.surfaceContainerHighest,
                 border: OutlineInputBorder(
@@ -714,13 +954,20 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
           const SizedBox(width: 8),
           IconButton.filled(
-            onPressed: _send,
+            onPressed: canSend ? _sendAll : null,
             icon: const Icon(Icons.send),
           ),
         ],
       ),
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+class _StagedFile {
+  final String path;
+  final String name;
+  const _StagedFile(this.path, this.name);
 }
 
 // ---------------------------------------------------------------------------

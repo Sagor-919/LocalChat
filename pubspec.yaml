@@ -15,6 +15,7 @@ dependencies:
   open_filex: ^4.7.0
   desktop_drop: ^0.7.0
   flutter_local_notifications: ^19.4.0
+  image_picker: ^1.2.1
 
 dev_dependencies:
   flutter_test:

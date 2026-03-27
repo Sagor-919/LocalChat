@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -5,6 +6,7 @@ import 'message_model.dart';
 
 class MessageStore {
   late final String _basePath;
+  final Map<String, Future<void>> _locks = {};
 
   MessageStore._();
 
@@ -22,50 +24,70 @@ class MessageStore {
       if (dir != null) return '$dir/LocalChat';
     }
     if (Platform.isAndroid) {
-      // On Android, Directory.systemTemp is <app_data>/cache.
-      // Go up one level to get the app data root, then use /files.
       final appDir = Directory.systemTemp.parent.path;
       return '$appDir/files/LocalChat';
     }
     return '${Directory.systemTemp.path}/LocalChat';
   }
 
-  File _file(String peerId) => File('$_basePath/$peerId.json');
-
-  Future<List<ChatMessage>> load(String peerId) async {
-    final f = _file(peerId);
-    if (!await f.exists()) return [];
+  Future<T> _withLock<T>(String peerId, Future<T> Function() fn) async {
+    while (_locks.containsKey(peerId)) {
+      try {
+        await _locks[peerId];
+      } catch (_) {}
+    }
+    final completer = Completer<void>();
+    _locks[peerId] = completer.future;
     try {
-      final raw = await f.readAsString();
-      final list = jsonDecode(raw) as List;
-      return list
-          .map((e) => ChatMessage.fromStore(e as Map<String, dynamic>))
-          .toList();
-    } catch (_) {
-      return [];
+      return await fn();
+    } finally {
+      _locks.remove(peerId);
+      completer.complete();
     }
   }
 
+  File _file(String peerId) => File('$_basePath/$peerId.json');
+
+  Future<List<ChatMessage>> load(String peerId) async {
+    return _withLock(peerId, () async {
+      final f = _file(peerId);
+      if (!await f.exists()) return <ChatMessage>[];
+      try {
+        final raw = await f.readAsString();
+        final list = jsonDecode(raw) as List;
+        return list
+            .map((e) => ChatMessage.fromStore(e as Map<String, dynamic>))
+            .toList();
+      } catch (_) {
+        return <ChatMessage>[];
+      }
+    });
+  }
+
   Future<void> add(String peerId, ChatMessage msg) async {
-    final messages = await _loadRaw(peerId);
-    if (messages.any((m) => m['id'] == msg.id)) return;
-    messages.add(msg.toStore());
-    await _file(peerId).writeAsString(jsonEncode(messages));
+    return _withLock(peerId, () async {
+      final messages = await _loadRawUnsafe(peerId);
+      if (messages.any((m) => m['id'] == msg.id)) return;
+      messages.add(msg.toStore());
+      await _file(peerId).writeAsString(jsonEncode(messages));
+    });
   }
 
   Future<void> updateAttachmentPath(
       String peerId, String messageId, String path) async {
-    final messages = await _loadRaw(peerId);
-    for (final m in messages) {
-      if (m['id'] == messageId) {
-        m['attachmentPath'] = path;
-        break;
+    return _withLock(peerId, () async {
+      final messages = await _loadRawUnsafe(peerId);
+      for (final m in messages) {
+        if (m['id'] == messageId) {
+          m['attachmentPath'] = path;
+          break;
+        }
       }
-    }
-    await _file(peerId).writeAsString(jsonEncode(messages));
+      await _file(peerId).writeAsString(jsonEncode(messages));
+    });
   }
 
-  Future<List<Map<String, dynamic>>> _loadRaw(String peerId) async {
+  Future<List<Map<String, dynamic>>> _loadRawUnsafe(String peerId) async {
     final f = _file(peerId);
     if (!await f.exists()) return [];
     try {
@@ -77,8 +99,10 @@ class MessageStore {
   }
 
   Future<void> clear(String peerId) async {
-    final f = _file(peerId);
-    if (await f.exists()) await f.delete();
+    return _withLock(peerId, () async {
+      final f = _file(peerId);
+      if (await f.exists()) await f.delete();
+    });
   }
 
   Future<void> clearAll() async {
