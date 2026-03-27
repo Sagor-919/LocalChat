@@ -112,11 +112,13 @@ class _HomeScreenState extends State<HomeScreen> {
     final storedInfos = await widget.store.loadAllPeerInfos();
     if (!mounted || gen != _peerRefreshGeneration) return;
 
-    final storedPeerIds = await widget.store.listPeerIds();
+    final conversationPeerIds =
+        await widget.store.listPeerIdsWithConversation();
     if (!mounted || gen != _peerRefreshGeneration) return;
 
-    final offlineIds =
-        storedPeerIds.where((id) => !onlineIds.contains(id)).toSet();
+    final offlineIds = conversationPeerIds
+        .where((id) => !onlineIds.contains(id))
+        .toSet();
 
     final list = <_PeerEntry>[];
 
@@ -133,12 +135,11 @@ class _HomeScreenState extends State<HomeScreen> {
 
     for (final id in offlineIds) {
       final info = storedInfos[id];
-      if (info == null) continue;
       list.add(_PeerEntry(
         userId: id,
-        name: info['name'] as String? ?? 'Unknown',
-        ip: info['ip'] as String? ?? '',
-        port: (info['port'] as num?)?.toInt() ?? 4041,
+        name: info?['name'] as String? ?? 'Unknown',
+        ip: info?['ip'] as String? ?? '',
+        port: (info?['port'] as num?)?.toInt() ?? 4041,
         online: false,
       ));
     }
@@ -318,22 +319,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildChatsBody(BuildContext context, ColorScheme cs) {
-    int activityCmp(_PeerEntry a, _PeerEntry b) {
-      final ta = _lastMsgTime[a.userId];
-      final tb = _lastMsgTime[b.userId];
-      if (ta != null && tb != null && ta != tb) {
-        return tb.compareTo(ta);
-      }
-      if (ta != null && tb == null) return -1;
-      if (ta == null && tb != null) return 1;
-      return a.name.toLowerCase().compareTo(b.name.toLowerCase());
-    }
-
-    final online = _peerList.where((e) => e.online).toList()..sort(activityCmp);
-    final offline =
-        _peerList.where((e) => !e.online).toList()..sort(activityCmp);
-
-    if (online.isEmpty && offline.isEmpty) {
+    if (_peerList.isEmpty) {
       return Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -361,15 +347,28 @@ class _HomeScreenState extends State<HomeScreen> {
       );
     }
 
+    /// Within each section: latest message first; no history sorts last, then name.
+    int activityCmp(_PeerEntry a, _PeerEntry b) {
+      const none = -1;
+      final tva = _lastMsgTime[a.userId] ?? none;
+      final tvb = _lastMsgTime[b.userId] ?? none;
+      if (tva != tvb) return tvb.compareTo(tva);
+      return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+    }
+
+    final online = _peerList.where((e) => e.online).toList()..sort(activityCmp);
+    final offline =
+        _peerList.where((e) => !e.online).toList()..sort(activityCmp);
+
     final isDark = Theme.of(context).brightness == Brightness.dark;
     final children = <Widget>[];
 
-    if (online.isNotEmpty && offline.isNotEmpty) {
-      children.add(_buildChatsSectionHeader(context, 'Online', cs, isDark));
-    }
     if (online.isNotEmpty) {
+      children.add(_buildChatsSectionHeader(context, 'Online', cs, isDark));
       for (final e in online) {
-        children.add(_buildChatTile(context, e, showPresenceDot: true));
+        children.add(
+          _buildChatTile(context, e, showPresenceDot: true),
+        );
       }
     }
 
@@ -378,10 +377,18 @@ class _HomeScreenState extends State<HomeScreen> {
         children.add(_buildChatsSectionDivider(cs));
       }
       children.add(
-        _buildChatsSectionHeader(context, 'Offline', cs, isDark, muted: true),
+        _buildChatsSectionHeader(
+          context,
+          'Offline',
+          cs,
+          isDark,
+          muted: true,
+        ),
       );
       for (final e in offline) {
-        children.add(_buildChatTile(context, e, showPresenceDot: false));
+        children.add(
+          _buildChatTile(context, e, showPresenceDot: false),
+        );
       }
     }
 

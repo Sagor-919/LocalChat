@@ -118,6 +118,7 @@ class TransferManager {
   Future<void> sendFile({
     required String peerId,
     required String peerIp,
+    String? peerDisplayName,
     required String fileId,
     required String fileName,
     required String filePath,
@@ -134,7 +135,13 @@ class TransferManager {
       attachmentSize: fileSize,
     );
 
-    await _store.add(peerId, msg);
+    await _store.add(
+      peerId,
+      msg,
+      peerDisplayName: peerDisplayName,
+      peerIp: peerIp,
+      peerTcpPort: ConnectionService.tcpPort,
+    );
     _fileMessages.add(FileMessageEvent(peerId, msg));
 
     final notified = _connections.sendJson(peerId, {
@@ -312,7 +319,14 @@ class TransferManager {
       attachmentSize: fileSize,
     );
 
-    _store.add(peerId, msg);
+    final sockIp =
+        _connections.getSocket(peerId)?.remoteAddress.address ?? '';
+    await _store.add(
+      peerId,
+      msg,
+      peerIp: sockIp,
+      peerTcpPort: ConnectionService.tcpPort,
+    );
     _fileMessages.add(FileMessageEvent(peerId, msg));
 
     transfers[fileId] = TransferState(

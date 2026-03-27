@@ -244,17 +244,28 @@ Future<void> main() async {
     final type = json['type'] as String?;
 
     if (type == 'hello') {
-      final name = json['name'] as String? ?? '';
+      final name = (json['name'] as String? ?? '').trim();
       final peer = _discoveryPeerById(peerId);
-      if (peer != null) {
-        _store.savePeerInfo(peerId, name, peer.ip, peer.port);
-      }
+      final sock = _connections.getSocket(peerId);
+      final ip = (peer?.ip ?? sock?.remoteAddress.address ?? '').trim();
+      final port = peer?.port ?? ConnectionService.tcpPort;
+      final displayName = name.isNotEmpty
+          ? name
+          : ((peer?.name ?? '').trim().isNotEmpty ? peer!.name : 'Peer');
+      unawaited(_store.savePeerInfo(peerId, displayName, ip, port));
     }
 
     if (type == 'message') {
       final msg = ChatMessage.fromJson(json, _me.userId);
       if (msg != null) {
-        _store.add(peerId, msg);
+        final peer = _discoveryPeerById(peerId);
+        unawaited(_store.add(
+          peerId,
+          msg,
+          peerDisplayName: peer?.name,
+          peerIp: peer?.ip,
+          peerTcpPort: peer?.port,
+        ));
       }
     }
 

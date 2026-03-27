@@ -165,6 +165,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _allMessages.sort((a, b) => a.timestamp.compareTo(b.timestamp));
     _displayCount = _pageSize;
     _rebuildVisible();
+    unawaited(_rememberPeerRecord());
     setState(() => _loading = false);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_scroll.hasClients) {
@@ -202,7 +203,20 @@ class _ChatScreenState extends State<ChatScreen> {
         await widget.connections.connectTo(_resolveLivePeer(), forceNew: false);
     if (socket != null && mounted) {
       setState(() => _connected = true);
+      unawaited(_rememberPeerRecord());
     }
+  }
+
+  /// Keeps [_peers.json] in sync so the home screen shows the right name when
+  /// this peer is offline.
+  Future<void> _rememberPeerRecord() async {
+    final live = _resolveLivePeer();
+    await widget.store.savePeerInfo(
+      _peerId,
+      live.name,
+      live.ip,
+      live.port,
+    );
   }
 
   @override
@@ -309,7 +323,7 @@ class _ChatScreenState extends State<ChatScreen> {
   // -----------------------------------------------------------------------
   // Send — text + all staged files via TransferManager
   // -----------------------------------------------------------------------
-  void _sendAll() {
+  Future<void> _sendAll() async {
     final text = _input.text.trim();
     final hasText = text.isNotEmpty;
     final hasFiles = _staged.isNotEmpty;
@@ -318,6 +332,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!_connected) return;
 
     if (hasText) {
+      final live = _resolveLivePeer();
       final msg = ChatMessage(
         id: _uuid.v4(),
         senderId: widget.me.userId,
@@ -329,7 +344,13 @@ class _ChatScreenState extends State<ChatScreen> {
       _allMessages.add(msg);
       _displayCount++;
       setState(() => _rebuildVisible());
-      widget.store.add(_peerId, msg);
+      await widget.store.add(
+        _peerId,
+        msg,
+        peerDisplayName: live.name,
+        peerIp: live.ip,
+        peerTcpPort: live.port,
+      );
       _input.clear();
     }
 
@@ -356,6 +377,7 @@ class _ChatScreenState extends State<ChatScreen> {
     await _tm.sendFile(
       peerId: _peerId,
       peerIp: live.ip,
+      peerDisplayName: live.name,
       fileId: fileId,
       fileName: fileName,
       filePath: filePath,
@@ -1432,7 +1454,7 @@ class _ChatScreenState extends State<ChatScreen> {
               controller: _input,
               focusNode: _focus,
               textInputAction: TextInputAction.send,
-              onSubmitted: (_) => _sendAll(),
+              onSubmitted: (_) => unawaited(_sendAll()),
               onChanged: (_) => setState(() {}),
               decoration: InputDecoration(
                 hintText: _staged.isNotEmpty
@@ -1451,7 +1473,7 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
           const SizedBox(width: 8),
           IconButton.filled(
-            onPressed: canSend ? _sendAll : null,
+            onPressed: canSend ? () => unawaited(_sendAll()) : null,
             icon: const Icon(Icons.send),
           ),
         ],

@@ -82,13 +82,41 @@ class MessageStore {
   File _file(String peerId) => File('$_basePath/$peerId.json');
   File get _peersFile => File('$_basePath/_peers.json');
 
+  static const int _defaultChatTcpPort = 4041;
+
   // ---------------------------------------------------------------------------
   // Peer metadata cache — persists name/ip/port so offline peers still show up
   // ---------------------------------------------------------------------------
+  /// Merges with existing row so a new [name] or [ip] that is empty does not
+  /// wipe a previously saved display name (e.g. from hello before discovery).
   Future<void> savePeerInfo(
       String peerId, String name, String ip, int port) async {
     final all = await _loadPeersMap();
-    all[peerId] = {'name': name, 'ip': ip, 'port': port};
+    final prev = all[peerId];
+
+    var resolvedName = name.trim();
+    if (resolvedName.isEmpty && prev != null) {
+      final p = (prev['name'] as String?)?.trim() ?? '';
+      if (p.isNotEmpty) resolvedName = p;
+    }
+    if (resolvedName.isEmpty) resolvedName = 'Unknown';
+
+    var resolvedIp = ip.trim();
+    if (resolvedIp.isEmpty && prev != null) {
+      resolvedIp = (prev['ip'] as String?)?.trim() ?? '';
+    }
+
+    var resolvedPort = port;
+    if (resolvedPort <= 0 && prev != null) {
+      resolvedPort = (prev['port'] as num?)?.toInt() ?? _defaultChatTcpPort;
+    }
+    if (resolvedPort <= 0) resolvedPort = _defaultChatTcpPort;
+
+    all[peerId] = {
+      'name': resolvedName,
+      'ip': resolvedIp,
+      'port': resolvedPort,
+    };
     await _peersFile.writeAsString(jsonEncode(all));
   }
 
@@ -122,6 +150,16 @@ class MessageStore {
     return ids;
   }
 
+  /// Peers with at least one stored message (for offline chat list).
+  Future<List<String>> listPeerIdsWithConversation() async {
+    final ids = await listPeerIds();
+    if (ids.isEmpty) return [];
+    final flags = await Future.wait(
+      ids.map((id) async => (id, (await load(id)).isNotEmpty)),
+    );
+    return [for (final p in flags) if (p.$2) p.$1];
+  }
+
   Future<List<ChatMessage>> load(String peerId) async {
     return _withLock(peerId, () async {
       final f = _file(peerId);
@@ -138,13 +176,33 @@ class MessageStore {
     });
   }
 
-  Future<void> add(String peerId, ChatMessage msg) async {
-    return _withLock(peerId, () async {
+  /// Persists [msg]. Optionally updates peer display row when any of
+  /// [peerDisplayName] / [peerIp] / [peerTcpPort] hints are provided.
+  Future<void> add(
+    String peerId,
+    ChatMessage msg, {
+    String? peerDisplayName,
+    String? peerIp,
+    int? peerTcpPort,
+  }) async {
+    await _withLock(peerId, () async {
       final messages = await _loadRawUnsafe(peerId);
       if (messages.any((m) => m['id'] == msg.id)) return;
       messages.add(msg.toStore());
       await _file(peerId).writeAsString(jsonEncode(messages));
     });
+
+    final hasName = peerDisplayName != null && peerDisplayName.trim().isNotEmpty;
+    final hasIp = peerIp != null && peerIp.trim().isNotEmpty;
+    final hasPort = peerTcpPort != null && peerTcpPort > 0;
+    if (hasName || hasIp || hasPort) {
+      await savePeerInfo(
+        peerId,
+        peerDisplayName ?? '',
+        peerIp ?? '',
+        peerTcpPort ?? _defaultChatTcpPort,
+      );
+    }
   }
 
   Future<void> updateAttachmentPath(

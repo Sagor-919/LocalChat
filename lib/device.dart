@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -17,8 +18,56 @@ class DeviceInfo {
       id = const Uuid().v4();
       await prefs.setString('device_id', id);
     }
-    final name = prefs.getString('device_name') ?? Platform.localHostname;
+
+    final saved = prefs.getString('device_name')?.trim();
+    String name;
+    if (saved != null && saved.isNotEmpty && !_isUnsuitableDisplayName(saved)) {
+      name = saved;
+    } else {
+      final host = Platform.localHostname.trim();
+      if (!_isUnsuitableDisplayName(host)) {
+        name = host;
+      } else {
+        name = _randomGamingName(id);
+      }
+      await prefs.setString('device_name', name);
+    }
+
     return DeviceInfo(userId: id, displayName: name);
+  }
+
+  /// Hostnames like `localhost` after reinstall, or generic placeholders.
+  static bool _isUnsuitableDisplayName(String raw) {
+    if (raw.isEmpty) return true;
+    final s = raw.toLowerCase().trim();
+    if (s == 'localhost' ||
+        s == '127.0.0.1' ||
+        s == '::1' ||
+        s == 'android' ||
+        s == 'unknown' ||
+        s == 'null') {
+      return true;
+    }
+    if (s.startsWith('sdk_gphone') || s.startsWith('emulator')) return true;
+    return false;
+  }
+
+  static String _randomGamingName(String userId) {
+    final r = Random(userId.hashCode);
+    const adjectives = [
+      'Swift', 'Neon', 'Shadow', 'Pixel', 'Storm', 'Frost', 'Blaze', 'Volt',
+      'Nova', 'Cyber', 'Echo', 'Rogue', 'Silent', 'Iron', 'Quantum', 'Void',
+      'Turbo', 'Dark', 'Ice', 'Fire',
+    ];
+    const nouns = [
+      'Fox', 'Wolf', 'Drift', 'Knight', 'Hawk', 'Viper', 'Tiger', 'Phoenix',
+      'Raven', 'Strike', 'Ghost', 'Legend', 'Claw', 'Star', 'Pulse', 'Wraith',
+      'Fang', 'Bolt', 'Shard', 'Ninja',
+    ];
+    final a = adjectives[r.nextInt(adjectives.length)];
+    final n = nouns[r.nextInt(nouns.length)];
+    final tag = 10 + r.nextInt(90);
+    return '$a$n$tag';
   }
 
   static Future<void> setName(String name) async {
