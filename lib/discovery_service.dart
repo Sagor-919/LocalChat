@@ -6,7 +6,6 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 
-import 'debug/app_diagnostics.dart';
 import 'device.dart';
 
 class DiscoveryService {
@@ -40,6 +39,9 @@ class DiscoveryService {
 
   List<PeerDevice> get peers => _peers.values.toList();
 
+  /// UDP bound and discovery loop running — best-effort signal that we can advertise.
+  bool get isAdvertisingActive => _started && _socket != null;
+
   Future<void> start() async {
     if (Platform.isAndroid) {
       try {
@@ -61,9 +63,6 @@ class DiscoveryService {
         const Duration(seconds: 2), (_) => _removeStale());
     _broadcast();
     _started = true;
-    diag('UDP',
-        'Discovery started: port=$udpPort, beacon every ${broadcastInterval.inSeconds}s, '
-        'stale after ${staleTimeout.inSeconds}s, multicast=$_multicastGroup');
   }
 
   Future<void> _bindUdpSocket() async {
@@ -98,7 +97,6 @@ class DiscoveryService {
   /// Close and rebind so discovery works again without killing the process.
   Future<void> rebindUdpSocket() async {
     if (!_started) return;
-    diag('UDP', 'rebindUdpSocket: rebinding UDP :$udpPort (fix stale interface)');
     try {
       _socket?.close();
     } catch (_) {}
@@ -119,8 +117,6 @@ class DiscoveryService {
     _broadcast();
     await Future<void>.delayed(const Duration(milliseconds: 150));
     _broadcast();
-    diag('UDP',
-        'rebindUdpSocket done: targets=${_cachedBroadcastTargets.length}, burst sent');
   }
 
   /// Joins multicast on the default socket and per IPv4 interface. Safe to call
@@ -244,7 +240,6 @@ class DiscoveryService {
         port: port,
         lastSeen: DateTime.now(),
       );
-      diag('UDP', 'Peer discovered: $userId at $senderIp:$port ($name)');
     }
     onPeersChanged?.call();
   }
@@ -257,15 +252,11 @@ class DiscoveryService {
       return now.difference(p.lastSeen) > staleTimeout;
     });
     if (_peers.length != before) {
-      diag('UDP',
-          'Stale prune: ${before - _peers.length} removed (>${staleTimeout.inSeconds}s silent), '
-          'remaining=${_peers.length}');
       onPeersChanged?.call();
     }
   }
 
   void stop() {
-    diag('UDP', 'Discovery stop()');
     _started = false;
     _broadcastTargetsTimer?.cancel();
     _broadcastTargetsTimer = null;

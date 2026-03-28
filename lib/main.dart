@@ -11,9 +11,10 @@ import 'package:window_manager/window_manager.dart';
 
 import 'app_branding.dart';
 import 'app_settings.dart';
+import 'chat_crypto.dart';
 import 'chat_screen.dart';
 import 'connection_service.dart';
-import 'debug/app_diagnostics.dart';
+import 'fps_overlay.dart';
 import 'device.dart';
 import 'first_launch_prompt.dart';
 import 'discovery_service.dart';
@@ -44,7 +45,6 @@ bool _connectivityIsOffline(List<ConnectivityResult> results) {
 /// stick to a dead interface — same as restarting the app. Clear chat sockets
 /// then rebind discovery so home + chat can reconnect without restart.
 Future<void> _restoreLanAfterLinkRecovery() async {
-  diag('APP', 'restoreLanAfterLinkRecovery: disconnect all TCP + rebind UDP');
   await _connections.disconnectAllPeers();
   await _discovery.rebindUdpSocket();
 }
@@ -56,8 +56,6 @@ void _onConnectivityChanged(List<ConnectivityResult> results) {
   _lastConnectivityResults = List<ConnectivityResult>.from(results);
 
   if (offline && !wasOffline) {
-    diag('APP',
-        'Connectivity offline → closing all chat TCP sockets (UDP may already be silent)');
     unawaited(_connections.disconnectAllPeers());
   } else if (!offline && wasOffline) {
     unawaited(_restoreLanAfterLinkRecovery());
@@ -117,6 +115,66 @@ String? _parsePeerIdFromPayload(String? payload) {
     return id;
   } catch (_) {
     return null;
+  }
+}
+
+Future<void> _handleIncomingEncryptedMessage(
+    String peerId, Map<String, dynamic> json) async {
+  final ct = json['ct'] as String?;
+  if (ct == null || ct.isEmpty) return;
+  final text = await ChatCrypto.decryptMessage(_me.userId, peerId, ct);
+  if (text == null) return;
+  final msg = ChatMessage(
+    id: json['id'] as String? ?? '',
+    senderId: json['from'] as String? ?? '',
+    text: text,
+    timestamp: (json['time'] as num?)?.toInt() ??
+        DateTime.now().millisecondsSinceEpoch,
+    isMine: (json['from'] as String?) == _me.userId,
+  );
+  await _handleIncomingTextMessage(peerId, msg);
+}
+
+Future<void> _handleIncomingTextMessage(String peerId, ChatMessage msg) async {
+  // Ack first so duplicate resends (same id) still clear the sender's pending state.
+  _connections.sendJson(peerId, {'type': 'message_ack', 'id': msg.id});
+
+  final peer = _discoveryPeerById(peerId);
+  final inserted = await _store.add(
+    peerId,
+    msg,
+    peerDisplayName: peer?.name,
+    peerIp: peer?.ip,
+    peerTcpPort: peer?.port,
+  );
+  if (inserted &&
+      _shouldAlertIncomingMessage() &&
+      !AppSettings.instance.notificationsMuted.value) {
+    final name = peer?.name ?? 'Someone';
+    _notifications.show(
+      peerId.hashCode,
+      name,
+      msg.text,
+      _incomingMessageNotificationDetails(),
+      payload: jsonEncode({'peerId': peerId}),
+    );
+    unawaited(_pulseWindowsTaskbarForAttention());
+  }
+}
+
+/// Receiver acknowledged [messageId]; we confirm back so both sides agree delivery completed.
+Future<void> _completeDeliveryHandshake(String peerId, String messageId) async {
+  final ok = _connections.sendJson(peerId, {
+    'type': 'message_ack_confirm',
+    'id': messageId,
+    'from': _me.userId,
+  });
+  if (ok) {
+    await _store.updateDeliveryState(
+        peerId, messageId, MessageDelivery.delivered);
+  } else {
+    await _store.updateDeliveryState(
+        peerId, messageId, MessageDelivery.awaitingConfirm);
   }
 }
 
@@ -251,15 +309,24 @@ Future<void> main() async {
   _discovery.hasActiveChatTcp = (id) => _connections.isConnected(id);
   await _connections.startServer();
   await _discovery.start();
-  diag('APP',
-      'Startup: user=${_me.userId} name=${_me.displayName} '
-      'chat TCP ${ConnectionService.tcpPort} / UDP ${DiscoveryService.udpPort}');
 
   await TransferManager.instance.init(
     connections: _connections,
     store: _store,
     myId: _me.userId,
     notificationsPlugin: _notifications,
+    onRemoteTransferFailed: (peerId, fileId, error) {
+      final peer = _discoveryPeerById(peerId);
+      final name = peer?.name ?? 'Peer';
+      final ctx = appNavigatorKey.currentContext;
+      if (ctx == null || !ctx.mounted) return;
+      ScaffoldMessenger.of(ctx).showSnackBar(
+        SnackBar(
+          content: Text('$name rejected the file: $error'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    },
   );
 
   try {
@@ -301,47 +368,60 @@ Future<void> main() async {
           ? name
           : ((peer?.name ?? '').trim().isNotEmpty ? peer!.name : 'Peer');
       unawaited(_store.savePeerInfo(peerId, displayName, ip, port));
+      return;
+    }
+
+    if (type == 'message_ack_confirm') {
+      // Original receiver: sender confirmed they recorded delivery after our message_ack.
+      return;
+    }
+
+    if (type == 'message_ack') {
+      final id = json['id'] as String?;
+      if (id != null && id.isNotEmpty) {
+        unawaited(_completeDeliveryHandshake(peerId, id));
+      }
+      return;
     }
 
     if (type == 'message') {
-      final msg = ChatMessage.fromJson(json, _me.userId);
-      if (msg != null) {
-        final peer = _discoveryPeerById(peerId);
-        unawaited(_store.add(
-          peerId,
-          msg,
-          peerDisplayName: peer?.name,
-          peerIp: peer?.ip,
-          peerTcpPort: peer?.port,
-        ));
+      final enc = json['enc'] == true;
+      if (enc) {
+        unawaited(_handleIncomingEncryptedMessage(peerId, json));
+      } else {
+        final msg = ChatMessage.fromJson(json, _me.userId);
+        if (msg != null) {
+          unawaited(_handleIncomingTextMessage(peerId, msg));
+        }
       }
+      return;
     }
 
     if (type == 'file_notify') {
-      TransferManager.instance.registerIncoming(
-        peerId,
-        json['id'] as String? ?? '',
-        json['name'] as String? ?? '',
-        (json['size'] as num?)?.toInt() ?? 0,
+      unawaited(
+        TransferManager.instance.registerIncoming(
+          peerId,
+          json['id'] as String? ?? '',
+          json['name'] as String? ?? '',
+          (json['size'] as num?)?.toInt() ?? 0,
+          encrypted: json['encrypted'] == true,
+          senderEphPubB64: json['eph_pub_b64'] as String?,
+        ),
       );
+      return;
     }
 
-    if (_shouldAlertIncomingMessage() &&
-        !AppSettings.instance.notificationsMuted.value &&
-        type == 'message') {
-      final text = json['text'] as String? ?? '';
-      final from = json['from'] as String? ?? 'Someone';
-      final peer = _discoveryPeerById(peerId);
-      final name = peer?.name ?? from;
-
-      _notifications.show(
-        peerId.hashCode,
-        name,
-        text,
-        _incomingMessageNotificationDetails(),
-        payload: jsonEncode({'peerId': peerId}),
+    if (type == 'file_transfer_key') {
+      TransferManager.instance.handleFileTransferKey(
+        peerId,
+        json,
       );
-      unawaited(_pulseWindowsTaskbarForAttention());
+      return;
+    }
+
+    if (type == 'file_transfer_result') {
+      TransferManager.instance.handleFileTransferResult(peerId, json);
+      return;
     }
   };
 
@@ -352,11 +432,14 @@ Future<void> main() async {
       final peer = _discoveryPeerById(event.peerId);
       final name = peer?.name ?? 'Someone';
       final fileName = event.message.attachmentName ?? 'a file';
+      final body = event.message.attachmentEncrypted
+          ? 'Secure transfer — $fileName'
+          : 'Sent you $fileName';
 
       _notifications.show(
         event.peerId.hashCode,
         name,
-        'Sent you $fileName',
+        body,
         _incomingMessageNotificationDetails(),
         payload: jsonEncode({'peerId': event.peerId}),
       );
@@ -543,7 +626,6 @@ class _LocalChatAppState extends State<LocalChatApp>
     _appInForeground = state == AppLifecycleState.resumed ||
         state == AppLifecycleState.inactive;
     if (state == AppLifecycleState.resumed) {
-      diag('APP', 'AppLifecycleState.resumed → UDP rebind (receive path + burst)');
       unawaited(_discovery.recoverAfterNetworkOrResume());
     }
   }
@@ -557,6 +639,12 @@ class _LocalChatAppState extends State<LocalChatApp>
           navigatorKey: appNavigatorKey,
           title: 'Local Chat',
           debugShowCheckedModeBanner: false,
+          builder: (context, child) {
+            if (!kFpsOverlayEnabled) {
+              return child ?? const SizedBox.shrink();
+            }
+            return FpsOverlayShell(child: child);
+          },
           themeMode: mode,
           theme: ThemeData(
             colorSchemeSeed: Colors.indigo,

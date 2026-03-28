@@ -1,3 +1,12 @@
+/// Outgoing text delivery (persisted for my messages). Incoming messages use null.
+enum MessageDelivery {
+  delivered,
+  /// Peer received (message_ack); waiting to send message_ack_confirm to peer.
+  awaitingConfirm,
+  pending,
+  undelivered,
+}
+
 class ChatMessage {
   final String id;
   final String senderId;
@@ -7,8 +16,12 @@ class ChatMessage {
   final String? attachmentName;
   final String? attachmentPath;
   final int? attachmentSize;
+  /// ECDH + AES-GCM on the file socket for this attachment (sender opted in or receiver matched).
+  final bool attachmentEncrypted;
   /// User dismissed a failed/cancelled transfer; show strikethrough / muted bubble.
   final bool transferDismissed;
+  /// Only for [isMine] text messages; null means legacy or not applicable.
+  final MessageDelivery? delivery;
 
   const ChatMessage({
     required this.id,
@@ -19,7 +32,9 @@ class ChatMessage {
     this.attachmentName,
     this.attachmentPath,
     this.attachmentSize,
+    this.attachmentEncrypted = false,
     this.transferDismissed = false,
+    this.delivery,
   });
 
   /// For sending over TCP (text messages only).
@@ -33,6 +48,8 @@ class ChatMessage {
 
   static ChatMessage? fromJson(Map<String, dynamic> json, String myId) {
     if (json['type'] != 'message') return null;
+    // Encrypted frames are decrypted in main.dart; avoid double-processing here.
+    if (json['enc'] == true) return null;
     return ChatMessage(
       id: json['id'] as String? ?? '',
       senderId: json['from'] as String? ?? '',
@@ -53,8 +70,20 @@ class ChatMessage {
         'attachmentName': attachmentName,
         'attachmentPath': attachmentPath,
         'attachmentSize': attachmentSize,
+        'attachmentEncrypted': attachmentEncrypted,
         'transferDismissed': transferDismissed,
+        if (delivery != null) 'delivery': delivery!.name,
       };
+
+  static MessageDelivery? _deliveryFromStore(dynamic raw) {
+    if (raw == null) return null;
+    if (raw is String) {
+      for (final v in MessageDelivery.values) {
+        if (v.name == raw) return v;
+      }
+    }
+    return null;
+  }
 
   static ChatMessage fromStore(Map<String, dynamic> json) {
     return ChatMessage(
@@ -66,7 +95,9 @@ class ChatMessage {
       attachmentName: json['attachmentName'] as String?,
       attachmentPath: json['attachmentPath'] as String?,
       attachmentSize: (json['attachmentSize'] as num?)?.toInt(),
+      attachmentEncrypted: json['attachmentEncrypted'] as bool? ?? false,
       transferDismissed: json['transferDismissed'] as bool? ?? false,
+      delivery: _deliveryFromStore(json['delivery']),
     );
   }
 
@@ -79,7 +110,10 @@ class ChatMessage {
     String? attachmentName,
     String? attachmentPath,
     int? attachmentSize,
+    bool? attachmentEncrypted,
     bool? transferDismissed,
+    MessageDelivery? delivery,
+    bool clearDelivery = false,
   }) {
     return ChatMessage(
       id: id ?? this.id,
@@ -90,7 +124,9 @@ class ChatMessage {
       attachmentName: attachmentName ?? this.attachmentName,
       attachmentPath: attachmentPath ?? this.attachmentPath,
       attachmentSize: attachmentSize ?? this.attachmentSize,
+      attachmentEncrypted: attachmentEncrypted ?? this.attachmentEncrypted,
       transferDismissed: transferDismissed ?? this.transferDismissed,
+      delivery: clearDelivery ? null : (delivery ?? this.delivery),
     );
   }
 }

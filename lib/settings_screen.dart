@@ -11,7 +11,6 @@ import 'android_app_control.dart';
 import 'android_storage_access.dart';
 import 'app_branding.dart';
 import 'app_settings.dart';
-import 'debug/diagnostics_panel_screen.dart';
 import 'message_store.dart';
 
 class SettingsScreen extends StatefulWidget {
@@ -111,7 +110,8 @@ class _SettingsScreenState extends State<SettingsScreen>
                       visualDensity: VisualDensity.compact,
                       shape: WidgetStatePropertyAll(
                         RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(12)),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
                       ),
                     ),
                   );
@@ -130,7 +130,8 @@ class _SettingsScreenState extends State<SettingsScreen>
               builder: (_, muted, child) {
                 return SwitchListTile(
                   shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(16)),
+                    borderRadius: BorderRadius.circular(16),
+                  ),
                   secondary: Icon(
                     muted
                         ? Icons.notifications_off_outlined
@@ -138,8 +139,7 @@ class _SettingsScreenState extends State<SettingsScreen>
                     color: cs.primary,
                   ),
                   title: const Text('Mute Notifications'),
-                  subtitle:
-                      const Text('Silence all incoming message alerts'),
+                  subtitle: const Text('Silence all incoming message alerts'),
                   value: muted,
                   onChanged: (v) => _settings.setNotificationsMuted(v),
                 );
@@ -155,7 +155,8 @@ class _SettingsScreenState extends State<SettingsScreen>
               cs: cs,
               child: SwitchListTile(
                 shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(16)),
+                  borderRadius: BorderRadius.circular(16),
+                ),
                 secondary: Icon(
                   _batteryUnrestricted == true
                       ? Icons.battery_charging_full
@@ -167,11 +168,11 @@ class _SettingsScreenState extends State<SettingsScreen>
                   _batteryUnrestricted == null
                       ? 'Checking system setting\u2026'
                       : _batteryUnrestricted!
-                          ? 'Android should not aggressively suspend Local Chat. '
-                              'Recommended for stable LAN connections.'
-                          : 'Battery optimization can drop discovery and chat in the '
-                              'background on Samsung, Xiaomi, OnePlus, and similar devices. '
-                              'Turn this on to open the system prompt, or open app info to change it.',
+                      ? 'Android should not aggressively suspend Local Chat. '
+                            'Recommended for stable LAN connections.'
+                      : 'Battery optimization can drop discovery and chat in the '
+                            'background on Samsung, Xiaomi, OnePlus, and similar devices. '
+                            'Turn this on to open the system prompt, or open app info to change it.',
                 ),
                 value: _batteryUnrestricted ?? false,
                 onChanged: _batteryUnrestricted == null
@@ -209,7 +210,8 @@ class _SettingsScreenState extends State<SettingsScreen>
                 builder: (_, enabled, _) {
                   return SwitchListTile(
                     shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(16)),
+                      borderRadius: BorderRadius.circular(16),
+                    ),
                     secondary: Icon(
                       enabled
                           ? Icons.visibility_outlined
@@ -244,11 +246,11 @@ class _SettingsScreenState extends State<SettingsScreen>
                 builder: (_, enabled, child) {
                   return SwitchListTile(
                     shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(16)),
+                      borderRadius: BorderRadius.circular(16),
+                    ),
                     secondary: Icon(Icons.launch, color: cs.primary),
                     title: const Text('Start with Windows'),
-                    subtitle: const Text(
-                        'Launch Local Chat when you sign in'),
+                    subtitle: const Text('Launch Local Chat when you sign in'),
                     value: enabled,
                     onChanged: (v) => _settings.setStartWithWindows(v),
                   );
@@ -257,6 +259,32 @@ class _SettingsScreenState extends State<SettingsScreen>
             ),
             const SizedBox(height: 16),
           ],
+
+          _sectionLabel(context, 'SECURITY'),
+          _card(
+            isDark: isDark,
+            cs: cs,
+            child: ValueListenableBuilder<bool>(
+              valueListenable: _settings.secureFileTransfer,
+              builder: (_, enabled, _) {
+                return SwitchListTile(
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  secondary: Icon(Icons.lock_outline, color: cs.primary),
+                  title: const Text('Secure File Transfer'),
+                  subtitle: const Text(
+                    'When on, your outgoing files use X25519 and AES-GCM per chunk. '
+                    'You can still receive a secure transfer if the sender uses this — '
+                    'your app unlocks that transfer only; it does not change this switch.',
+                  ),
+                  value: enabled,
+                  onChanged: (v) => _settings.setSecureFileTransfer(v),
+                );
+              },
+            ),
+          ),
+          const SizedBox(height: 16),
 
           _sectionLabel(context, 'DOWNLOADS'),
           _card(
@@ -267,7 +295,8 @@ class _SettingsScreenState extends State<SettingsScreen>
               builder: (_, path, child) {
                 return ListTile(
                   shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(16)),
+                    borderRadius: BorderRadius.circular(16),
+                  ),
                   leading: Icon(Icons.folder_outlined, color: cs.primary),
                   title: const Text('Download Location'),
                   subtitle: Text(
@@ -297,66 +326,16 @@ class _SettingsScreenState extends State<SettingsScreen>
           ),
           const SizedBox(height: 16),
 
-          _sectionLabel(context, 'DIAGNOSTICS'),
-          _card(
-            isDark: isDark,
-            cs: cs,
-            child: Column(
-              children: [
-                ValueListenableBuilder<bool>(
-                  valueListenable: _settings.diagnosticsLoggingEnabled,
-                  builder: (_, enabled, _) {
-                    return SwitchListTile(
-                      shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(16)),
-                      secondary: Icon(
-                        Icons.bug_report_outlined,
-                        color: cs.primary,
-                      ),
-                      title: const Text('Diagnostic logging'),
-                      subtitle: const Text(
-                        'Record TCP, UDP discovery, chat, and file-transfer '
-                        'events with timestamps. Turn off when stable to reduce work.',
-                      ),
-                      value: enabled,
-                      onChanged: (v) => _settings.setDiagnosticsLoggingEnabled(v),
-                    );
-                  },
-                ),
-                ListTile(
-                  shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(16)),
-                  leading: Icon(Icons.terminal, color: cs.primary),
-                  title: const Text('Open diagnostic log'),
-                  subtitle: const Text(
-                    'Scrollable timeline — copy all or clear. '
-                    'Disable logging above or set kAppDiagnosticsEnabled=false in '
-                    'lib/debug/app_diagnostics.dart to remove.',
-                  ),
-                  trailing: const Icon(Icons.chevron_right),
-                  onTap: () {
-                    Navigator.of(context).push(
-                      MaterialPageRoute<void>(
-                        builder: (_) => const DiagnosticsPanelScreen(),
-                      ),
-                    );
-                  },
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 16),
-
           _sectionLabel(context, 'DATA'),
           _card(
             isDark: isDark,
             cs: cs,
             child: ListTile(
               shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(16)),
+                borderRadius: BorderRadius.circular(16),
+              ),
               leading: Icon(Icons.delete_sweep_outlined, color: cs.error),
-              title: Text('Clear All Chats',
-                  style: TextStyle(color: cs.error)),
+              title: Text('Clear All Chats', style: TextStyle(color: cs.error)),
               subtitle: const Text('Delete all message history'),
               onTap: _confirmClearAll,
             ),
@@ -372,16 +351,22 @@ class _SettingsScreenState extends State<SettingsScreen>
                 const SizedBox(height: 24),
                 const AppIconTile(size: 80, withDropShadow: true),
                 const SizedBox(height: 14),
-                Text('Local Chat',
-                    style: TextStyle(
-                        fontWeight: FontWeight.w800,
-                        fontSize: 22,
-                        color: cs.onSurface)),
-                Text('v1.0.0',
-                    style: TextStyle(
-                        color: cs.outline,
-                        fontSize: 13,
-                        fontWeight: FontWeight.w500)),
+                Text(
+                  'Local Chat',
+                  style: TextStyle(
+                    fontWeight: FontWeight.w800,
+                    fontSize: 22,
+                    color: cs.onSurface,
+                  ),
+                ),
+                Text(
+                  'v1.0.0',
+                  style: TextStyle(
+                    color: cs.outline,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
                 const SizedBox(height: 20),
                 const Divider(height: 1, indent: 20, endIndent: 20),
                 const SizedBox(height: 16),
@@ -406,39 +391,52 @@ class _SettingsScreenState extends State<SettingsScreen>
                   ),
                 ),
                 const SizedBox(height: 8),
-                Text('Developed By',
-                    style: TextStyle(
-                        color: cs.outline,
-                        fontSize: 12,
-                        fontWeight: FontWeight.w600,
-                        letterSpacing: 0.5)),
-                Text('Sagor Hossen',
-                    style: TextStyle(
-                        fontWeight: FontWeight.w700,
-                        fontSize: 17,
-                        color: cs.onSurface)),
+                Text(
+                  'Developed By',
+                  style: TextStyle(
+                    color: cs.outline,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: 0.5,
+                  ),
+                ),
+                Text(
+                  'Sagor Hossen',
+                  style: TextStyle(
+                    fontWeight: FontWeight.w700,
+                    fontSize: 17,
+                    color: cs.onSurface,
+                  ),
+                ),
                 const SizedBox(height: 16),
                 const Divider(height: 1, indent: 20, endIndent: 20),
                 ListTile(
                   leading: Icon(Icons.language, color: cs.primary),
                   title: const Text('Website'),
-                  trailing: Text('RecklessGalaxy.com',
-                      style: TextStyle(
-                          color: cs.primary,
-                          fontSize: 14,
-                          fontWeight: FontWeight.w500)),
+                  trailing: Text(
+                    'RecklessGalaxy.com',
+                    style: TextStyle(
+                      color: cs.primary,
+                      fontSize: 14,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
                   onTap: () => _launchUrl('https://recklessgalaxy.com'),
                 ),
                 ListTile(
                   shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(16)),
+                    borderRadius: BorderRadius.circular(16),
+                  ),
                   leading: Icon(Icons.email_outlined, color: cs.primary),
                   title: const Text('Email'),
-                  trailing: Text('sagor@recklessgalaxy.com',
-                      style: TextStyle(
-                          color: cs.primary,
-                          fontSize: 14,
-                          fontWeight: FontWeight.w500)),
+                  trailing: Text(
+                    'sagor@recklessgalaxy.com',
+                    style: TextStyle(
+                      color: cs.primary,
+                      fontSize: 14,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
                   onTap: () => _launchUrl('mailto:sagor@recklessgalaxy.com'),
                 ),
                 const SizedBox(height: 8),
@@ -542,7 +540,8 @@ class _SettingsScreenState extends State<SettingsScreen>
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
         title: const Text('Clear All Chats'),
         content: const Text(
-            'Delete ALL message history for every conversation? This cannot be undone.'),
+          'Delete ALL message history for every conversation? This cannot be undone.',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx),
@@ -555,14 +554,17 @@ class _SettingsScreenState extends State<SettingsScreen>
               if (mounted) {
                 ScaffoldMessenger.of(context)
                   ..clearSnackBars()
-                  ..showSnackBar(const SnackBar(
-                    content: Text('All chats cleared'),
-                    behavior: SnackBarBehavior.floating,
-                  ));
+                  ..showSnackBar(
+                    const SnackBar(
+                      content: Text('All chats cleared'),
+                      behavior: SnackBarBehavior.floating,
+                    ),
+                  );
               }
             },
             style: FilledButton.styleFrom(
-                backgroundColor: Theme.of(context).colorScheme.error),
+              backgroundColor: Theme.of(context).colorScheme.error,
+            ),
             child: const Text('Clear All'),
           ),
         ],

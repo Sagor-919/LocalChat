@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
@@ -47,6 +48,15 @@ class _HomeScreenState extends State<HomeScreen> {
   /// Coalesce rapid UDP discovery callbacks into one refresh + disk pass.
   Timer? _discoveryDebounce;
 
+  StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
+  /// Null until the first [Connectivity.checkConnectivity] completes.
+  List<ConnectivityResult>? _connectivityResults;
+
+  bool get _connectivityOffline =>
+      _connectivityResults != null &&
+      _connectivityResults!.length == 1 &&
+      _connectivityResults!.first == ConnectivityResult.none;
+
   void _onMessageHistoryRevision() {
     final sig = widget.store.consumePendingHistoryClear();
     if (sig == null) return;
@@ -78,6 +88,8 @@ class _HomeScreenState extends State<HomeScreen> {
 
     widget.discovery.onPeersChanged = _onDiscoveryPeersChanged;
 
+    unawaited(_initConnectivity());
+
     _prevOnMessage = widget.connections.onMessage;
     widget.connections.onMessage = (peerId, json) {
       _prevOnMessage?.call(peerId, json);
@@ -87,9 +99,15 @@ class _HomeScreenState extends State<HomeScreen> {
           setState(() {
             _unread[peerId] = (_unread[peerId] ?? 0) + 1;
             if (type == 'message') {
-              _lastMsg[peerId] = json['text'] as String? ?? '';
-              _lastMsgTime[peerId] = (json['time'] as num?)?.toInt() ??
-                  DateTime.now().millisecondsSinceEpoch;
+              if (json['enc'] == true) {
+                _lastMsgTime[peerId] = (json['time'] as num?)?.toInt() ??
+                    DateTime.now().millisecondsSinceEpoch;
+                unawaited(_syncPreviewFromStore(peerId));
+              } else {
+                _lastMsg[peerId] = json['text'] as String? ?? '';
+                _lastMsgTime[peerId] = (json['time'] as num?)?.toInt() ??
+                    DateTime.now().millisecondsSinceEpoch;
+              }
             } else {
               _lastMsg[peerId] = 'Incoming file\u2026';
               _lastMsgTime[peerId] = DateTime.now().millisecondsSinceEpoch;
@@ -98,6 +116,22 @@ class _HomeScreenState extends State<HomeScreen> {
         }
       }
     };
+  }
+
+  Future<void> _initConnectivity() async {
+    final c = Connectivity();
+    try {
+      final r = await c.checkConnectivity();
+      if (mounted) {
+        setState(() => _connectivityResults = r);
+        unawaited(_refreshPeerList());
+      }
+    } catch (_) {}
+    _connectivitySub = c.onConnectivityChanged.listen((r) {
+      if (!mounted) return;
+      setState(() => _connectivityResults = r);
+      unawaited(_refreshPeerList());
+    });
   }
 
   void _onDiscoveryPeersChanged() {
@@ -113,8 +147,11 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _refreshPeerList() async {
     final gen = ++_peerRefreshGeneration;
-    final onlinePeers = widget.discovery.peers;
-    final onlineIds = onlinePeers.map((p) => p.userId).toSet();
+    final networkDown = _connectivityOffline;
+    final discoveryPeers = widget.discovery.peers;
+    final onlineIds = networkDown
+        ? <String>{}
+        : discoveryPeers.map((p) => p.userId).toSet();
 
     final storedInfos = await widget.store.loadAllPeerInfos();
     if (!mounted || gen != _peerRefreshGeneration) return;
@@ -129,15 +166,17 @@ class _HomeScreenState extends State<HomeScreen> {
 
     final list = <_PeerEntry>[];
 
-    for (final p in onlinePeers) {
-      list.add(_PeerEntry(
-        userId: p.userId,
-        name: p.name,
-        ip: p.ip,
-        port: p.port,
-        online: true,
-        peer: p,
-      ));
+    if (!networkDown) {
+      for (final p in discoveryPeers) {
+        list.add(_PeerEntry(
+          userId: p.userId,
+          name: p.name,
+          ip: p.ip,
+          port: p.port,
+          online: true,
+          peer: p,
+        ));
+      }
     }
 
     for (final id in offlineIds) {
@@ -151,6 +190,20 @@ class _HomeScreenState extends State<HomeScreen> {
       ));
     }
 
+    if (networkDown) {
+      for (final p in discoveryPeers) {
+        if (conversationPeerIds.contains(p.userId)) continue;
+        list.add(_PeerEntry(
+          userId: p.userId,
+          name: p.name,
+          ip: p.ip,
+          port: p.port,
+          online: false,
+          peer: p,
+        ));
+      }
+    }
+
     if (!mounted || gen != _peerRefreshGeneration) return;
     setState(() => _peerList = list);
     await _hydratePreviewsFromStore(list, gen);
@@ -159,6 +212,9 @@ class _HomeScreenState extends State<HomeScreen> {
   String _subtitleForMessage(ChatMessage m) {
     final name = m.attachmentName;
     if (name != null && name.isNotEmpty) {
+      if (m.attachmentEncrypted) {
+        return 'Secure file: $name';
+      }
       return 'File: $name';
     }
     return m.text;
@@ -193,6 +249,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    _connectivitySub?.cancel();
     _discoveryDebounce?.cancel();
     widget.store.messageHistoryRevision.removeListener(_onMessageHistoryRevision);
     _fileMsgSub?.cancel();
@@ -467,6 +524,17 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget _buildProfileCard(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     final isDark = Theme.of(context).brightness == Brightness.dark;
+    final offline = _connectivityOffline;
+    final advertising = widget.discovery.isAdvertisingActive;
+    final known = _connectivityResults != null;
+    final showOnline = !known
+        ? advertising
+        : (!offline && advertising);
+    final statusLabel = !known
+        ? 'Checking network\u2026'
+        : (offline
+            ? 'Offline'
+            : (advertising ? 'Online' : 'Limited'));
 
     return Material(
       color: isDark ? cs.surfaceContainerHigh : Colors.white,
@@ -487,7 +555,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     : '?',
                 radius: 28,
                 fontSize: 22,
-                online: true,
+                online: showOnline,
               ),
               const SizedBox(width: 14),
               Expanded(
@@ -508,14 +576,22 @@ class _HomeScreenState extends State<HomeScreen> {
                         Container(
                           width: 8,
                           height: 8,
-                          decoration: const BoxDecoration(
+                          decoration: BoxDecoration(
                             shape: BoxShape.circle,
-                            color: _RingAvatar._onlineGreen,
+                            color: !known
+                                ? cs.outlineVariant
+                                : (showOnline
+                                    ? _RingAvatar._onlineGreen
+                                    : (offline
+                                        ? (isDark
+                                            ? const Color(0xFF757575)
+                                            : const Color(0xFFBDBDBD))
+                                        : Colors.amber.shade700)),
                           ),
                         ),
                         const SizedBox(width: 5),
                         Text(
-                          'Online',
+                          statusLabel,
                           style: TextStyle(
                             fontSize: 13,
                             fontWeight: FontWeight.w500,

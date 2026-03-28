@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' show max, min;
 
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
@@ -12,13 +13,70 @@ import 'package:path/path.dart' as p;
 import 'package:super_clipboard/super_clipboard.dart';
 import 'package:uuid/uuid.dart';
 
+import 'chat_crypto.dart';
 import 'connection_service.dart';
-import 'debug/app_diagnostics.dart';
 import 'device.dart';
 import 'discovery_service.dart';
 import 'message_model.dart';
 import 'message_store.dart';
 import 'transfer_manager.dart';
+
+/// Rebuilds only this message subtree when [messageId]'s [TransferState] changes,
+/// instead of calling [setState] on the whole [ChatScreen].
+class _TransferBubbleScope extends StatefulWidget {
+  const _TransferBubbleScope({
+    required this.messageId,
+    required this.builder,
+  });
+
+  final String messageId;
+  final Widget Function(BuildContext context, TransferState? t) builder;
+
+  @override
+  State<_TransferBubbleScope> createState() => _TransferBubbleScopeState();
+}
+
+class _TransferBubbleScopeState extends State<_TransferBubbleScope> {
+  StreamSubscription<void>? _sub;
+  TransferState? _last;
+
+  @override
+  void initState() {
+    super.initState();
+    _last = TransferManager.instance.transfers[widget.messageId];
+    _sub = TransferManager.instance.transferUpdates.listen((_) {
+      if (!mounted) return;
+      final t = TransferManager.instance.transfers[widget.messageId];
+      if (_transferVisualEquals(_last, t)) return;
+      _last = t;
+      setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = TransferManager.instance.transfers[widget.messageId];
+    return widget.builder(context, t);
+  }
+}
+
+bool _transferVisualEquals(TransferState? a, TransferState? b) {
+  // Do not use [identical]: [TransferState] is mutated in place during transfer.
+  if (a == null && b == null) return true;
+  if (a == null || b == null) return false;
+  return a.transferredBytes == b.transferredBytes &&
+      a.progress == b.progress &&
+      a.error == b.error &&
+      a.cancelled == b.cancelled &&
+      a.awaitingRemoteAck == b.awaitingRemoteAck &&
+      a.isSending == b.isSending;
+}
 
 class ChatScreen extends StatefulWidget {
   final DeviceInfo me;
@@ -43,9 +101,17 @@ class ChatScreen extends StatefulWidget {
 class _ChatScreenState extends State<ChatScreen> {
   static const _uuid = Uuid();
   static const _pageSize = 50;
+  /// First DB fetch: newest N messages (SQLite indexed).
+  static const _initialHistoryWindow = 100;
+  /// Each scroll-up load of older messages.
+  static const _historyBatchSize = 50;
+
   final List<ChatMessage> _allMessages = [];
   List<ChatMessage> _messages = [];
   int _displayCount = _pageSize;
+  int _totalInDb = 0;
+  bool _hasMoreOlder = false;
+  bool _loadingOlder = false;
   final TextEditingController _input = TextEditingController();
   final FocusNode _focus = FocusNode();
   final ScrollController _scroll = ScrollController();
@@ -58,19 +124,62 @@ class _ChatScreenState extends State<ChatScreen> {
 
   final List<_StagedFile> _staged = [];
 
-  StreamSubscription<void>? _transferSub;
   StreamSubscription<FileMessageEvent>? _fileMsgSub;
-  Timer? _transferThrottle;
   Timer? _connTimer;
+  Timer? _storeRevisionDebounce;
+  Timer? _scrollLoadOlderDebounce;
   DateTime? _lastAutoReconnect;
 
   String get _peerId => widget.peer.userId;
   TransferManager get _tm => TransferManager.instance;
 
+  static int _compareMessages(ChatMessage a, ChatMessage b) {
+    final c = a.timestamp.compareTo(b.timestamp);
+    if (c != 0) return c;
+    return a.id.compareTo(b.id);
+  }
+
+  void _insertMessageSorted(ChatMessage msg) {
+    var lo = 0;
+    var hi = _allMessages.length;
+    while (lo < hi) {
+      final mid = (lo + hi) >> 1;
+      if (_compareMessages(_allMessages[mid], msg) < 0) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    _allMessages.insert(lo, msg);
+  }
+
+  void _growVisibleForNewMessage() {
+    _displayCount = (_displayCount + 1).clamp(0, _allMessages.length);
+  }
+
+  /// Stable order: time, then message id (same ms from two clients).
+  void _sortMessagesInPlace() {
+    _allMessages.sort((a, b) {
+      final c = a.timestamp.compareTo(b.timestamp);
+      if (c != 0) return c;
+      return a.id.compareTo(b.id);
+    });
+  }
+
+  void _onStoreRevision() {
+    if (!mounted) return;
+    _storeRevisionDebounce?.cancel();
+    _storeRevisionDebounce = Timer(const Duration(milliseconds: 120), () {
+      if (!mounted) return;
+      unawaited(_reloadMessagesFromStore());
+    });
+  }
+
   @override
   void initState() {
     super.initState();
     _connected = widget.connections.isConnected(_peerId);
+    widget.store.messageHistoryRevision.addListener(_onStoreRevision);
 
     _prevOnMessage = widget.connections.onMessage;
     widget.connections.onMessage = (peerId, json) {
@@ -79,6 +188,11 @@ class _ChatScreenState extends State<ChatScreen> {
         setState(() => _connected = true);
       }
       if (peerId != _peerId) return;
+      final type = json['type'] as String?;
+      if (type == 'message' || type == 'message_ack') {
+        unawaited(_reloadMessagesFromStore());
+        return;
+      }
       _handleJson(json);
     };
 
@@ -90,8 +204,8 @@ class _ChatScreenState extends State<ChatScreen> {
         // immediately. Throttle only limits repeated failed dials, not recovery
         // from an unrelated earlier attempt (same idea as MsgStream re-init).
         _lastAutoReconnect = null;
-        diag('CHAT', 'onDisconnected peer=$_peerId (TCP lost)');
         setState(() => _connected = false);
+        unawaited(_onChatTcpLost());
       }
     };
 
@@ -100,15 +214,9 @@ class _ChatScreenState extends State<ChatScreen> {
       _prevOnIncoming?.call(socket, peerId);
       if (peerId == _peerId && mounted) {
         setState(() => _connected = true);
+        unawaited(_syncOutboundMessagesAfterConnect());
       }
     };
-
-    _transferSub = _tm.transferUpdates.listen((_) {
-      if (_transferThrottle?.isActive ?? false) return;
-      _transferThrottle = Timer(const Duration(milliseconds: 200), () {
-        if (mounted) setState(() {});
-      });
-    });
 
     _fileMsgSub = _tm.fileMessages.listen((event) {
       if (event.peerId != _peerId) return;
@@ -117,8 +225,9 @@ class _ChatScreenState extends State<ChatScreen> {
       if (allIdx >= 0) {
         _allMessages[allIdx] = event.message;
       } else {
-        _allMessages.add(event.message);
-        _displayCount++;
+        _insertMessageSorted(event.message);
+        _growVisibleForNewMessage();
+        _totalInDb++;
       }
       setState(() => _rebuildVisible());
       _scrollToBottom();
@@ -146,7 +255,8 @@ class _ChatScreenState extends State<ChatScreen> {
     if (HardwareKeyboard.instance.isShiftPressed) return false;
     if (!mounted) return false;
     final textReady = normalizeOutgoingMessageText(_input.text).isNotEmpty;
-    final canSend = _connected && (textReady || _staged.isNotEmpty);
+    final canSend =
+        textReady || (_connected && _staged.isNotEmpty);
     if (!canSend) return false;
     unawaited(_sendAll());
     return true;
@@ -166,6 +276,7 @@ class _ChatScreenState extends State<ChatScreen> {
   void _syncConnection() {
     if (!mounted) return;
     final socketConnected = widget.connections.isConnected(_peerId);
+    final wasConnected = _connected;
     final live = _resolveLivePeer();
     final inDiscovery =
         widget.discovery.peers.any((p) => p.userId == _peerId);
@@ -175,6 +286,9 @@ class _ChatScreenState extends State<ChatScreen> {
     if (socketConnected != _connected) {
       setState(() => _connected = socketConnected);
     }
+    if (socketConnected && !wasConnected) {
+      unawaited(_syncOutboundMessagesAfterConnect());
+    }
     if (!socketConnected && canTryReconnect) {
       final now = DateTime.now();
       if (_lastAutoReconnect != null &&
@@ -183,9 +297,6 @@ class _ChatScreenState extends State<ChatScreen> {
         return;
       }
       _lastAutoReconnect = now;
-      diag('CHAT',
-          'auto-reconnect peer=$_peerId (discovery=$inDiscovery ip=${live.ip.isNotEmpty}) '
-          'forceNew TCP');
       unawaited(
         widget.connections.connectTo(live, forceNew: true),
       );
@@ -193,14 +304,20 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _loadHistory() async {
-    final stored = await widget.store.load(_peerId);
+    _totalInDb = await widget.store.messageCount(_peerId);
+    final initial = min(_initialHistoryWindow, _totalInDb);
+    final stored =
+        initial > 0 ? await widget.store.loadRecent(_peerId, initial) : <ChatMessage>[];
     if (!mounted) return;
-    final existingIds = _allMessages.map((m) => m.id).toSet();
-    for (final m in stored) {
-      if (!existingIds.contains(m.id)) _allMessages.add(m);
+    _allMessages
+      ..clear()
+      ..addAll(stored);
+    _sortMessagesInPlace();
+    _hasMoreOlder = _allMessages.length < _totalInDb;
+    _displayCount = _pageSize.clamp(0, _allMessages.length);
+    if (_allMessages.length <= _pageSize) {
+      _displayCount = _allMessages.length;
     }
-    _allMessages.sort((a, b) => a.timestamp.compareTo(b.timestamp));
-    _displayCount = _pageSize;
     _rebuildVisible();
     unawaited(_rememberPeerRecord());
     setState(() => _loading = false);
@@ -209,6 +326,7 @@ class _ChatScreenState extends State<ChatScreen> {
         _scroll.jumpTo(_scroll.position.maxScrollExtent);
       }
     });
+    if (_connected) unawaited(_syncOutboundMessagesAfterConnect());
   }
 
   void _rebuildVisible() {
@@ -218,8 +336,10 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _onScroll() {
-    if (_scroll.position.pixels <= 50 &&
-        _displayCount < _allMessages.length) {
+    if (!_scroll.hasClients) return;
+    if (_scroll.position.pixels > 50) return;
+
+    if (_displayCount < _allMessages.length) {
       final prevMax = _scroll.position.maxScrollExtent;
       setState(() {
         _displayCount =
@@ -232,6 +352,57 @@ class _ChatScreenState extends State<ChatScreen> {
           _scroll.jumpTo(_scroll.position.pixels + (newMax - prevMax));
         }
       });
+      return;
+    }
+
+    if (_hasMoreOlder && !_loadingOlder) {
+      _scrollLoadOlderDebounce?.cancel();
+      _scrollLoadOlderDebounce = Timer(const Duration(milliseconds: 150), () {
+        if (!mounted) return;
+        if (_hasMoreOlder && !_loadingOlder) {
+          unawaited(_loadOlderBatch());
+        }
+      });
+    }
+  }
+
+  /// Loads the next chunk of older messages from SQLite (offset paging).
+  Future<void> _loadOlderBatch() async {
+    if (_loadingOlder || !_hasMoreOlder) return;
+    _loadingOlder = true;
+    try {
+      _totalInDb = await widget.store.messageCount(_peerId);
+      final l = _allMessages.length;
+      if (l >= _totalInDb) {
+        if (mounted) setState(() => _hasMoreOlder = false);
+        return;
+      }
+
+      final prevMax =
+          _scroll.hasClients ? _scroll.position.maxScrollExtent : 0.0;
+      final prevPixels =
+          _scroll.hasClients ? _scroll.position.pixels : 0.0;
+
+      final want = min(_historyBatchSize, _totalInDb - l);
+      final offset = _totalInDb - l - want;
+      final older = await widget.store.loadRange(_peerId, offset, want);
+      if (!mounted || older.isEmpty) return;
+
+      setState(() {
+        _allMessages.insertAll(0, older);
+        _sortMessagesInPlace();
+        _displayCount += older.length;
+        _rebuildVisible();
+        _hasMoreOlder = _allMessages.length < _totalInDb;
+      });
+
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!_scroll.hasClients) return;
+        final newMax = _scroll.position.maxScrollExtent;
+        _scroll.jumpTo(prevPixels + (newMax - prevMax));
+      });
+    } finally {
+      _loadingOlder = false;
     }
   }
 
@@ -239,11 +410,9 @@ class _ChatScreenState extends State<ChatScreen> {
     final socket =
         await widget.connections.connectTo(_resolveLivePeer(), forceNew: false);
     if (socket != null && mounted) {
-      diag('CHAT', 'initial connect OK peer=$_peerId');
       setState(() => _connected = true);
       unawaited(_rememberPeerRecord());
-    } else if (mounted) {
-      diag('CHAT', 'initial connect failed or cancelled peer=$_peerId');
+      unawaited(_syncOutboundMessagesAfterConnect());
     }
   }
 
@@ -261,15 +430,16 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void dispose() {
+    _storeRevisionDebounce?.cancel();
+    _scrollLoadOlderDebounce?.cancel();
+    widget.store.messageHistoryRevision.removeListener(_onStoreRevision);
     HardwareKeyboard.instance.removeHandler(_handleComposerHardwareKey);
     _connTimer?.cancel();
     _scroll.removeListener(_onScroll);
     widget.connections.onMessage = _prevOnMessage;
     widget.connections.onDisconnected = _prevOnDisconnected;
     widget.connections.onIncomingConnection = _prevOnIncoming;
-    _transferSub?.cancel();
     _fileMsgSub?.cancel();
-    _transferThrottle?.cancel();
     _input.dispose();
     _focus.dispose();
     _scroll.dispose();
@@ -281,10 +451,124 @@ class _ChatScreenState extends State<ChatScreen> {
     if (msg == null) return;
     if (!mounted) return;
     if (_allMessages.any((m) => m.id == msg.id)) return;
-    _allMessages.add(msg);
-    _displayCount++;
+    _insertMessageSorted(msg);
+    _growVisibleForNewMessage();
+    _totalInDb++;
     setState(() => _rebuildVisible());
     _scrollToBottom();
+  }
+
+  Future<void> _reloadMessagesFromStore() async {
+    _totalInDb = await widget.store.messageCount(_peerId);
+    final grow = _totalInDb > _allMessages.length ? 1 : 0;
+    final take = min(
+      _totalInDb,
+      max(_allMessages.length + grow, _initialHistoryWindow),
+    );
+    final stored =
+        take > 0 ? await widget.store.loadRecent(_peerId, take) : <ChatMessage>[];
+    if (!mounted) return;
+    _allMessages
+      ..clear()
+      ..addAll(stored);
+    _sortMessagesInPlace();
+    _hasMoreOlder = _allMessages.length < _totalInDb;
+    _displayCount = _displayCount.clamp(0, _allMessages.length);
+    if (_allMessages.length <= _pageSize) {
+      _displayCount = _allMessages.length;
+    }
+    setState(() => _rebuildVisible());
+    _scrollToBottom();
+  }
+
+  Future<void> _setMessageDelivery(String id, MessageDelivery d) async {
+    await widget.store.updateDeliveryState(_peerId, id, d);
+    if (!mounted) return;
+    final i = _allMessages.indexWhere((m) => m.id == id);
+    if (i >= 0) {
+      _allMessages[i] = _allMessages[i].copyWith(delivery: d);
+      setState(() => _rebuildVisible());
+    }
+  }
+
+  Future<void> _transmitEncryptedText(ChatMessage msg) async {
+    final b64 = await ChatCrypto.encryptMessage(
+        widget.me.userId, _peerId, msg.text);
+    if (b64 == null) {
+      await _setMessageDelivery(msg.id, MessageDelivery.undelivered);
+      return;
+    }
+    final ok = widget.connections.sendJson(_peerId, {
+      'type': 'message',
+      'id': msg.id,
+      'from': widget.me.userId,
+      'time': msg.timestamp,
+      'enc': true,
+      'ct': b64,
+    });
+    if (!ok) {
+      await _setMessageDelivery(msg.id, MessageDelivery.undelivered);
+    }
+  }
+
+  Future<void> _retryDeliveryConfirm(String messageId) async {
+    if (!widget.connections.isConnected(_peerId)) {
+      final sock = await widget.connections.connectTo(
+        _resolveLivePeer(),
+        forceNew: true,
+      );
+      if (sock == null || !mounted) return;
+      setState(() => _connected = true);
+    }
+    if (!widget.connections.isConnected(_peerId)) return;
+    final ok = widget.connections.sendJson(_peerId, {
+      'type': 'message_ack_confirm',
+      'id': messageId,
+      'from': widget.me.userId,
+    });
+    if (ok) {
+      await _setMessageDelivery(messageId, MessageDelivery.delivered);
+    }
+  }
+
+  Future<void> _resendTextMessage(ChatMessage m) async {
+    if (m.attachmentName != null) return;
+    if (m.delivery == MessageDelivery.awaitingConfirm) {
+      await _retryDeliveryConfirm(m.id);
+      return;
+    }
+    if (!widget.connections.isConnected(_peerId)) {
+      final sock = await widget.connections.connectTo(
+        _resolveLivePeer(),
+        forceNew: true,
+      );
+      if (sock == null || !mounted) return;
+      setState(() => _connected = true);
+    }
+    if (!widget.connections.isConnected(_peerId)) return;
+    await _setMessageDelivery(m.id, MessageDelivery.pending);
+    final updated = m.copyWith(delivery: MessageDelivery.pending);
+    await _transmitEncryptedText(updated);
+  }
+
+  /// TCP drop: "Sent" without ack cannot be trusted — show as undelivered.
+  Future<void> _onChatTcpLost() async {
+    await widget.store.markPendingOutgoingAsUndelivered(_peerId);
+    if (!mounted) return;
+    await _reloadMessagesFromStore();
+  }
+
+  /// After reconnect: resend ciphertext or finish the delivery handshake.
+  Future<void> _syncOutboundMessagesAfterConnect() async {
+    final list = await widget.store.loadOutboundTextNeedingSync(_peerId);
+    for (final m in list) {
+      if (m.delivery == MessageDelivery.awaitingConfirm) {
+        await _retryDeliveryConfirm(m.id);
+        continue;
+      }
+      await _resendTextMessage(m);
+    }
+    if (mounted) await _reloadMessagesFromStore();
   }
 
   // -----------------------------------------------------------------------
@@ -292,7 +576,12 @@ class _ChatScreenState extends State<ChatScreen> {
   // -----------------------------------------------------------------------
   void _stageFiles(List<_StagedFile> files) {
     if (files.isEmpty) return;
-    setState(() => _staged.addAll(files));
+    // Defer so the picker can finish dismissing before a heavy ListView rebuild
+    // (helps Android jank with many / large staged items).
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      setState(() => _staged.addAll(files));
+    });
   }
 
   Future<void> _pickFiles() async {
@@ -379,7 +668,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final hasFiles = _staged.isNotEmpty;
 
     if (!hasText && !hasFiles) return;
-    if (!_connected) return;
+    if (hasFiles && !_connected) return;
 
     if (hasText) {
       final live = _resolveLivePeer();
@@ -389,19 +678,25 @@ class _ChatScreenState extends State<ChatScreen> {
         text: toSend,
         timestamp: DateTime.now().millisecondsSinceEpoch,
         isMine: true,
+        delivery: _connected
+            ? MessageDelivery.pending
+            : MessageDelivery.undelivered,
       );
-      widget.connections.sendJson(_peerId, msg.toJson());
-      _allMessages.add(msg);
-      _displayCount++;
+      _insertMessageSorted(msg);
+      _growVisibleForNewMessage();
       setState(() => _rebuildVisible());
-      await widget.store.add(
+      final inserted = await widget.store.add(
         _peerId,
         msg,
         peerDisplayName: live.name,
         peerIp: live.ip,
         peerTcpPort: live.port,
       );
+      if (inserted) _totalInDb++;
       _input.clear();
+      if (_connected) {
+        await _transmitEncryptedText(msg);
+      }
     }
 
     if (hasFiles) {
@@ -437,10 +732,6 @@ class _ChatScreenState extends State<ChatScreen> {
 
   void _cancelTransfer(String fileId) {
     _tm.cancel(fileId);
-  }
-
-  void _retryTransfer(String fileId) {
-    _tm.retry(fileId);
   }
 
   void _openFolder(String filePath) {
@@ -481,6 +772,8 @@ class _ChatScreenState extends State<ChatScreen> {
                   _allMessages.clear();
                   _messages.clear();
                   _displayCount = _pageSize;
+                  _totalInDb = 0;
+                  _hasMoreOlder = false;
                 });
               }
             },
@@ -727,8 +1020,8 @@ class _ChatScreenState extends State<ChatScreen> {
                                 style: TextStyle(color: cs.outline)))
                         : ListView.builder(
                             controller: _scroll,
-                            padding: const EdgeInsets.symmetric(
-                                horizontal: 14, vertical: 8),
+                            cacheExtent: 400,
+                            padding: const EdgeInsets.fromLTRB(14, 16, 14, 12),
                             itemCount: _messages.length,
                             itemBuilder: (ctx, i) {
                               final widgets = <Widget>[];
@@ -738,9 +1031,12 @@ class _ChatScreenState extends State<ChatScreen> {
                                         _messages[i].timestamp)));
                               }
                               widgets.add(_buildBubble(ctx, _messages[i]));
-                              return Column(
+                              return RepaintBoundary(
+                                child: Column(
                                   mainAxisSize: MainAxisSize.min,
-                                  children: widgets);
+                                  children: widgets,
+                                ),
+                              );
                             },
                           ),
               ),
@@ -824,6 +1120,9 @@ class _ChatScreenState extends State<ChatScreen> {
                                   fit: BoxFit.cover,
                                   width: 64,
                                   height: 64,
+                                  cacheWidth: 128,
+                                  cacheHeight: 128,
+                                  filterQuality: FilterQuality.low,
                                   errorBuilder: (_, _, _) => Icon(
                                     Icons.broken_image,
                                     size: 24,
@@ -884,6 +1183,36 @@ class _ChatScreenState extends State<ChatScreen> {
   // -----------------------------------------------------------------------
   // Bubbles — reads transfer state from TransferManager
   // -----------------------------------------------------------------------
+  String _deliveryStatusLabel(MessageDelivery d) {
+    switch (d) {
+      case MessageDelivery.delivered:
+        return 'Delivered';
+      case MessageDelivery.awaitingConfirm:
+        return 'Confirming';
+      case MessageDelivery.pending:
+        return 'Sent';
+      case MessageDelivery.undelivered:
+        return 'Undelivered';
+    }
+  }
+
+  void _showCopyFeedback(String message) {
+    if (!mounted) return;
+    final mq = MediaQuery.of(context);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        duration: const Duration(milliseconds: 1800),
+        behavior: SnackBarBehavior.floating,
+        margin: EdgeInsets.only(
+          left: 16,
+          right: 16,
+          bottom: mq.viewInsets.bottom + mq.padding.bottom + 96,
+        ),
+      ),
+    );
+  }
+
   void _copyMessage(ChatMessage m) {
     String text;
     if (m.attachmentPath != null && _isImage(m.attachmentName ?? '')) {
@@ -894,15 +1223,7 @@ class _ChatScreenState extends State<ChatScreen> {
       text = m.text;
     }
     Clipboard.setData(ClipboardData(text: text));
-    if (mounted) {
-      ScaffoldMessenger.of(context)
-        ..clearSnackBars()
-        ..showSnackBar(const SnackBar(
-          content: Text('Copied to clipboard'),
-          duration: Duration(seconds: 1),
-          behavior: SnackBarBehavior.floating,
-        ));
-    }
+    _showCopyFeedback('Copied to clipboard');
   }
 
   void _showCopyMenu(BuildContext context, Offset position, ChatMessage m) {
@@ -926,13 +1247,31 @@ class _ChatScreenState extends State<ChatScreen> {
   static const _cancelledAmber = Color(0xFFFF9500);
 
   Widget _buildBubble(BuildContext context, ChatMessage m) {
+    if (m.attachmentName != null) {
+      return _TransferBubbleScope(
+        messageId: m.id,
+        builder: (context, t) => _buildBubbleWithTransfer(context, m, t),
+      );
+    }
+    return _buildBubbleWithTransfer(context, m, _tm.transfers[m.id]);
+  }
+
+  Widget _buildBubbleWithTransfer(
+    BuildContext context,
+    ChatMessage m,
+    TransferState? t,
+  ) {
     final cs = Theme.of(context).colorScheme;
     final mine = m.isMine;
-    final t = _tm.transfers[m.id];
     final isDark = Theme.of(context).brightness == Brightness.dark;
 
     final bool isFailed = t != null && t.error != null && !t.cancelled;
     final bool isCancelled = t != null && t.cancelled;
+    final bool awaitingPeerAck = t != null &&
+        t.isSending &&
+        t.awaitingRemoteAck &&
+        t.error == null &&
+        !t.cancelled;
     final bool dismissedAborted = m.transferDismissed &&
         m.attachmentName != null &&
         t == null;
@@ -997,6 +1336,43 @@ class _ChatScreenState extends State<ChatScreen> {
             else
               _buildSelectableMessageBody(m.text, textColor),
 
+            if (mine &&
+                m.attachmentName == null &&
+                m.delivery != null) ...[
+              const SizedBox(height: 6),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    _deliveryStatusLabel(m.delivery!),
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: subtleColor,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  if (m.delivery == MessageDelivery.undelivered ||
+                      m.delivery == MessageDelivery.awaitingConfirm) ...[
+                    const SizedBox(width: 10),
+                    InkWell(
+                      onTap: () => unawaited(_resendTextMessage(m)),
+                      child: Text(
+                        'Resend',
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: mine ? Colors.white : cs.primary,
+                          fontWeight: FontWeight.w700,
+                          decoration: TextDecoration.underline,
+                          decorationColor:
+                              mine ? Colors.white70 : cs.primary,
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ],
+
             if (t != null) ...[
               const SizedBox(height: 8),
               if (isFailed || isCancelled) ...[
@@ -1024,19 +1400,48 @@ class _ChatScreenState extends State<ChatScreen> {
                 Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    if (t.isSending)
-                      _actionButton(
-                        label: 'Retry',
-                        icon: Icons.refresh,
-                        color: _iMessageBlue,
-                        onTap: () => _retryTransfer(m.id),
-                      ),
-                    if (t.isSending) const SizedBox(width: 8),
                     _actionButton(
                       label: 'Dismiss',
                       icon: Icons.close,
                       color: cs.outline,
                       onTap: () => _tm.dismiss(m.id),
+                    ),
+                  ],
+                ),
+              ] else if (awaitingPeerAck) ...[
+                LinearProgressIndicator(
+                  value: null,
+                  minHeight: 5,
+                  borderRadius: BorderRadius.circular(99),
+                  backgroundColor: mine ? Colors.white24 : cs.outlineVariant,
+                  color: mine ? Colors.white : _iMessageBlue,
+                ),
+                const SizedBox(height: 6),
+                Row(
+                  children: [
+                    Icon(Icons.verified_outlined, size: 16, color: subtleColor),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        'Verifying with peer…',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: subtleColor,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    _actionButton(
+                      label: 'Cancel',
+                      icon: Icons.close,
+                      color: cs.outline,
+                      onTap: () => _cancelTransfer(m.id),
                     ),
                   ],
                 ),
@@ -1122,12 +1527,9 @@ class _ChatScreenState extends State<ChatScreen> {
     );
     if (!context.mounted) return;
     if (selected == 'path') {
-      final messenger = ScaffoldMessenger.of(context);
       await Clipboard.setData(ClipboardData(text: path));
       if (!context.mounted) return;
-      messenger.showSnackBar(
-        const SnackBar(content: Text('File path copied')),
-      );
+      _showCopyFeedback('File path copied');
     } else if (selected == 'image') {
       await _copyImageBytesToClipboard(path, fileName);
     }
@@ -1138,15 +1540,9 @@ class _ChatScreenState extends State<ChatScreen> {
     final clipboard = SystemClipboard.instance;
     if (clipboard == null) {
       if (!context.mounted) return;
-      final messenger = ScaffoldMessenger.of(context);
-      messenger.showSnackBar(
-        const SnackBar(
-          content: Text('Image clipboard is not available here'),
-        ),
-      );
+      _showCopyFeedback('Image clipboard is not available here');
       return;
     }
-    final messenger = ScaffoldMessenger.of(context);
     try {
       final bytes = await File(path).readAsBytes();
       if (!context.mounted) return;
@@ -1168,14 +1564,10 @@ class _ChatScreenState extends State<ChatScreen> {
       }
       await clipboard.write([item]);
       if (!context.mounted) return;
-      messenger.showSnackBar(
-        const SnackBar(content: Text('Image copied to clipboard')),
-      );
+      _showCopyFeedback('Image copied to clipboard');
     } catch (e) {
       if (!context.mounted) return;
-      messenger.showSnackBar(
-        SnackBar(content: Text('Could not copy image: $e')),
-      );
+      _showCopyFeedback('Could not copy image: $e');
     }
   }
 
@@ -1236,6 +1628,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Widget _buildAttachment(
       BuildContext context, ChatMessage m, bool mine, bool strikeAborted) {
+    final cs = Theme.of(context).colorScheme;
     final isDark = Theme.of(context).brightness == Brightness.dark;
     final hasPath = m.attachmentPath != null;
     final isImg = hasPath && _isImage(m.attachmentName!);
@@ -1254,6 +1647,34 @@ class _ChatScreenState extends State<ChatScreen> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        if (m.attachmentEncrypted)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 6),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  Icons.lock_outline,
+                  size: 14,
+                  color: mine
+                      ? Colors.white.withValues(alpha: 0.85)
+                      : (isDark ? Colors.greenAccent.shade100 : cs.primary),
+                ),
+                const SizedBox(width: 5),
+                Text(
+                  'Secure transfer',
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 0.2,
+                    color: mine
+                        ? Colors.white.withValues(alpha: 0.9)
+                        : (isDark ? Colors.greenAccent.shade100 : cs.primary),
+                  ),
+                ),
+              ],
+            ),
+          ),
         if (isImg && !strikeAborted)
           Padding(
             padding: const EdgeInsets.only(bottom: 6),
@@ -1397,7 +1818,8 @@ class _ChatScreenState extends State<ChatScreen> {
         builder: (context, _) {
           final textReady =
               normalizeOutgoingMessageText(_input.text).isNotEmpty;
-          final canSend = _connected && (textReady || _staged.isNotEmpty);
+          final canSend =
+              textReady || (_connected && _staged.isNotEmpty);
           return Row(
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [

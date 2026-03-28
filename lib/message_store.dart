@@ -3,11 +3,16 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:path/path.dart' as p;
+import 'package:sqflite/sqflite.dart';
 
 import 'message_model.dart';
+import 'sqflite_init.dart';
 
 class MessageStore {
-  late final String _basePath;
+  late final String _dataDir;
+  late final Database _db;
+
   final Map<String, Future<void>> _locks = {};
 
   /// Notified after [clear] / [clearAll]; [HomeScreen] resets chat previews.
@@ -43,11 +48,193 @@ class MessageStore {
 
   MessageStore._();
 
+  static const int _dbVersion = 2;
+  static const int _defaultChatTcpPort = 4041;
+
   static Future<MessageStore> init() async {
+    await ensureSqfliteInitialized();
     final store = MessageStore._();
-    store._basePath = '${await _resolveDataDir()}/localchat_messages';
-    await Directory(store._basePath).create(recursive: true);
+    store._dataDir = await _resolveDataDir();
+    await Directory(store._dataDir).create(recursive: true);
+
+    final dbPath = p.join(store._dataDir, 'localchat.db');
+    store._db = await openDatabase(
+      dbPath,
+      version: _dbVersion,
+      onCreate: (db, version) async {
+        await _createSchema(db);
+      },
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          await db.execute('''
+            ALTER TABLE messages ADD COLUMN attachment_encrypted INTEGER NOT NULL DEFAULT 0
+          ''');
+        }
+      },
+    );
+    await store._migrateFromLegacyJsonIfNeeded();
     return store;
+  }
+
+  static Future<void> _createSchema(Database db) async {
+    await db.execute('''
+      CREATE TABLE peers (
+        peer_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        ip TEXT NOT NULL,
+        port INTEGER NOT NULL
+      )
+    ''');
+    await db.execute('''
+      CREATE TABLE messages (
+        peer_id TEXT NOT NULL,
+        id TEXT NOT NULL,
+        sender_id TEXT NOT NULL,
+        text TEXT NOT NULL,
+        timestamp INTEGER NOT NULL,
+        is_mine INTEGER NOT NULL,
+        attachment_name TEXT,
+        attachment_path TEXT,
+        attachment_size INTEGER,
+        attachment_encrypted INTEGER NOT NULL DEFAULT 0,
+        transfer_dismissed INTEGER NOT NULL DEFAULT 0,
+        delivery TEXT,
+        PRIMARY KEY (peer_id, id)
+      )
+    ''');
+    await db.execute(
+      'CREATE INDEX idx_messages_peer_time ON messages(peer_id, timestamp)',
+    );
+  }
+
+  /// One-time import from `localchat_messages/*.json` and `_peers.json`.
+  Future<void> _migrateFromLegacyJsonIfNeeded() async {
+    final legacyDir = Directory(p.join(_dataDir, 'localchat_messages'));
+    if (!await legacyDir.exists()) return;
+
+    final peersCount = Sqflite.firstIntValue(
+      await _db.rawQuery('SELECT COUNT(*) FROM peers'),
+    );
+    final peersFile = File(p.join(legacyDir.path, '_peers.json'));
+    if ((peersCount == null || peersCount == 0) && await peersFile.exists()) {
+      try {
+        final raw = await peersFile.readAsString();
+        final map = jsonDecode(raw) as Map<String, dynamic>;
+        final batch = _db.batch();
+        for (final e in map.entries) {
+          final id = e.key;
+          final v = e.value as Map<String, dynamic>;
+          batch.insert(
+            'peers',
+            {
+              'peer_id': id,
+              'name': v['name'] as String? ?? 'Unknown',
+              'ip': v['ip'] as String? ?? '',
+              'port': (v['port'] as num?)?.toInt() ?? _defaultChatTcpPort,
+            },
+            conflictAlgorithm: ConflictAlgorithm.replace,
+          );
+        }
+        await batch.commit(noResult: true);
+        try {
+          await peersFile.delete();
+        } catch (_) {}
+      } catch (_) {}
+    }
+
+    final msgCount = Sqflite.firstIntValue(
+      await _db.rawQuery('SELECT COUNT(*) FROM messages'),
+    );
+    if (msgCount != null && msgCount > 0) return;
+
+    try {
+      await for (final entity in legacyDir.list()) {
+        if (entity is! File) continue;
+        final name = p.basename(entity.path);
+        if (!name.endsWith('.json') || name.startsWith('_')) continue;
+        final peerId = name.replaceAll('.json', '');
+        if (peerId.isEmpty) continue;
+
+        final raw = await entity.readAsString();
+        final list = jsonDecode(raw) as List;
+        final batch = _db.batch();
+        for (final item in list) {
+          final m = item as Map<String, dynamic>;
+          batch.insert(
+            'messages',
+            _messageMapFromLegacyJson(peerId, m),
+            conflictAlgorithm: ConflictAlgorithm.replace,
+          );
+        }
+        await batch.commit(noResult: true);
+      }
+      await _deleteLegacyJsonFiles(legacyDir);
+    } catch (_) {}
+  }
+
+  Future<void> _deleteLegacyJsonFiles(Directory legacyDir) async {
+    try {
+      await for (final entity in legacyDir.list()) {
+        if (entity is File) {
+          await entity.delete();
+        }
+      }
+      try {
+        await legacyDir.delete();
+      } catch (_) {}
+    } catch (_) {}
+  }
+
+  static Map<String, Object?> _messageMapFromLegacyJson(
+    String peerId,
+    Map<String, dynamic> m,
+  ) {
+    return {
+      'peer_id': peerId,
+      'id': m['id'] as String,
+      'sender_id': m['senderId'] as String,
+      'text': m['text'] as String,
+      'timestamp': m['timestamp'] as int,
+      'is_mine': (m['isMine'] as bool?) == true ? 1 : 0,
+      'attachment_name': m['attachmentName'] as String?,
+      'attachment_path': m['attachmentPath'] as String?,
+      'attachment_size': (m['attachmentSize'] as num?)?.toInt(),
+      'transfer_dismissed': (m['transferDismissed'] as bool?) == true ? 1 : 0,
+      'delivery': m['delivery'] as String?,
+    };
+  }
+
+  static Map<String, Object?> _messageToRow(String peerId, ChatMessage msg) {
+    return {
+      'peer_id': peerId,
+      'id': msg.id,
+      'sender_id': msg.senderId,
+      'text': msg.text,
+      'timestamp': msg.timestamp,
+      'is_mine': msg.isMine ? 1 : 0,
+      'attachment_name': msg.attachmentName,
+      'attachment_path': msg.attachmentPath,
+      'attachment_size': msg.attachmentSize,
+      'attachment_encrypted': msg.attachmentEncrypted ? 1 : 0,
+      'transfer_dismissed': msg.transferDismissed ? 1 : 0,
+      'delivery': msg.delivery?.name,
+    };
+  }
+
+  static ChatMessage _rowToMessage(Map<String, Object?> row) {
+    return ChatMessage.fromStore({
+      'id': row['id'] as String,
+      'senderId': row['sender_id'] as String,
+      'text': row['text'] as String,
+      'timestamp': row['timestamp'] as int,
+      'isMine': (row['is_mine'] as int) != 0,
+      'attachmentName': row['attachment_name'] as String?,
+      'attachmentPath': row['attachment_path'] as String?,
+      'attachmentSize': (row['attachment_size'] as int?),
+      'attachmentEncrypted': (row['attachment_encrypted'] as int? ?? 0) != 0,
+      'transferDismissed': (row['transfer_dismissed'] as int? ?? 0) != 0,
+      'delivery': row['delivery'] as String?,
+    });
   }
 
   static Future<String> _resolveDataDir() async {
@@ -79,19 +266,12 @@ class MessageStore {
     }
   }
 
-  File _file(String peerId) => File('$_basePath/$peerId.json');
-  File get _peersFile => File('$_basePath/_peers.json');
-
-  static const int _defaultChatTcpPort = 4041;
-
   // ---------------------------------------------------------------------------
-  // Peer metadata cache — persists name/ip/port so offline peers still show up
+  // Peer metadata
   // ---------------------------------------------------------------------------
-  /// Merges with existing row so a new [name] or [ip] that is empty does not
-  /// wipe a previously saved display name (e.g. from hello before discovery).
   Future<void> savePeerInfo(
       String peerId, String name, String ip, int port) async {
-    final all = await _loadPeersMap();
+    final all = await loadAllPeerInfos();
     final prev = all[peerId];
 
     var resolvedName = name.trim();
@@ -112,94 +292,153 @@ class MessageStore {
     }
     if (resolvedPort <= 0) resolvedPort = _defaultChatTcpPort;
 
-    all[peerId] = {
-      'name': resolvedName,
-      'ip': resolvedIp,
-      'port': resolvedPort,
-    };
-    await _peersFile.writeAsString(jsonEncode(all));
+    await _db.insert(
+      'peers',
+      {
+        'peer_id': peerId,
+        'name': resolvedName,
+        'ip': resolvedIp,
+        'port': resolvedPort,
+      },
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
   }
 
   Future<Map<String, Map<String, dynamic>>> loadAllPeerInfos() async {
-    return _loadPeersMap();
-  }
-
-  Future<Map<String, Map<String, dynamic>>> _loadPeersMap() async {
-    final f = _peersFile;
-    if (!await f.exists()) return {};
-    try {
-      final raw = await f.readAsString();
-      final decoded = jsonDecode(raw) as Map<String, dynamic>;
-      return decoded
-          .map((k, v) => MapEntry(k, Map<String, dynamic>.from(v as Map)));
-    } catch (_) {
-      return {};
-    }
+    final rows = await _db.query('peers');
+    return {
+      for (final r in rows)
+        r['peer_id'] as String: {
+          'name': r['name'],
+          'ip': r['ip'],
+          'port': r['port'],
+        }
+    };
   }
 
   Future<List<String>> listPeerIds() async {
-    final dir = Directory(_basePath);
-    if (!await dir.exists()) return [];
-    final ids = <String>[];
-    await for (final f in dir.list()) {
-      if (f is! File) continue;
-      final name = f.path.split(Platform.pathSeparator).last;
-      if (name.startsWith('_') || !name.endsWith('.json')) continue;
-      ids.add(name.replaceAll('.json', ''));
-    }
+    final rows = await _db.rawQuery('''
+      SELECT peer_id FROM peers
+      UNION
+      SELECT DISTINCT peer_id FROM messages
+    ''');
+    final ids = rows.map((r) => r['peer_id'] as String).toSet().toList();
+    ids.sort();
     return ids;
   }
 
   /// Peers with at least one stored message (for offline chat list).
   Future<List<String>> listPeerIdsWithConversation() async {
-    final ids = await listPeerIds();
-    if (ids.isEmpty) return [];
-    final flags = await Future.wait(
-      ids.map((id) async {
-        final f = _file(id);
-        if (!await f.exists()) return (id, false);
-        try {
-          // Empty history is stored as `[]` — skip full read/decode.
-          if (await f.length() <= 2) return (id, false);
-        } catch (_) {
-          return (id, false);
-        }
-        return (id, (await load(id)).isNotEmpty);
-      }),
-    );
-    return [for (final p in flags) if (p.$2) p.$1];
+    final rows = await _db.rawQuery('''
+      SELECT peer_id FROM messages GROUP BY peer_id HAVING COUNT(*) > 0
+    ''');
+    return [for (final r in rows) r['peer_id'] as String];
   }
 
+  /// All messages for [peerId], oldest first (indexed query).
   Future<List<ChatMessage>> load(String peerId) async {
     return _withLock(peerId, () async {
-      final f = _file(peerId);
-      if (!await f.exists()) return <ChatMessage>[];
-      try {
-        final raw = await f.readAsString();
-        final list = jsonDecode(raw) as List;
-        return list
-            .map((e) => ChatMessage.fromStore(e as Map<String, dynamic>))
-            .toList();
-      } catch (_) {
-        return <ChatMessage>[];
-      }
+      final rows = await _db.query(
+        'messages',
+        where: 'peer_id = ?',
+        whereArgs: [peerId],
+        orderBy: 'timestamp ASC, id ASC',
+      );
+      return rows.map(_rowToMessage).toList();
+    });
+  }
+
+  /// Recent [limit] messages for [peerId], oldest first — for chat lazy load.
+  Future<List<ChatMessage>> loadRecent(String peerId, int limit) async {
+    if (limit <= 0) return [];
+    return _withLock(peerId, () async {
+      final rows = await _db.query(
+        'messages',
+        where: 'peer_id = ?',
+        whereArgs: [peerId],
+        orderBy: 'timestamp DESC, id ASC',
+        limit: limit,
+      );
+      final list = rows.map(_rowToMessage).toList();
+      return list.reversed.toList();
+    });
+  }
+
+  Future<int> messageCount(String peerId) async {
+    final n = Sqflite.firstIntValue(
+      await _db.rawQuery(
+        'SELECT COUNT(*) FROM messages WHERE peer_id = ?',
+        [peerId],
+      ),
+    );
+    return n ?? 0;
+  }
+
+  /// Contiguous slice in chronological order (for loading older history by offset).
+  /// [offset] is 0-based into the full ascending-sorted list for this peer.
+  Future<List<ChatMessage>> loadRange(
+    String peerId,
+    int offset,
+    int limit,
+  ) async {
+    if (limit <= 0) return [];
+    return _withLock(peerId, () async {
+      final rows = await _db.query(
+        'messages',
+        where: 'peer_id = ?',
+        whereArgs: [peerId],
+        orderBy: 'timestamp ASC, id ASC',
+        offset: offset,
+        limit: limit,
+      );
+      return rows.map(_rowToMessage).toList();
+    });
+  }
+
+  /// Outgoing text rows that may need resend / delivery confirm after reconnect.
+  /// Avoids scanning the full history ([load]) when syncing TCP.
+  Future<List<ChatMessage>> loadOutboundTextNeedingSync(String peerId) async {
+    return _withLock(peerId, () async {
+      final rows = await _db.query(
+        'messages',
+        where: 'peer_id = ? AND is_mine = 1 AND '
+            '(attachment_name IS NULL OR attachment_name = ?) AND '
+            'delivery IN (?, ?, ?)',
+        whereArgs: [
+          peerId,
+          '',
+          MessageDelivery.pending.name,
+          MessageDelivery.undelivered.name,
+          MessageDelivery.awaitingConfirm.name,
+        ],
+        orderBy: 'timestamp ASC, id ASC',
+      );
+      return rows.map(_rowToMessage).toList();
     });
   }
 
   /// Persists [msg]. Optionally updates peer display row when any of
   /// [peerDisplayName] / [peerIp] / [peerTcpPort] hints are provided.
-  Future<void> add(
+  /// Returns true if a new message row was written (false if [msg.id] already existed).
+  Future<bool> add(
     String peerId,
     ChatMessage msg, {
     String? peerDisplayName,
     String? peerIp,
     int? peerTcpPort,
   }) async {
+    var inserted = false;
     await _withLock(peerId, () async {
-      final messages = await _loadRawUnsafe(peerId);
-      if (messages.any((m) => m['id'] == msg.id)) return;
-      messages.add(msg.toStore());
-      await _file(peerId).writeAsString(jsonEncode(messages));
+      final existing = await _db.query(
+        'messages',
+        columns: ['id'],
+        where: 'peer_id = ? AND id = ?',
+        whereArgs: [peerId, msg.id],
+        limit: 1,
+      );
+      if (existing.isNotEmpty) return;
+      await _db.insert('messages', _messageToRow(peerId, msg));
+      inserted = true;
     });
 
     final hasName = peerDisplayName != null && peerDisplayName.trim().isNotEmpty;
@@ -213,69 +452,82 @@ class MessageStore {
         peerTcpPort ?? _defaultChatTcpPort,
       );
     }
+    return inserted;
+  }
+
+  Future<void> markPendingOutgoingAsUndelivered(String peerId) async {
+    await _withLock(peerId, () async {
+      final n = await _db.rawUpdate(
+        '''
+        UPDATE messages SET delivery = ?
+        WHERE peer_id = ? AND is_mine = 1
+          AND delivery IN (?, ?)
+        ''',
+        [
+          MessageDelivery.undelivered.name,
+          peerId,
+          MessageDelivery.pending.name,
+          MessageDelivery.awaitingConfirm.name,
+        ],
+      );
+      if (n > 0) messageHistoryRevision.value++;
+    });
+  }
+
+  Future<void> updateDeliveryState(
+    String peerId,
+    String messageId,
+    MessageDelivery delivery,
+  ) async {
+    await _withLock(peerId, () async {
+      await _db.update(
+        'messages',
+        {'delivery': delivery.name},
+        where: 'peer_id = ? AND id = ?',
+        whereArgs: [peerId, messageId],
+      );
+    });
+    messageHistoryRevision.value++;
   }
 
   Future<void> updateAttachmentPath(
       String peerId, String messageId, String path) async {
     return _withLock(peerId, () async {
-      final messages = await _loadRawUnsafe(peerId);
-      for (final m in messages) {
-        if (m['id'] == messageId) {
-          m['attachmentPath'] = path;
-          break;
-        }
-      }
-      await _file(peerId).writeAsString(jsonEncode(messages));
+      await _db.update(
+        'messages',
+        {'attachment_path': path},
+        where: 'peer_id = ? AND id = ?',
+        whereArgs: [peerId, messageId],
+      );
     });
   }
 
   Future<void> updateTransferDismissed(
       String peerId, String messageId) async {
     return _withLock(peerId, () async {
-      final messages = await _loadRawUnsafe(peerId);
-      for (final m in messages) {
-        if (m['id'] == messageId) {
-          m['transferDismissed'] = true;
-          break;
-        }
-      }
-      await _file(peerId).writeAsString(jsonEncode(messages));
+      await _db.update(
+        'messages',
+        {'transfer_dismissed': 1},
+        where: 'peer_id = ? AND id = ?',
+        whereArgs: [peerId, messageId],
+      );
     });
-  }
-
-  Future<List<Map<String, dynamic>>> _loadRawUnsafe(String peerId) async {
-    final f = _file(peerId);
-    if (!await f.exists()) return [];
-    try {
-      final raw = await f.readAsString();
-      return (jsonDecode(raw) as List).cast<Map<String, dynamic>>();
-    } catch (_) {
-      return [];
-    }
   }
 
   Future<void> clear(String peerId) async {
     return _withLock(peerId, () async {
-      final f = _file(peerId);
-      if (await f.exists()) await f.delete();
+      await _db.delete('messages', where: 'peer_id = ?', whereArgs: [peerId]);
       _notifyHistoryCleared(all: false, peerId: peerId);
     });
   }
 
   Future<void> clearAll() async {
-    final dir = Directory(_basePath);
-    if (await dir.exists()) {
-      await for (final f in dir.list()) {
-        if (f is File) await f.delete();
-      }
-    }
+    await _db.delete('messages');
+    await _db.delete('peers');
     _notifyHistoryCleared(all: true);
   }
 
   Future<void> removePeerInfo(String peerId) async {
-    final all = await _loadPeersMap();
-    if (all.remove(peerId) != null) {
-      await _peersFile.writeAsString(jsonEncode(all));
-    }
+    await _db.delete('peers', where: 'peer_id = ?', whereArgs: [peerId]);
   }
 }

@@ -4,7 +4,6 @@ import 'dart:io';
 
 import 'package:uuid/uuid.dart';
 
-import 'debug/app_diagnostics.dart';
 import 'device.dart';
 
 /// Chat TCP stream — behavior matches [MsgStream] in `netstreamer.cpp`:
@@ -53,7 +52,6 @@ class ConnectionService {
 
   Future<void> startServer() async {
     _server = await ServerSocket.bind(InternetAddress.anyIPv4, tcpPort);
-    diag('TCP', 'Chat server listening on 0.0.0.0:$tcpPort');
     _server!.listen(_handleIncoming);
     _startHeartbeat();
   }
@@ -92,7 +90,6 @@ class ConnectionService {
     if (!ok) return;
     _pingTimeoutTimers[peerId] = Timer(pingTimeout, () {
       if (_pendingPingIds[peerId] != pingId) return;
-      diag('TCP', 'Ping timeout peer=$peerId → disconnect');
       unawaited(disconnect(peerId));
     });
   }
@@ -120,19 +117,14 @@ class ConnectionService {
     if (existing != null) return existing;
 
     try {
-      diag('TCP',
-          'Outbound connect → ${peer.userId} at ${peer.ip}:${peer.port} (forceNew=$forceNew)');
       final socket = await _connectChatSocket(peer.ip, peer.port);
 
       _attachSocket(socket, peer.userId);
 
       sendJson(peer.userId,
           {'type': 'hello', 'id': me.userId, 'name': me.displayName});
-      diag('TCP', 'Connected + hello sent to ${peer.userId}');
       return socket;
-    } catch (e, st) {
-      diagError('TCP', e, st);
-      diag('TCP', 'Connect failed to ${peer.userId} ${peer.ip}:${peer.port}');
+    } catch (_) {
       return null;
     }
   }
@@ -163,11 +155,8 @@ class ConnectionService {
           _buffers.remove(peerId);
           if (had) {
             _clearPingState(id);
-            diag('TCP', 'Socket onDone (remote closed) peer=$peerId');
             onDisconnected?.call(peerId!);
           }
-        } else {
-          diag('TCP', 'Socket onDone before hello (peer unknown)');
         }
       },
       onError: (e, st) {
@@ -177,12 +166,8 @@ class ConnectionService {
           _buffers.remove(peerId);
           if (had) {
             _clearPingState(id);
-            diagError('TCP', e, st);
-            diag('TCP', 'Socket error, disconnected peer=$peerId');
             onDisconnected?.call(peerId!);
           }
-        } else {
-          diagError('TCP', e, st);
         }
       },
       cancelOnError: true,
@@ -238,9 +223,7 @@ class ConnectionService {
     try {
       socket.write('${jsonEncode(json)}\n');
       return true;
-    } catch (e, st) {
-      diagError('TCP', e, st);
-      diag('TCP', 'sendJson failed → drop socket peer=$peerId');
+    } catch (_) {
       _clearPingState(peerId);
       _sockets.remove(peerId);
       _buffers.remove(peerId);
@@ -257,7 +240,6 @@ class ConnectionService {
 
   Future<void> disconnect(String peerId) async {
     _clearPingState(peerId);
-    diag('TCP', 'disconnect() called peer=$peerId');
     final s = _sockets.remove(peerId);
     _buffers.remove(peerId);
     try {
@@ -273,7 +255,6 @@ class ConnectionService {
   Future<void> disconnectAllPeers() async {
     final ids = List<String>.from(_sockets.keys);
     if (ids.isEmpty) return;
-    diag('TCP', 'disconnectAllPeers: closing ${ids.length} socket(s)');
     for (final id in ids) {
       await disconnect(id);
     }

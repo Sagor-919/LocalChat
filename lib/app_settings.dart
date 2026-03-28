@@ -5,13 +5,13 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import 'debug/app_diagnostics.dart';
-
 class AppSettings {
   static final instance = AppSettings._();
   AppSettings._();
 
-  static const _kFirstLaunchOnboardingComplete = 'first_launch_onboarding_complete';
+  static const _kFirstLaunchOnboardingComplete =
+      'first_launch_onboarding_complete';
+
   /// Legacy key from notification-only first run; counts as onboarding done.
   static const _kFirstLaunchPermissionsDone = 'first_launch_permissions_done';
 
@@ -21,11 +21,12 @@ class AppSettings {
   final notificationsMuted = ValueNotifier<bool>(false);
   final downloadPath = ValueNotifier<String>('');
   final startWithWindows = ValueNotifier<bool>(false);
+
   /// Desktop: when true, closing the window hides to tray and keeps LAN active; when false, exit the app.
   final desktopRunInBackground = ValueNotifier<bool>(true);
 
-  /// When false, [diag] / [AppDiagnostics.log] are no-ops (UI panel still opens).
-  final diagnosticsLoggingEnabled = ValueNotifier<bool>(true);
+  /// When true, file payloads use X25519 ECDH + HKDF + AES-256-GCM per chunk.
+  final secureFileTransfer = ValueNotifier<bool>(false);
 
   Future<void> init() async {
     _prefs = await SharedPreferences.getInstance();
@@ -60,16 +61,12 @@ class AppSettings {
       startWithWindows.value = await _readStartupRegistry();
     }
 
-    diagnosticsLoggingEnabled.value =
-        _prefs.getBool('diagnostics_logging_enabled') ?? true;
-    AppDiagnostics.instance
-        .setLoggingAllowed(diagnosticsLoggingEnabled.value);
+    secureFileTransfer.value = _prefs.getBool('secure_file_transfer') ?? false;
   }
 
-  Future<void> setDiagnosticsLoggingEnabled(bool enabled) async {
-    diagnosticsLoggingEnabled.value = enabled;
-    await _prefs.setBool('diagnostics_logging_enabled', enabled);
-    AppDiagnostics.instance.setLoggingAllowed(enabled);
+  Future<void> setSecureFileTransfer(bool enabled) async {
+    secureFileTransfer.value = enabled;
+    await _prefs.setBool('secure_file_transfer', enabled);
   }
 
   Future<void> setThemeMode(ThemeMode mode) async {
@@ -118,16 +115,20 @@ class AppSettings {
       await Process.run('reg', [
         'add',
         r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
-        '/v', 'LocalChat',
-        '/t', 'REG_SZ',
-        '/d', exe,
+        '/v',
+        'LocalChat',
+        '/t',
+        'REG_SZ',
+        '/d',
+        exe,
         '/f',
       ]);
     } else {
       await Process.run('reg', [
         'delete',
         r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
-        '/v', 'LocalChat',
+        '/v',
+        'LocalChat',
         '/f',
       ]);
     }
@@ -138,7 +139,8 @@ class AppSettings {
       final result = await Process.run('reg', [
         'query',
         r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
-        '/v', 'LocalChat',
+        '/v',
+        'LocalChat',
       ]);
       return result.exitCode == 0;
     } catch (_) {
