@@ -4,14 +4,12 @@ import 'dart:io';
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
-import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path/path.dart' as p;
 import 'package:super_clipboard/super_clipboard.dart';
-import 'package:url_launcher/url_launcher.dart';
 import 'package:uuid/uuid.dart';
 
 import 'connection_service.dart';
@@ -125,6 +123,27 @@ class _ChatScreenState extends State<ChatScreen> {
     _loadHistory();
 
     _connTimer = Timer.periodic(const Duration(seconds: 2), (_) => _syncConnection());
+
+    HardwareKeyboard.instance.addHandler(_handleComposerHardwareKey);
+  }
+
+  /// Desktop: Enter sends (Shift+Enter keeps newline). Uses hardware handler so
+  /// it does not compete with a second [Focus] on the same [FocusNode].
+  bool _handleComposerHardwareKey(KeyEvent event) {
+    if (!_isDesktop) return false;
+    if (!_focus.hasFocus) return false;
+    if (event is! KeyDownEvent) return false;
+    final k = event.logicalKey;
+    if (k != LogicalKeyboardKey.enter && k != LogicalKeyboardKey.numpadEnter) {
+      return false;
+    }
+    if (HardwareKeyboard.instance.isShiftPressed) return false;
+    if (!mounted) return false;
+    final textReady = normalizeOutgoingMessageText(_input.text).isNotEmpty;
+    final canSend = _connected && (textReady || _staged.isNotEmpty);
+    if (!canSend) return false;
+    unawaited(_sendAll());
+    return true;
   }
 
   PeerDevice _resolveLivePeer() {
@@ -221,6 +240,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void dispose() {
+    HardwareKeyboard.instance.removeHandler(_handleComposerHardwareKey);
     _connTimer?.cancel();
     _scroll.removeListener(_onScroll);
     widget.connections.onMessage = _prevOnMessage;
@@ -323,9 +343,18 @@ class _ChatScreenState extends State<ChatScreen> {
   // -----------------------------------------------------------------------
   // Send — text + all staged files via TransferManager
   // -----------------------------------------------------------------------
+  /// Trims leading/trailing whitespace; normalizes NBSP; caps runs of 3+ newlines to 2.
+  static String normalizeOutgoingMessageText(String raw) {
+    var s = raw.replaceAll('\u00a0', ' ').trim();
+    while (s.contains('\n\n\n')) {
+      s = s.replaceAll('\n\n\n', '\n\n');
+    }
+    return s;
+  }
+
   Future<void> _sendAll() async {
-    final text = _input.text.trim();
-    final hasText = text.isNotEmpty;
+    final toSend = normalizeOutgoingMessageText(_input.text);
+    final hasText = toSend.isNotEmpty;
     final hasFiles = _staged.isNotEmpty;
 
     if (!hasText && !hasFiles) return;
@@ -336,7 +365,7 @@ class _ChatScreenState extends State<ChatScreen> {
       final msg = ChatMessage(
         id: _uuid.v4(),
         senderId: widget.me.userId,
-        text: text,
+        text: toSend,
         timestamp: DateTime.now().millisecondsSinceEpoch,
         isMine: true,
       );
@@ -539,100 +568,17 @@ class _ChatScreenState extends State<ChatScreen> {
   bool get _isDesktop =>
       !kIsWeb && (Platform.isWindows || Platform.isLinux || Platform.isMacOS);
 
-  static final _linkRe = RegExp(
-    r'(https?://[^\s]+)|([\w.+-]+@[\w-]+\.\w[\w.]*)',
-    caseSensitive: false,
-  );
+  static TextStyle _messageBodyStyle(Color color) => TextStyle(
+        color: color,
+        fontSize: 15,
+        height: 1.35,
+      );
 
-  void _openUrl(String raw) async {
-    final uri = raw.contains('@') && !raw.startsWith('http')
-        ? Uri.parse('mailto:$raw')
-        : Uri.parse(raw);
-    try {
-      await launchUrl(uri, mode: LaunchMode.externalApplication);
-    } catch (_) {}
-  }
-
-  Widget _buildRichText(String text, Color color, bool mine) {
-    final cs = Theme.of(context).colorScheme;
-    final matches = _linkRe.allMatches(text).toList();
-    if (matches.isEmpty) {
-      return Text(text,
-          style: TextStyle(color: color, fontSize: 15, height: 1.3));
-    }
-
-    final spans = <InlineSpan>[];
-    int last = 0;
-    for (final m in matches) {
-      if (m.start > last) {
-        spans.add(TextSpan(
-            text: text.substring(last, m.start),
-            style: TextStyle(color: color, fontSize: 15, height: 1.3)));
-      }
-      final link = m.group(0)!;
-      final linkColor = mine ? Colors.white : cs.primary;
-      spans.add(TextSpan(
-        text: link,
-        style: TextStyle(
-          color: linkColor,
-          fontSize: 15,
-          height: 1.3,
-          decoration: TextDecoration.underline,
-          decorationColor: linkColor,
-          fontWeight: FontWeight.w600,
-        ),
-        recognizer: TapGestureRecognizer()
-          ..onTap = () {
-            if (!kIsWeb && Platform.isAndroid) {
-              _showLinkMenu(link);
-            } else {
-              _openUrl(link);
-            }
-          },
-      ));
-      last = m.end;
-    }
-    if (last < text.length) {
-      spans.add(TextSpan(
-          text: text.substring(last),
-          style: TextStyle(color: color, fontSize: 15, height: 1.3)));
-    }
-    return Text.rich(TextSpan(children: spans));
-  }
-
-  void _showLinkMenu(String link) {
-    showModalBottomSheet(
-      context: context,
-      builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ListTile(
-              leading: const Icon(Icons.open_in_browser),
-              title: Text(link.contains('@') ? 'Send Email' : 'Open in Browser'),
-              onTap: () {
-                Navigator.pop(ctx);
-                _openUrl(link);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.copy),
-              title: const Text('Copy'),
-              onTap: () {
-                Navigator.pop(ctx);
-                Clipboard.setData(ClipboardData(text: link));
-                ScaffoldMessenger.of(context)
-                  ..clearSnackBars()
-                  ..showSnackBar(const SnackBar(
-                    content: Text('Copied to clipboard'),
-                    duration: Duration(seconds: 1),
-                    behavior: SnackBarBehavior.floating,
-                  ));
-              },
-            ),
-          ],
-        ),
-      ),
+  /// Preserves line breaks and spacing; selection toolbar includes Copy.
+  Widget _buildSelectableMessageBody(String text, Color color) {
+    return SelectableText(
+      text,
+      style: _messageBodyStyle(color),
     );
   }
 
@@ -997,13 +943,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 ? Colors.white.withValues(alpha: 0.6)
                 : (isDark ? Colors.white60 : Colors.black54));
 
-    return Align(
-      alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
-      child: GestureDetector(
-        onLongPress: () => _copyMessage(m),
-        onSecondaryTapUp: (details) =>
-            _showCopyMenu(context, details.globalPosition, m),
-        child: Container(
+    final bubble = Container(
         constraints: const BoxConstraints(maxWidth: 520),
         margin: const EdgeInsets.symmetric(vertical: 3),
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
@@ -1034,7 +974,7 @@ class _ChatScreenState extends State<ChatScreen> {
             if (m.attachmentName != null)
               _buildAttachment(context, m, mine, dismissedAborted)
             else
-              _buildRichText(m.text, textColor, mine),
+              _buildSelectableMessageBody(m.text, textColor),
 
             if (t != null) ...[
               const SizedBox(height: 8),
@@ -1121,8 +1061,18 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
           ],
         ),
-      ),
-      ),
+    );
+
+    return Align(
+      alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
+      child: m.attachmentName != null
+          ? GestureDetector(
+              onLongPress: () => _copyMessage(m),
+              onSecondaryTapUp: (details) =>
+                  _showCopyMenu(context, details.globalPosition, m),
+              child: bubble,
+            )
+          : bubble,
     );
   }
 
@@ -1412,12 +1362,20 @@ class _ChatScreenState extends State<ChatScreen> {
   // -----------------------------------------------------------------------
   Widget _buildComposer(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    final canSend =
-        _connected && (_input.text.trim().isNotEmpty || _staged.isNotEmpty);
+    final textReady =
+        normalizeOutgoingMessageText(_input.text).isNotEmpty;
+    final canSend = _connected && (textReady || _staged.isNotEmpty);
+
+    final hint = _staged.isNotEmpty
+        ? 'Add a message (optional)...'
+        : (_isDesktop
+            ? 'Message — Enter send · Shift+Enter new line'
+            : 'Message');
 
     return Padding(
       padding: const EdgeInsets.fromLTRB(12, 6, 12, 12),
       child: Row(
+        crossAxisAlignment: CrossAxisAlignment.end,
         children: [
           IconButton.filled(
             onPressed: _pickFiles,
@@ -1450,24 +1408,42 @@ class _ChatScreenState extends State<ChatScreen> {
           ],
           const SizedBox(width: 8),
           Expanded(
-            child: TextField(
-              controller: _input,
-              focusNode: _focus,
-              textInputAction: TextInputAction.send,
-              onSubmitted: (_) => unawaited(_sendAll()),
-              onChanged: (_) => setState(() {}),
-              decoration: InputDecoration(
-                hintText: _staged.isNotEmpty
-                    ? 'Add a message (optional)...'
-                    : 'Message',
-                filled: true,
-                fillColor: cs.surfaceContainerHighest,
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(999),
-                  borderSide: BorderSide.none,
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(
+                minHeight: 48,
+                maxHeight: 168,
+              ),
+              child: Material(
+                color: cs.surfaceContainerHighest,
+                borderRadius: BorderRadius.circular(22),
+                clipBehavior: Clip.antiAlias,
+                child: TextField(
+                  controller: _input,
+                  focusNode: _focus,
+                  keyboardType: TextInputType.multiline,
+                  textInputAction: TextInputAction.newline,
+                  minLines: 1,
+                  maxLines: null,
+                  textAlignVertical: TextAlignVertical.top,
+                  scrollPadding: const EdgeInsets.only(bottom: 120, top: 16),
+                  style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                        height: 1.35,
+                      ),
+                  scrollPhysics: const ClampingScrollPhysics(),
+                  onChanged: (_) => setState(() {}),
+                  decoration: InputDecoration(
+                    hintText: hint,
+                    hintStyle: TextStyle(
+                      color: cs.onSurfaceVariant.withValues(alpha: 0.65),
+                      fontSize: 13,
+                    ),
+                    border: InputBorder.none,
+                    filled: false,
+                    isDense: true,
+                    contentPadding:
+                        const EdgeInsets.fromLTRB(16, 12, 16, 12),
+                  ),
                 ),
-                contentPadding:
-                    const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
               ),
             ),
           ),
