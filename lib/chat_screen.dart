@@ -13,6 +13,7 @@ import 'package:super_clipboard/super_clipboard.dart';
 import 'package:uuid/uuid.dart';
 
 import 'connection_service.dart';
+import 'debug/app_diagnostics.dart';
 import 'device.dart';
 import 'discovery_service.dart';
 import 'message_model.dart';
@@ -85,6 +86,11 @@ class _ChatScreenState extends State<ChatScreen> {
     widget.connections.onDisconnected = (peerId) {
       _prevOnDisconnected?.call(peerId);
       if (peerId == _peerId && mounted) {
+        // After a real TCP loss, allow the next [_syncConnection] tick to retry
+        // immediately. Throttle only limits repeated failed dials, not recovery
+        // from an unrelated earlier attempt (same idea as MsgStream re-init).
+        _lastAutoReconnect = null;
+        diag('CHAT', 'onDisconnected peer=$_peerId (TCP lost)');
         setState(() => _connected = false);
       }
     };
@@ -153,15 +159,23 @@ class _ChatScreenState extends State<ChatScreen> {
     return widget.peer;
   }
 
+  /// Keeps UI state in sync with [ConnectionService.isConnected] (TCP, like
+  /// MsgStream’s socket) and retries outbound connect when discovery still lists
+  /// the peer (LAN present). No “internet” API — unreachable LAN matches TCP
+  /// timeout / disconnect, same as `netstreamer.cpp`.
   void _syncConnection() {
     if (!mounted) return;
     final socketConnected = widget.connections.isConnected(_peerId);
-    final peerOnline =
+    final live = _resolveLivePeer();
+    final inDiscovery =
         widget.discovery.peers.any((p) => p.userId == _peerId);
+    final hasLanAddress = live.ip.trim().isNotEmpty;
+    // UDP may have pruned the peer after Wi‑Fi flap; we still have IP from route/store.
+    final canTryReconnect = inDiscovery || hasLanAddress;
     if (socketConnected != _connected) {
       setState(() => _connected = socketConnected);
     }
-    if (!socketConnected && peerOnline) {
+    if (!socketConnected && canTryReconnect) {
       final now = DateTime.now();
       if (_lastAutoReconnect != null &&
           now.difference(_lastAutoReconnect!) <
@@ -169,8 +183,12 @@ class _ChatScreenState extends State<ChatScreen> {
         return;
       }
       _lastAutoReconnect = now;
+      diag('CHAT',
+          'auto-reconnect peer=$_peerId (discovery=$inDiscovery ip=${live.ip.isNotEmpty}) '
+          'forceNew TCP');
       unawaited(
-          widget.connections.connectTo(_resolveLivePeer(), forceNew: false));
+        widget.connections.connectTo(live, forceNew: true),
+      );
     }
   }
 
@@ -221,8 +239,11 @@ class _ChatScreenState extends State<ChatScreen> {
     final socket =
         await widget.connections.connectTo(_resolveLivePeer(), forceNew: false);
     if (socket != null && mounted) {
+      diag('CHAT', 'initial connect OK peer=$_peerId');
       setState(() => _connected = true);
       unawaited(_rememberPeerRecord());
+    } else if (mounted) {
+      diag('CHAT', 'initial connect failed or cancelled peer=$_peerId');
     }
   }
 
@@ -1362,97 +1383,101 @@ class _ChatScreenState extends State<ChatScreen> {
   // -----------------------------------------------------------------------
   Widget _buildComposer(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    final textReady =
-        normalizeOutgoingMessageText(_input.text).isNotEmpty;
-    final canSend = _connected && (textReady || _staged.isNotEmpty);
-
     final hint = _staged.isNotEmpty
         ? 'Add a message (optional)...'
         : (_isDesktop
             ? 'Message — Enter send · Shift+Enter new line'
             : 'Message');
 
+    // Rebuild only the composer row on typing — not the whole chat (avoids jank).
     return Padding(
       padding: const EdgeInsets.fromLTRB(12, 6, 12, 12),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.end,
-        children: [
-          IconButton.filled(
-            onPressed: _pickFiles,
-            tooltip: 'Attach Files',
-            icon: const Icon(Icons.attach_file),
-          ),
-          if (_isDesktop) ...[
-            const SizedBox(width: 4),
-            IconButton.filled(
-              onPressed: _pickFolder,
-              tooltip: 'Attach Folder',
-              style: IconButton.styleFrom(
-                backgroundColor: cs.secondaryContainer,
-                foregroundColor: cs.onSecondaryContainer,
+      child: ListenableBuilder(
+        listenable: _input,
+        builder: (context, _) {
+          final textReady =
+              normalizeOutgoingMessageText(_input.text).isNotEmpty;
+          final canSend = _connected && (textReady || _staged.isNotEmpty);
+          return Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              IconButton.filled(
+                onPressed: _pickFiles,
+                tooltip: 'Attach Files',
+                icon: const Icon(Icons.attach_file),
               ),
-              icon: const Icon(Icons.folder),
-            ),
-          ],
-          if (!kIsWeb && Platform.isAndroid) ...[
-            const SizedBox(width: 4),
-            IconButton.filled(
-              onPressed: _pickGallery,
-              tooltip: 'Gallery',
-              style: IconButton.styleFrom(
-                backgroundColor: cs.secondaryContainer,
-                foregroundColor: cs.onSecondaryContainer,
-              ),
-              icon: const Icon(Icons.photo_library),
-            ),
-          ],
-          const SizedBox(width: 8),
-          Expanded(
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(
-                minHeight: 48,
-                maxHeight: 168,
-              ),
-              child: Material(
-                color: cs.surfaceContainerHighest,
-                borderRadius: BorderRadius.circular(22),
-                clipBehavior: Clip.antiAlias,
-                child: TextField(
-                  controller: _input,
-                  focusNode: _focus,
-                  keyboardType: TextInputType.multiline,
-                  textInputAction: TextInputAction.newline,
-                  minLines: 1,
-                  maxLines: null,
-                  textAlignVertical: TextAlignVertical.top,
-                  scrollPadding: const EdgeInsets.only(bottom: 120, top: 16),
-                  style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                        height: 1.35,
+              if (_isDesktop) ...[
+                const SizedBox(width: 4),
+                IconButton.filled(
+                  onPressed: _pickFolder,
+                  tooltip: 'Attach Folder',
+                  style: IconButton.styleFrom(
+                    backgroundColor: cs.secondaryContainer,
+                    foregroundColor: cs.onSecondaryContainer,
+                  ),
+                  icon: const Icon(Icons.folder),
+                ),
+              ],
+              if (!kIsWeb && Platform.isAndroid) ...[
+                const SizedBox(width: 4),
+                IconButton.filled(
+                  onPressed: _pickGallery,
+                  tooltip: 'Gallery',
+                  style: IconButton.styleFrom(
+                    backgroundColor: cs.secondaryContainer,
+                    foregroundColor: cs.onSecondaryContainer,
+                  ),
+                  icon: const Icon(Icons.photo_library),
+                ),
+              ],
+              const SizedBox(width: 8),
+              Expanded(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(
+                    minHeight: 48,
+                    maxHeight: 168,
+                  ),
+                  child: Material(
+                    color: cs.surfaceContainerHighest,
+                    borderRadius: BorderRadius.circular(22),
+                    clipBehavior: Clip.antiAlias,
+                    child: TextField(
+                      controller: _input,
+                      focusNode: _focus,
+                      keyboardType: TextInputType.multiline,
+                      textInputAction: TextInputAction.newline,
+                      minLines: 1,
+                      maxLines: null,
+                      textAlignVertical: TextAlignVertical.top,
+                      scrollPadding: const EdgeInsets.only(bottom: 120, top: 16),
+                      style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                            height: 1.35,
+                          ),
+                      scrollPhysics: const ClampingScrollPhysics(),
+                      decoration: InputDecoration(
+                        hintText: hint,
+                        hintStyle: TextStyle(
+                          color: cs.onSurfaceVariant.withValues(alpha: 0.65),
+                          fontSize: 13,
+                        ),
+                        border: InputBorder.none,
+                        filled: false,
+                        isDense: true,
+                        contentPadding:
+                            const EdgeInsets.fromLTRB(16, 12, 16, 12),
                       ),
-                  scrollPhysics: const ClampingScrollPhysics(),
-                  onChanged: (_) => setState(() {}),
-                  decoration: InputDecoration(
-                    hintText: hint,
-                    hintStyle: TextStyle(
-                      color: cs.onSurfaceVariant.withValues(alpha: 0.65),
-                      fontSize: 13,
                     ),
-                    border: InputBorder.none,
-                    filled: false,
-                    isDense: true,
-                    contentPadding:
-                        const EdgeInsets.fromLTRB(16, 12, 16, 12),
                   ),
                 ),
               ),
-            ),
-          ),
-          const SizedBox(width: 8),
-          IconButton.filled(
-            onPressed: canSend ? () => unawaited(_sendAll()) : null,
-            icon: const Icon(Icons.send),
-          ),
-        ],
+              const SizedBox(width: 8),
+              IconButton.filled(
+                onPressed: canSend ? () => unawaited(_sendAll()) : null,
+                icon: const Icon(Icons.send),
+              ),
+            ],
+          );
+        },
       ),
     );
   }

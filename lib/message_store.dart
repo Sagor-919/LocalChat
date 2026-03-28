@@ -155,7 +155,17 @@ class MessageStore {
     final ids = await listPeerIds();
     if (ids.isEmpty) return [];
     final flags = await Future.wait(
-      ids.map((id) async => (id, (await load(id)).isNotEmpty)),
+      ids.map((id) async {
+        final f = _file(id);
+        if (!await f.exists()) return (id, false);
+        try {
+          // Empty history is stored as `[]` — skip full read/decode.
+          if (await f.length() <= 2) return (id, false);
+        } catch (_) {
+          return (id, false);
+        }
+        return (id, (await load(id)).isNotEmpty);
+      }),
     );
     return [for (final p in flags) if (p.$2) p.$1];
   }

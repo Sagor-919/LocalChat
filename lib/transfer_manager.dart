@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
 import 'connection_service.dart';
+import 'debug/app_diagnostics.dart';
 import 'file_transfer_service.dart';
 import 'message_model.dart';
 import 'message_store.dart';
@@ -98,6 +99,7 @@ class TransferManager {
     _receiver!.onFileComplete = _onReceiveComplete;
     _receiver!.onFileError = _onReceiveError;
     await _receiver!.startServer();
+    diag('FILE', 'Incoming file server bound on 0.0.0.0:$kFileTransferPort');
   }
 
   /// Called from main.dart when a file_notify arrives over the chat TCP.
@@ -161,6 +163,8 @@ class TransferManager {
     );
     transfers[fileId] = t;
     if (!notified) {
+      diag('FILE',
+          'send blocked: file_notify not sent (no chat TCP) peer=$peerId file=$fileName');
       t.error =
           'Not connected — wait for peer or pull down to refresh peers, then retry.';
       _notify();
@@ -197,6 +201,8 @@ class TransferManager {
     final sender = FileSender();
     t.sender = sender;
 
+    diag('FILE',
+        'send start peer=${t.peerId} file=${t.fileName} id=${t.fileId} → $peerIp:$kFileTransferPort (${t.totalBytes} bytes)');
     try {
       await sender.send(
         host: peerIp,
@@ -212,7 +218,9 @@ class TransferManager {
       );
       transfers.remove(t.fileId);
       _notify();
-    } catch (e) {
+      diag('FILE', 'send complete id=${t.fileId} peer=${t.peerId}');
+    } catch (e, st) {
+      diagError('FILE', e, st);
       t.error = e.toString();
       _notify();
     } finally {
@@ -374,6 +382,7 @@ class TransferManager {
     final t = transfers[fileId];
     if (t == null) return;
     final peerId = t.peerId;
+    diag('FILE', 'receive error id=$fileId peer=$peerId: $error');
     t.error = error;
     _notify();
     unawaited(_emitStoredFileMessageForPreview(peerId, fileId));

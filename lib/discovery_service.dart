@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 
+import 'debug/app_diagnostics.dart';
 import 'device.dart';
 
 class DiscoveryService {
@@ -28,6 +29,13 @@ class DiscoveryService {
   List<InternetAddress> _cachedBroadcastTargets = [];
   void Function()? onPeersChanged;
 
+  /// When non-null, peers for which this returns true are **not** pruned for
+  /// UDP silence — avoids dropping from the list while chat TCP is still up.
+  bool Function(String peerId)? hasActiveChatTcp;
+
+  /// True after [start] completes; used to guard [rebindUdpSocket].
+  bool _started = false;
+
   DiscoveryService({required this.me});
 
   List<PeerDevice> get peers => _peers.values.toList();
@@ -39,29 +47,8 @@ class DiscoveryService {
       } catch (_) {}
     }
 
-    // reusePort is unsupported on Android; reuseAddress:true has caused
-    // reusePort-related failures on some Android builds — keep both off there.
-    final reuseAddr = !Platform.isAndroid;
-    _socket = await RawDatagramSocket.bind(
-      InternetAddress.anyIPv4,
-      udpPort,
-      reuseAddress: reuseAddr,
-      reusePort: false,
-    );
-    _socket!.broadcastEnabled = true;
-
-    _joinMulticastGroups();
-
-    _socket!.listen((event) {
-      if (event != RawSocketEvent.read) return;
-      final dg = _socket!.receive();
-      if (dg == null) return;
-
-      try {
-        final msg = utf8.decode(dg.data);
-        _handleMessage(msg, dg.address.address);
-      } catch (_) {}
-    });
+    await _bindUdpSocket();
+    _attachDatagramListener();
 
     unawaited(_refreshBroadcastTargets());
     _broadcastTargetsTimer =
@@ -73,8 +60,71 @@ class DiscoveryService {
     _cleanupTimer = Timer.periodic(
         const Duration(seconds: 2), (_) => _removeStale());
     _broadcast();
+    _started = true;
+    diag('UDP',
+        'Discovery started: port=$udpPort, beacon every ${broadcastInterval.inSeconds}s, '
+        'stale after ${staleTimeout.inSeconds}s, multicast=$_multicastGroup');
   }
 
+  Future<void> _bindUdpSocket() async {
+    final reuseAddr = !Platform.isAndroid;
+    _socket = await RawDatagramSocket.bind(
+      InternetAddress.anyIPv4,
+      udpPort,
+      reuseAddress: reuseAddr,
+      reusePort: false,
+    );
+    _socket!.broadcastEnabled = true;
+    _joinMulticastGroups();
+  }
+
+  void _attachDatagramListener() {
+    final s = _socket;
+    if (s == null) return;
+    s.listen((event) {
+      if (event != RawSocketEvent.read) return;
+      final dg = s.receive();
+      if (dg == null) return;
+
+      try {
+        final msg = utf8.decode(dg.data);
+        _handleMessage(msg, dg.address.address);
+      } catch (_) {}
+    });
+  }
+
+  /// After Wi‑Fi/VPN changes, the old [RawDatagramSocket] may stop receiving
+  /// multicast/broadcast until the process restarts — same as “restart app fixes it”.
+  /// Close and rebind so discovery works again without killing the process.
+  Future<void> rebindUdpSocket() async {
+    if (!_started) return;
+    diag('UDP', 'rebindUdpSocket: rebinding UDP :$udpPort (fix stale interface)');
+    try {
+      _socket?.close();
+    } catch (_) {}
+    _socket = null;
+
+    if (Platform.isAndroid) {
+      try {
+        await _androidDiscovery.invokeMethod<void>('acquireMulticastLock');
+      } catch (_) {}
+    }
+
+    await _bindUdpSocket();
+    _attachDatagramListener();
+    await _refreshBroadcastTargets();
+    _joinMulticastGroups();
+    _broadcast();
+    await Future<void>.delayed(const Duration(milliseconds: 150));
+    _broadcast();
+    await Future<void>.delayed(const Duration(milliseconds: 150));
+    _broadcast();
+    diag('UDP',
+        'rebindUdpSocket done: targets=${_cachedBroadcastTargets.length}, burst sent');
+  }
+
+  /// Joins multicast on the default socket and per IPv4 interface. Safe to call
+  /// again after Wi‑Fi/VPN changes (see [rebindUdpSocket]).
   void _joinMulticastGroups() {
     final s = _socket;
     if (s == null) return;
@@ -96,6 +146,11 @@ class DiscoveryService {
         }
       });
     } catch (_) {}
+  }
+
+  /// App resumed — refresh targets and rebind UDP so receive path works again.
+  Future<void> recoverAfterNetworkOrResume() async {
+    await rebindUdpSocket();
   }
 
   /// Subnet broadcast(s) for Wi‑Fi/LAN; global broadcast is unreliable on many Androids.
@@ -189,6 +244,7 @@ class DiscoveryService {
         port: port,
         lastSeen: DateTime.now(),
       );
+      diag('UDP', 'Peer discovered: $userId at $senderIp:$port ($name)');
     }
     onPeersChanged?.call();
   }
@@ -196,12 +252,21 @@ class DiscoveryService {
   void _removeStale() {
     final now = DateTime.now();
     final before = _peers.length;
-    _peers.removeWhere(
-        (_, p) => now.difference(p.lastSeen) > staleTimeout);
-    if (_peers.length != before) onPeersChanged?.call();
+    _peers.removeWhere((id, p) {
+      if (hasActiveChatTcp?.call(id) == true) return false;
+      return now.difference(p.lastSeen) > staleTimeout;
+    });
+    if (_peers.length != before) {
+      diag('UDP',
+          'Stale prune: ${before - _peers.length} removed (>${staleTimeout.inSeconds}s silent), '
+          'remaining=${_peers.length}');
+      onPeersChanged?.call();
+    }
   }
 
   void stop() {
+    diag('UDP', 'Discovery stop()');
+    _started = false;
     _broadcastTargetsTimer?.cancel();
     _broadcastTargetsTimer = null;
     _broadcastTimer?.cancel();

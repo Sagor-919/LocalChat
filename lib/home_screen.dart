@@ -44,6 +44,9 @@ class _HomeScreenState extends State<HomeScreen> {
   /// cannot overwrite the UI after a newer discovery snapshot.
   int _peerRefreshGeneration = 0;
 
+  /// Coalesce rapid UDP discovery callbacks into one refresh + disk pass.
+  Timer? _discoveryDebounce;
+
   void _onMessageHistoryRevision() {
     final sig = widget.store.consumePendingHistoryClear();
     if (sig == null) return;
@@ -73,14 +76,7 @@ class _HomeScreenState extends State<HomeScreen> {
       unawaited(_syncPreviewFromStore(e.peerId));
     });
 
-    widget.discovery.onPeersChanged = () {
-      if (mounted) {
-        for (final p in widget.discovery.peers) {
-          widget.store.savePeerInfo(p.userId, p.name, p.ip, p.port);
-        }
-        _refreshPeerList();
-      }
-    };
+    widget.discovery.onPeersChanged = _onDiscoveryPeersChanged;
 
     _prevOnMessage = widget.connections.onMessage;
     widget.connections.onMessage = (peerId, json) {
@@ -102,6 +98,17 @@ class _HomeScreenState extends State<HomeScreen> {
         }
       }
     };
+  }
+
+  void _onDiscoveryPeersChanged() {
+    _discoveryDebounce?.cancel();
+    _discoveryDebounce = Timer(const Duration(milliseconds: 400), () {
+      if (!mounted) return;
+      for (final p in widget.discovery.peers) {
+        unawaited(widget.store.savePeerInfo(p.userId, p.name, p.ip, p.port));
+      }
+      unawaited(_refreshPeerList());
+    });
   }
 
   Future<void> _refreshPeerList() async {
@@ -186,6 +193,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    _discoveryDebounce?.cancel();
     widget.store.messageHistoryRevision.removeListener(_onMessageHistoryRevision);
     _fileMsgSub?.cancel();
     widget.discovery.onPeersChanged = null;

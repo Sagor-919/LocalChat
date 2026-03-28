@@ -5,6 +5,8 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'debug/app_diagnostics.dart';
+
 class AppSettings {
   static final instance = AppSettings._();
   AppSettings._();
@@ -21,6 +23,9 @@ class AppSettings {
   final startWithWindows = ValueNotifier<bool>(false);
   /// Desktop: when true, closing the window hides to tray and keeps LAN active; when false, exit the app.
   final desktopRunInBackground = ValueNotifier<bool>(true);
+
+  /// When false, [diag] / [AppDiagnostics.log] are no-ops (UI panel still opens).
+  final diagnosticsLoggingEnabled = ValueNotifier<bool>(true);
 
   Future<void> init() async {
     _prefs = await SharedPreferences.getInstance();
@@ -54,6 +59,17 @@ class AppSettings {
     if (Platform.isWindows) {
       startWithWindows.value = await _readStartupRegistry();
     }
+
+    diagnosticsLoggingEnabled.value =
+        _prefs.getBool('diagnostics_logging_enabled') ?? true;
+    AppDiagnostics.instance
+        .setLoggingAllowed(diagnosticsLoggingEnabled.value);
+  }
+
+  Future<void> setDiagnosticsLoggingEnabled(bool enabled) async {
+    diagnosticsLoggingEnabled.value = enabled;
+    await _prefs.setBool('diagnostics_logging_enabled', enabled);
+    AppDiagnostics.instance.setLoggingAllowed(enabled);
   }
 
   Future<void> setThemeMode(ThemeMode mode) async {

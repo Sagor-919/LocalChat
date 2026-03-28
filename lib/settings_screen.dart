@@ -11,6 +11,7 @@ import 'android_app_control.dart';
 import 'android_storage_access.dart';
 import 'app_branding.dart';
 import 'app_settings.dart';
+import 'debug/diagnostics_panel_screen.dart';
 import 'message_store.dart';
 
 class SettingsScreen extends StatefulWidget {
@@ -292,6 +293,56 @@ class _SettingsScreenState extends State<SettingsScreen>
                   ),
                 );
               },
+            ),
+          ),
+          const SizedBox(height: 16),
+
+          _sectionLabel(context, 'DIAGNOSTICS'),
+          _card(
+            isDark: isDark,
+            cs: cs,
+            child: Column(
+              children: [
+                ValueListenableBuilder<bool>(
+                  valueListenable: _settings.diagnosticsLoggingEnabled,
+                  builder: (_, enabled, _) {
+                    return SwitchListTile(
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(16)),
+                      secondary: Icon(
+                        Icons.bug_report_outlined,
+                        color: cs.primary,
+                      ),
+                      title: const Text('Diagnostic logging'),
+                      subtitle: const Text(
+                        'Record TCP, UDP discovery, chat, and file-transfer '
+                        'events with timestamps. Turn off when stable to reduce work.',
+                      ),
+                      value: enabled,
+                      onChanged: (v) => _settings.setDiagnosticsLoggingEnabled(v),
+                    );
+                  },
+                ),
+                ListTile(
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(16)),
+                  leading: Icon(Icons.terminal, color: cs.primary),
+                  title: const Text('Open diagnostic log'),
+                  subtitle: const Text(
+                    'Scrollable timeline — copy all or clear. '
+                    'Disable logging above or set kAppDiagnosticsEnabled=false in '
+                    'lib/debug/app_diagnostics.dart to remove.',
+                  ),
+                  trailing: const Icon(Icons.chevron_right),
+                  onTap: () {
+                    Navigator.of(context).push(
+                      MaterialPageRoute<void>(
+                        builder: (_) => const DiagnosticsPanelScreen(),
+                      ),
+                    );
+                  },
+                ),
+              ],
             ),
           ),
           const SizedBox(height: 16),

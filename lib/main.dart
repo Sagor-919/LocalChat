@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
@@ -12,6 +13,7 @@ import 'app_branding.dart';
 import 'app_settings.dart';
 import 'chat_screen.dart';
 import 'connection_service.dart';
+import 'debug/app_diagnostics.dart';
 import 'device.dart';
 import 'first_launch_prompt.dart';
 import 'discovery_service.dart';
@@ -30,6 +32,37 @@ late MessageStore _store;
 final FlutterLocalNotificationsPlugin _notifications =
     FlutterLocalNotificationsPlugin();
 bool _appInForeground = true;
+
+/// Last connectivity snapshot for online/offline edge detection.
+List<ConnectivityResult>? _lastConnectivityResults;
+
+bool _connectivityIsOffline(List<ConnectivityResult> results) {
+  return results.length == 1 && results.first == ConnectivityResult.none;
+}
+
+/// After a real network drop, TCP sockets can be zombies and UDP receive can
+/// stick to a dead interface — same as restarting the app. Clear chat sockets
+/// then rebind discovery so home + chat can reconnect without restart.
+Future<void> _restoreLanAfterLinkRecovery() async {
+  diag('APP', 'restoreLanAfterLinkRecovery: disconnect all TCP + rebind UDP');
+  await _connections.disconnectAllPeers();
+  await _discovery.rebindUdpSocket();
+}
+
+void _onConnectivityChanged(List<ConnectivityResult> results) {
+  final offline = _connectivityIsOffline(results);
+  final wasOffline = _lastConnectivityResults != null &&
+      _connectivityIsOffline(_lastConnectivityResults!);
+  _lastConnectivityResults = List<ConnectivityResult>.from(results);
+
+  if (offline && !wasOffline) {
+    diag('APP',
+        'Connectivity offline → closing all chat TCP sockets (UDP may already be silent)');
+    unawaited(_connections.disconnectAllPeers());
+  } else if (!offline && wasOffline) {
+    unawaited(_restoreLanAfterLinkRecovery());
+  }
+}
 
 /// Desktop: show message toasts when the window is hidden or minimized.
 bool _desktopNotifyIncomingMessages = false;
@@ -215,8 +248,12 @@ Future<void> main() async {
   _store = await MessageStore.init();
   _discovery = DiscoveryService(me: _me);
   _connections = ConnectionService(me: _me);
+  _discovery.hasActiveChatTcp = (id) => _connections.isConnected(id);
   await _connections.startServer();
   await _discovery.start();
+  diag('APP',
+      'Startup: user=${_me.userId} name=${_me.displayName} '
+      'chat TCP ${ConnectionService.tcpPort} / UDP ${DiscoveryService.udpPort}');
 
   await TransferManager.instance.init(
     connections: _connections,
@@ -242,6 +279,17 @@ Future<void> main() async {
 
   _connections.onMessage = (peerId, json) {
     final type = json['type'] as String?;
+
+    if (type == 'ping') {
+      final id = json['id'] as String?;
+      if (id != null) _connections.handleIncomingPing(peerId, id);
+      return;
+    }
+    if (type == 'pong') {
+      final id = json['id'] as String?;
+      if (id != null) _connections.handlePong(peerId, id);
+      return;
+    }
 
     if (type == 'hello') {
       final name = (json['name'] as String? ?? '').trim();
@@ -336,9 +384,14 @@ class LocalChatApp extends StatefulWidget {
 
 class _LocalChatAppState extends State<LocalChatApp>
     with WidgetsBindingObserver, TrayListener, WindowListener {
+  StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
+
   @override
   void initState() {
     super.initState();
+    _connectivitySub =
+        Connectivity().onConnectivityChanged.listen(_onConnectivityChanged);
+    unawaited(Connectivity().checkConnectivity().then(_onConnectivityChanged));
     WidgetsBinding.instance.addObserver(this);
     if (_isDesktop) {
       windowManager.addListener(this);
@@ -368,6 +421,7 @@ class _LocalChatAppState extends State<LocalChatApp>
 
   @override
   void dispose() {
+    _connectivitySub?.cancel();
     if (_isDesktop) {
       windowManager.removeListener(this);
       trayManager.removeListener(this);
@@ -488,6 +542,10 @@ class _LocalChatAppState extends State<LocalChatApp>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     _appInForeground = state == AppLifecycleState.resumed ||
         state == AppLifecycleState.inactive;
+    if (state == AppLifecycleState.resumed) {
+      diag('APP', 'AppLifecycleState.resumed → UDP rebind (receive path + burst)');
+      unawaited(_discovery.recoverAfterNetworkOrResume());
+    }
   }
 
   @override
