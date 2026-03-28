@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' show min;
 
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
@@ -11,7 +12,10 @@ import 'sqflite_init.dart';
 
 class MessageStore {
   late final String _dataDir;
-  late final Database _db;
+  late Database _db;
+
+  /// Absolute directory containing `localchat.db` (e.g. Windows: `%LOCALAPPDATA%\LocalChat`).
+  String get dataDirectoryPath => _dataDir;
 
   final Map<String, Future<void>> _locks = {};
 
@@ -48,7 +52,7 @@ class MessageStore {
 
   MessageStore._();
 
-  static const int _dbVersion = 2;
+  static const int _dbVersion = 1;
   static const int _defaultChatTcpPort = 4041;
 
   static Future<MessageStore> init() async {
@@ -63,13 +67,6 @@ class MessageStore {
       version: _dbVersion,
       onCreate: (db, version) async {
         await _createSchema(db);
-      },
-      onUpgrade: (db, oldVersion, newVersion) async {
-        if (oldVersion < 2) {
-          await db.execute('''
-            ALTER TABLE messages ADD COLUMN attachment_encrypted INTEGER NOT NULL DEFAULT 0
-          ''');
-        }
       },
     );
     await store._migrateFromLegacyJsonIfNeeded();
@@ -96,7 +93,6 @@ class MessageStore {
         attachment_name TEXT,
         attachment_path TEXT,
         attachment_size INTEGER,
-        attachment_encrypted INTEGER NOT NULL DEFAULT 0,
         transfer_dismissed INTEGER NOT NULL DEFAULT 0,
         delivery TEXT,
         PRIMARY KEY (peer_id, id)
@@ -215,7 +211,6 @@ class MessageStore {
       'attachment_name': msg.attachmentName,
       'attachment_path': msg.attachmentPath,
       'attachment_size': msg.attachmentSize,
-      'attachment_encrypted': msg.attachmentEncrypted ? 1 : 0,
       'transfer_dismissed': msg.transferDismissed ? 1 : 0,
       'delivery': msg.delivery?.name,
     };
@@ -231,7 +226,6 @@ class MessageStore {
       'attachmentName': row['attachment_name'] as String?,
       'attachmentPath': row['attachment_path'] as String?,
       'attachmentSize': (row['attachment_size'] as int?),
-      'attachmentEncrypted': (row['attachment_encrypted'] as int? ?? 0) != 0,
       'transferDismissed': (row['transfer_dismissed'] as int? ?? 0) != 0,
       'delivery': row['delivery'] as String?,
     });
@@ -356,11 +350,77 @@ class MessageStore {
         'messages',
         where: 'peer_id = ?',
         whereArgs: [peerId],
-        orderBy: 'timestamp DESC, id ASC',
+        orderBy: 'timestamp DESC, id DESC',
         limit: limit,
       );
       final list = rows.map(_rowToMessage).toList();
       return list.reversed.toList();
+    });
+  }
+
+  /// [messageCount] + newest-[take] messages in one lock — avoids offset skew if rows are added concurrently.
+  Future<({int total, List<ChatMessage> messages})> loadRecentWindow(
+    String peerId,
+    int take,
+  ) async {
+    if (take <= 0) {
+      final n = await messageCount(peerId);
+      return (total: n, messages: <ChatMessage>[]);
+    }
+    return _withLock(peerId, () async {
+      final n = Sqflite.firstIntValue(
+        await _db.rawQuery(
+          'SELECT COUNT(*) FROM messages WHERE peer_id = ?',
+          [peerId],
+        ),
+      );
+      final total = n ?? 0;
+      if (total == 0) return (total: 0, messages: <ChatMessage>[]);
+      final limit = min(take, total);
+      final rows = await _db.query(
+        'messages',
+        where: 'peer_id = ?',
+        whereArgs: [peerId],
+        orderBy: 'timestamp DESC, id DESC',
+        limit: limit,
+      );
+      final list = rows.map(_rowToMessage).toList();
+      return (total: total, messages: list.reversed.toList());
+    });
+  }
+
+  /// [messageCount] + [loadRange] for the next older slice — single lock for consistent paging.
+  Future<({int total, List<ChatMessage> older})> loadOlderBatch(
+    String peerId,
+    int alreadyLoaded,
+    int batchSize,
+  ) async {
+    if (batchSize <= 0) {
+      final n = await messageCount(peerId);
+      return (total: n, older: <ChatMessage>[]);
+    }
+    return _withLock(peerId, () async {
+      final n = Sqflite.firstIntValue(
+        await _db.rawQuery(
+          'SELECT COUNT(*) FROM messages WHERE peer_id = ?',
+          [peerId],
+        ),
+      );
+      final total = n ?? 0;
+      if (total == 0 || alreadyLoaded >= total) {
+        return (total: total, older: <ChatMessage>[]);
+      }
+      final want = min(batchSize, total - alreadyLoaded);
+      final offset = total - alreadyLoaded - want;
+      final rows = await _db.query(
+        'messages',
+        where: 'peer_id = ?',
+        whereArgs: [peerId],
+        orderBy: 'timestamp ASC, id ASC',
+        offset: offset,
+        limit: want,
+      );
+      return (total: total, older: rows.map(_rowToMessage).toList());
     });
   }
 
@@ -440,6 +500,8 @@ class MessageStore {
       await _db.insert('messages', _messageToRow(peerId, msg));
       inserted = true;
     });
+
+    if (inserted) messageHistoryRevision.value++;
 
     final hasName = peerDisplayName != null && peerDisplayName.trim().isNotEmpty;
     final hasIp = peerIp != null && peerIp.trim().isNotEmpty;

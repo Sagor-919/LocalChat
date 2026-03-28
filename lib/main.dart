@@ -14,7 +14,6 @@ import 'app_settings.dart';
 import 'chat_crypto.dart';
 import 'chat_screen.dart';
 import 'connection_service.dart';
-import 'fps_overlay.dart';
 import 'device.dart';
 import 'first_launch_prompt.dart';
 import 'discovery_service.dart';
@@ -315,18 +314,6 @@ Future<void> main() async {
     store: _store,
     myId: _me.userId,
     notificationsPlugin: _notifications,
-    onRemoteTransferFailed: (peerId, fileId, error) {
-      final peer = _discoveryPeerById(peerId);
-      final name = peer?.name ?? 'Peer';
-      final ctx = appNavigatorKey.currentContext;
-      if (ctx == null || !ctx.mounted) return;
-      ScaffoldMessenger.of(ctx).showSnackBar(
-        SnackBar(
-          content: Text('$name rejected the file: $error'),
-          behavior: SnackBarBehavior.floating,
-        ),
-      );
-    },
   );
 
   try {
@@ -398,29 +385,25 @@ Future<void> main() async {
     }
 
     if (type == 'file_notify') {
-      unawaited(
-        TransferManager.instance.registerIncoming(
-          peerId,
-          json['id'] as String? ?? '',
-          json['name'] as String? ?? '',
-          (json['size'] as num?)?.toInt() ?? 0,
-          encrypted: json['encrypted'] == true,
-          senderEphPubB64: json['eph_pub_b64'] as String?,
-        ),
-      );
-      return;
-    }
-
-    if (type == 'file_transfer_key') {
-      TransferManager.instance.handleFileTransferKey(
+      TransferManager.instance.registerIncoming(
         peerId,
-        json,
+        json['id'] as String? ?? '',
+        json['name'] as String? ?? '',
+        (json['size'] as num?)?.toInt() ?? 0,
       );
-      return;
     }
 
-    if (type == 'file_transfer_result') {
-      TransferManager.instance.handleFileTransferResult(peerId, json);
+    if (type == 'file_control') {
+      final id = json['id'] as String?;
+      if (id == null || id.isEmpty) return;
+      final from = json['from'] as String? ?? '';
+      if (json['pause'] == true) {
+        if (from == 'sender') {
+          TransferManager.instance.handleRemotePauseIncoming(id);
+        } else if (from == 'receiver') {
+          TransferManager.instance.handleRemotePauseOutgoing(id);
+        }
+      }
       return;
     }
   };
@@ -432,14 +415,11 @@ Future<void> main() async {
       final peer = _discoveryPeerById(event.peerId);
       final name = peer?.name ?? 'Someone';
       final fileName = event.message.attachmentName ?? 'a file';
-      final body = event.message.attachmentEncrypted
-          ? 'Secure transfer — $fileName'
-          : 'Sent you $fileName';
 
       _notifications.show(
         event.peerId.hashCode,
         name,
-        body,
+        'Sent you $fileName',
         _incomingMessageNotificationDetails(),
         payload: jsonEncode({'peerId': event.peerId}),
       );
@@ -639,12 +619,6 @@ class _LocalChatAppState extends State<LocalChatApp>
           navigatorKey: appNavigatorKey,
           title: 'Local Chat',
           debugShowCheckedModeBanner: false,
-          builder: (context, child) {
-            if (!kFpsOverlayEnabled) {
-              return child ?? const SizedBox.shrink();
-            }
-            return FpsOverlayShell(child: child);
-          },
           themeMode: mode,
           theme: ThemeData(
             colorSchemeSeed: Colors.indigo,

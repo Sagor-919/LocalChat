@@ -212,9 +212,6 @@ class _HomeScreenState extends State<HomeScreen> {
   String _subtitleForMessage(ChatMessage m) {
     final name = m.attachmentName;
     if (name != null && name.isNotEmpty) {
-      if (m.attachmentEncrypted) {
-        return 'Secure file: $name';
-      }
       return 'File: $name';
     }
     return m.text;

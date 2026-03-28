@@ -16,8 +16,6 @@ class ChatMessage {
   final String? attachmentName;
   final String? attachmentPath;
   final int? attachmentSize;
-  /// ECDH + AES-GCM on the file socket for this attachment (sender opted in or receiver matched).
-  final bool attachmentEncrypted;
   /// User dismissed a failed/cancelled transfer; show strikethrough / muted bubble.
   final bool transferDismissed;
   /// Only for [isMine] text messages; null means legacy or not applicable.
@@ -32,7 +30,6 @@ class ChatMessage {
     this.attachmentName,
     this.attachmentPath,
     this.attachmentSize,
-    this.attachmentEncrypted = false,
     this.transferDismissed = false,
     this.delivery,
   });
@@ -70,7 +67,6 @@ class ChatMessage {
         'attachmentName': attachmentName,
         'attachmentPath': attachmentPath,
         'attachmentSize': attachmentSize,
-        'attachmentEncrypted': attachmentEncrypted,
         'transferDismissed': transferDismissed,
         if (delivery != null) 'delivery': delivery!.name,
       };
@@ -95,7 +91,6 @@ class ChatMessage {
       attachmentName: json['attachmentName'] as String?,
       attachmentPath: json['attachmentPath'] as String?,
       attachmentSize: (json['attachmentSize'] as num?)?.toInt(),
-      attachmentEncrypted: json['attachmentEncrypted'] as bool? ?? false,
       transferDismissed: json['transferDismissed'] as bool? ?? false,
       delivery: _deliveryFromStore(json['delivery']),
     );
@@ -110,7 +105,6 @@ class ChatMessage {
     String? attachmentName,
     String? attachmentPath,
     int? attachmentSize,
-    bool? attachmentEncrypted,
     bool? transferDismissed,
     MessageDelivery? delivery,
     bool clearDelivery = false,
@@ -124,7 +118,6 @@ class ChatMessage {
       attachmentName: attachmentName ?? this.attachmentName,
       attachmentPath: attachmentPath ?? this.attachmentPath,
       attachmentSize: attachmentSize ?? this.attachmentSize,
-      attachmentEncrypted: attachmentEncrypted ?? this.attachmentEncrypted,
       transferDismissed: transferDismissed ?? this.transferDismissed,
       delivery: clearDelivery ? null : (delivery ?? this.delivery),
     );

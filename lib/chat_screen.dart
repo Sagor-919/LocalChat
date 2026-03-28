@@ -21,63 +21,6 @@ import 'message_model.dart';
 import 'message_store.dart';
 import 'transfer_manager.dart';
 
-/// Rebuilds only this message subtree when [messageId]'s [TransferState] changes,
-/// instead of calling [setState] on the whole [ChatScreen].
-class _TransferBubbleScope extends StatefulWidget {
-  const _TransferBubbleScope({
-    required this.messageId,
-    required this.builder,
-  });
-
-  final String messageId;
-  final Widget Function(BuildContext context, TransferState? t) builder;
-
-  @override
-  State<_TransferBubbleScope> createState() => _TransferBubbleScopeState();
-}
-
-class _TransferBubbleScopeState extends State<_TransferBubbleScope> {
-  StreamSubscription<void>? _sub;
-  TransferState? _last;
-
-  @override
-  void initState() {
-    super.initState();
-    _last = TransferManager.instance.transfers[widget.messageId];
-    _sub = TransferManager.instance.transferUpdates.listen((_) {
-      if (!mounted) return;
-      final t = TransferManager.instance.transfers[widget.messageId];
-      if (_transferVisualEquals(_last, t)) return;
-      _last = t;
-      setState(() {});
-    });
-  }
-
-  @override
-  void dispose() {
-    _sub?.cancel();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final t = TransferManager.instance.transfers[widget.messageId];
-    return widget.builder(context, t);
-  }
-}
-
-bool _transferVisualEquals(TransferState? a, TransferState? b) {
-  // Do not use [identical]: [TransferState] is mutated in place during transfer.
-  if (a == null && b == null) return true;
-  if (a == null || b == null) return false;
-  return a.transferredBytes == b.transferredBytes &&
-      a.progress == b.progress &&
-      a.error == b.error &&
-      a.cancelled == b.cancelled &&
-      a.awaitingRemoteAck == b.awaitingRemoteAck &&
-      a.isSending == b.isSending;
-}
-
 class ChatScreen extends StatefulWidget {
   final DeviceInfo me;
   final PeerDevice peer;
@@ -107,6 +50,8 @@ class _ChatScreenState extends State<ChatScreen> {
   static const _historyBatchSize = 50;
 
   final List<ChatMessage> _allMessages = [];
+  /// Keeps outgoing timestamps strictly after the latest row (clock skew + rapid sends).
+  int _sendTimestampSeq = 0;
   List<ChatMessage> _messages = [];
   int _displayCount = _pageSize;
   int _totalInDb = 0;
@@ -123,8 +68,12 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _loading = true;
 
   final List<_StagedFile> _staged = [];
+  /// Prevents overlapping native file/folder/gallery pickers (multiple explorer windows).
+  bool _nativePickerOpen = false;
 
+  StreamSubscription<void>? _transferSub;
   StreamSubscription<FileMessageEvent>? _fileMsgSub;
+  Timer? _transferThrottle;
   Timer? _connTimer;
   Timer? _storeRevisionDebounce;
   Timer? _scrollLoadOlderDebounce;
@@ -133,6 +82,7 @@ class _ChatScreenState extends State<ChatScreen> {
   String get _peerId => widget.peer.userId;
   TransferManager get _tm => TransferManager.instance;
 
+  /// Matches SQLite ordering: [timestamp] then [id] for stable order when times tie.
   static int _compareMessages(ChatMessage a, ChatMessage b) {
     final c = a.timestamp.compareTo(b.timestamp);
     if (c != 0) return c;
@@ -140,6 +90,15 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _insertMessageSorted(ChatMessage msg) {
+    if (_allMessages.isEmpty) {
+      _allMessages.add(msg);
+      return;
+    }
+    final last = _allMessages.last;
+    if (_compareMessages(last, msg) < 0) {
+      _allMessages.add(msg);
+      return;
+    }
     var lo = 0;
     var hi = _allMessages.length;
     while (lo < hi) {
@@ -157,13 +116,22 @@ class _ChatScreenState extends State<ChatScreen> {
     _displayCount = (_displayCount + 1).clamp(0, _allMessages.length);
   }
 
-  /// Stable order: time, then message id (same ms from two clients).
-  void _sortMessagesInPlace() {
-    _allMessages.sort((a, b) {
-      final c = a.timestamp.compareTo(b.timestamp);
-      if (c != 0) return c;
-      return a.id.compareTo(b.id);
-    });
+  void _syncSendTimestampSeq() {
+    if (_allMessages.isEmpty) {
+      _sendTimestampSeq = 0;
+      return;
+    }
+    _sendTimestampSeq = _allMessages.last.timestamp;
+  }
+
+  /// Ensures new outgoing messages sort after the latest line in the thread (fixes desktop clock skew).
+  int _nextOutgoingTimestamp() {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final lastTs = _allMessages.isEmpty ? 0 : _allMessages.last.timestamp;
+    final base = max(now, lastTs + 1);
+    final next = max(base, _sendTimestampSeq + 1);
+    _sendTimestampSeq = next;
+    return next;
   }
 
   void _onStoreRevision() {
@@ -190,7 +158,8 @@ class _ChatScreenState extends State<ChatScreen> {
       if (peerId != _peerId) return;
       final type = json['type'] as String?;
       if (type == 'message' || type == 'message_ack') {
-        unawaited(_reloadMessagesFromStore());
+        // Inserts/updates run in [MessageStore.add] / delivery handlers, which bump
+        // [messageHistoryRevision]; debounced [_reloadMessagesFromStore] keeps UI in sync.
         return;
       }
       _handleJson(json);
@@ -217,6 +186,13 @@ class _ChatScreenState extends State<ChatScreen> {
         unawaited(_syncOutboundMessagesAfterConnect());
       }
     };
+
+    _transferSub = _tm.transferUpdates.listen((_) {
+      if (_transferThrottle?.isActive ?? false) return;
+      _transferThrottle = Timer(const Duration(milliseconds: 200), () {
+        if (mounted) setState(() {});
+      });
+    });
 
     _fileMsgSub = _tm.fileMessages.listen((event) {
       if (event.peerId != _peerId) return;
@@ -304,21 +280,20 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _loadHistory() async {
-    _totalInDb = await widget.store.messageCount(_peerId);
-    final initial = min(_initialHistoryWindow, _totalInDb);
-    final stored =
-        initial > 0 ? await widget.store.loadRecent(_peerId, initial) : <ChatMessage>[];
+    final window =
+        await widget.store.loadRecentWindow(_peerId, _initialHistoryWindow);
     if (!mounted) return;
+    _totalInDb = window.total;
     _allMessages
       ..clear()
-      ..addAll(stored);
-    _sortMessagesInPlace();
+      ..addAll(window.messages);
     _hasMoreOlder = _allMessages.length < _totalInDb;
     _displayCount = _pageSize.clamp(0, _allMessages.length);
     if (_allMessages.length <= _pageSize) {
       _displayCount = _allMessages.length;
     }
     _rebuildVisible();
+    _syncSendTimestampSeq();
     unawaited(_rememberPeerRecord());
     setState(() => _loading = false);
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -371,9 +346,9 @@ class _ChatScreenState extends State<ChatScreen> {
     if (_loadingOlder || !_hasMoreOlder) return;
     _loadingOlder = true;
     try {
-      _totalInDb = await widget.store.messageCount(_peerId);
-      final l = _allMessages.length;
-      if (l >= _totalInDb) {
+      final gap = max(0, _totalInDb - _allMessages.length);
+      final want = min(_historyBatchSize, gap);
+      if (want <= 0) {
         if (mounted) setState(() => _hasMoreOlder = false);
         return;
       }
@@ -383,14 +358,23 @@ class _ChatScreenState extends State<ChatScreen> {
       final prevPixels =
           _scroll.hasClients ? _scroll.position.pixels : 0.0;
 
-      final want = min(_historyBatchSize, _totalInDb - l);
-      final offset = _totalInDb - l - want;
-      final older = await widget.store.loadRange(_peerId, offset, want);
-      if (!mounted || older.isEmpty) return;
+      final result = await widget.store.loadOlderBatch(
+        _peerId,
+        _allMessages.length,
+        want,
+      );
+      if (!mounted) return;
+      _totalInDb = result.total;
+      final older = result.older;
+      if (older.isEmpty) {
+        if (mounted) {
+          setState(() => _hasMoreOlder = _allMessages.length < _totalInDb);
+        }
+        return;
+      }
 
       setState(() {
         _allMessages.insertAll(0, older);
-        _sortMessagesInPlace();
         _displayCount += older.length;
         _rebuildVisible();
         _hasMoreOlder = _allMessages.length < _totalInDb;
@@ -439,7 +423,9 @@ class _ChatScreenState extends State<ChatScreen> {
     widget.connections.onMessage = _prevOnMessage;
     widget.connections.onDisconnected = _prevOnDisconnected;
     widget.connections.onIncomingConnection = _prevOnIncoming;
+    _transferSub?.cancel();
     _fileMsgSub?.cancel();
+    _transferThrottle?.cancel();
     _input.dispose();
     _focus.dispose();
     _scroll.dispose();
@@ -459,24 +445,21 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _reloadMessagesFromStore() async {
-    _totalInDb = await widget.store.messageCount(_peerId);
     final grow = _totalInDb > _allMessages.length ? 1 : 0;
-    final take = min(
-      _totalInDb,
-      max(_allMessages.length + grow, _initialHistoryWindow),
-    );
-    final stored =
-        take > 0 ? await widget.store.loadRecent(_peerId, take) : <ChatMessage>[];
+    // Do not cap by [_totalInDb] here — it can be stale; [loadRecentWindow] clamps to DB total.
+    final take = max(_allMessages.length + grow, _initialHistoryWindow);
+    final window = await widget.store.loadRecentWindow(_peerId, take);
     if (!mounted) return;
+    _totalInDb = window.total;
     _allMessages
       ..clear()
-      ..addAll(stored);
-    _sortMessagesInPlace();
+      ..addAll(window.messages);
     _hasMoreOlder = _allMessages.length < _totalInDb;
     _displayCount = _displayCount.clamp(0, _allMessages.length);
     if (_allMessages.length <= _pageSize) {
       _displayCount = _allMessages.length;
     }
+    _syncSendTimestampSeq();
     setState(() => _rebuildVisible());
     _scrollToBottom();
   }
@@ -574,6 +557,20 @@ class _ChatScreenState extends State<ChatScreen> {
   // -----------------------------------------------------------------------
   // Staging — pick files / images into preview, send all on press
   // -----------------------------------------------------------------------
+  Future<void> _withSingleNativePicker(Future<void> Function() action) async {
+    if (_nativePickerOpen) return;
+    setState(() => _nativePickerOpen = true);
+    try {
+      await action();
+    } finally {
+      if (mounted) {
+        setState(() => _nativePickerOpen = false);
+      } else {
+        _nativePickerOpen = false;
+      }
+    }
+  }
+
   void _stageFiles(List<_StagedFile> files) {
     if (files.isEmpty) return;
     // Defer so the picker can finish dismissing before a heavy ListView rebuild
@@ -585,64 +582,70 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _pickFiles() async {
-    final picked = await FilePicker.platform.pickFiles(
-      type: FileType.any,
-      allowMultiple: true,
-      withData: false,
-    );
-    if (picked == null) return;
-    _stageFiles(picked.files
-        .where((f) => f.path != null)
-        .map((f) => _StagedFile(f.path!, f.name))
-        .toList());
+    await _withSingleNativePicker(() async {
+      final picked = await FilePicker.platform.pickFiles(
+        type: FileType.any,
+        allowMultiple: true,
+        withData: false,
+      );
+      if (picked == null) return;
+      _stageFiles(picked.files
+          .where((f) => f.path != null)
+          .map((f) => _StagedFile(f.path!, f.name))
+          .toList());
+    });
   }
 
   Future<void> _pickFolder() async {
-    final dirPath = await FilePicker.platform.getDirectoryPath();
-    if (dirPath == null) return;
+    await _withSingleNativePicker(() async {
+      final dirPath = await FilePicker.platform.getDirectoryPath();
+      if (dirPath == null) return;
 
-    final folderName = dirPath.split(Platform.pathSeparator).last;
-    final zipPath =
-        '${Directory.systemTemp.path}${Platform.pathSeparator}$folderName.zip';
+      final folderName = dirPath.split(Platform.pathSeparator).last;
+      final zipPath =
+          '${Directory.systemTemp.path}${Platform.pathSeparator}$folderName.zip';
 
-    try {
-      final zipFile = File(zipPath);
-      if (await zipFile.exists()) await zipFile.delete();
+      try {
+        final zipFile = File(zipPath);
+        if (await zipFile.exists()) await zipFile.delete();
 
-      final parentDir = Directory(dirPath).parent.path;
-      final result = await Process.run(
-        'tar',
-        ['-a', '-cf', zipPath, '-C', parentDir, folderName],
-      );
-      if (result.exitCode != 0) {
+        final parentDir = Directory(dirPath).parent.path;
+        final result = await Process.run(
+          'tar',
+          ['-a', '-cf', zipPath, '-C', parentDir, folderName],
+        );
+        if (result.exitCode != 0) {
+          if (mounted) {
+            ScaffoldMessenger.of(context)
+              ..clearSnackBars()
+              ..showSnackBar(SnackBar(
+                content: Text('Failed to compress folder: ${result.stderr}'),
+                behavior: SnackBarBehavior.floating,
+              ));
+          }
+          return;
+        }
+        _stageFiles([_StagedFile(zipPath, '$folderName.zip')]);
+      } catch (e) {
         if (mounted) {
           ScaffoldMessenger.of(context)
             ..clearSnackBars()
             ..showSnackBar(SnackBar(
-              content: Text('Failed to compress folder: ${result.stderr}'),
+              content: Text('Failed to compress folder: $e'),
               behavior: SnackBarBehavior.floating,
             ));
         }
-        return;
       }
-      _stageFiles([_StagedFile(zipPath, '$folderName.zip')]);
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context)
-          ..clearSnackBars()
-          ..showSnackBar(SnackBar(
-            content: Text('Failed to compress folder: $e'),
-            behavior: SnackBarBehavior.floating,
-          ));
-      }
-    }
+    });
   }
 
   Future<void> _pickGallery() async {
-    final picker = ImagePicker();
-    final images = await picker.pickMultiImage(limit: 20);
-    if (images.isEmpty) return;
-    _stageFiles(images.map((x) => _StagedFile(x.path, x.name)).toList());
+    await _withSingleNativePicker(() async {
+      final picker = ImagePicker();
+      final images = await picker.pickMultiImage(limit: 20);
+      if (images.isEmpty) return;
+      _stageFiles(images.map((x) => _StagedFile(x.path, x.name)).toList());
+    });
   }
 
   void _onDropDone(DropDoneDetails details) {
@@ -676,7 +679,7 @@ class _ChatScreenState extends State<ChatScreen> {
         id: _uuid.v4(),
         senderId: widget.me.userId,
         text: toSend,
-        timestamp: DateTime.now().millisecondsSinceEpoch,
+        timestamp: _nextOutgoingTimestamp(),
         isMine: true,
         delivery: _connected
             ? MessageDelivery.pending
@@ -700,15 +703,43 @@ class _ChatScreenState extends State<ChatScreen> {
     }
 
     if (hasFiles) {
-      final batch = List<_StagedFile>.from(_staged);
+      final raw = List<_StagedFile>.from(_staged);
       setState(() => _staged.clear());
+      final batch = await _dedupeStagedPaths(raw);
+      // One send at a time so chat TCP lines (file_notify + store.add) stay ordered
+      // and duplicate cache paths (same basename on Android) do not race.
       for (final sf in batch) {
-        unawaited(_sendFile(sf.path, sf.name));
+        await _sendFile(sf.path, sf.name);
       }
     }
 
     _focus.requestFocus();
     _scrollToBottom();
+  }
+
+  /// Picks / drag-drop can reuse one cache path for the same display name; copy so each send is distinct.
+  Future<List<_StagedFile>> _dedupeStagedPaths(List<_StagedFile> files) async {
+    final seen = <String>{};
+    final out = <_StagedFile>[];
+    for (final sf in files) {
+      if (seen.contains(sf.path)) {
+        final dest = await _copyFileToUniqueTemp(sf.path, sf.name);
+        out.add(_StagedFile(dest, sf.name));
+        seen.add(dest);
+      } else {
+        out.add(sf);
+        seen.add(sf.path);
+      }
+    }
+    return out;
+  }
+
+  Future<String> _copyFileToUniqueTemp(String sourcePath, String displayName) async {
+    final safe = displayName.replaceAll(RegExp(r'[/\\]'), '_');
+    final name = '${_uuid.v4()}_$safe';
+    final dest = p.join(Directory.systemTemp.path, name);
+    await File(sourcePath).copy(dest);
+    return dest;
   }
 
   Future<void> _sendFile(String filePath, String fileName) async {
@@ -727,6 +758,7 @@ class _ChatScreenState extends State<ChatScreen> {
       fileName: fileName,
       filePath: filePath,
       fileSize: fileSize,
+      timestamp: _nextOutgoingTimestamp(),
     );
   }
 
@@ -1006,46 +1038,61 @@ class _ChatScreenState extends State<ChatScreen> {
         ],
       ),
       body: SafeArea(
-        child: DropTarget(
-          enable: _isDesktop,
-          onDragDone: _onDropDone,
-          child: Column(
-            children: [
-              Expanded(
-                child: _loading
-                    ? const Center(child: CircularProgressIndicator())
-                    : _messages.isEmpty
-                        ? Center(
-                            child: Text('No messages yet',
-                                style: TextStyle(color: cs.outline)))
-                        : ListView.builder(
-                            controller: _scroll,
-                            cacheExtent: 400,
-                            padding: const EdgeInsets.fromLTRB(14, 16, 14, 12),
-                            itemCount: _messages.length,
-                            itemBuilder: (ctx, i) {
-                              final widgets = <Widget>[];
-                              if (_needsDateSeparator(i)) {
-                                widgets.add(_buildDateSeparator(ctx,
-                                    DateTime.fromMillisecondsSinceEpoch(
-                                        _messages[i].timestamp)));
-                              }
-                              widgets.add(_buildBubble(ctx, _messages[i]));
-                              return RepaintBoundary(
-                                child: Column(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: widgets,
-                                ),
-                              );
-                            },
-                          ),
-              ),
-              if (_staged.isNotEmpty) _buildStagedPreview(context),
-              _buildComposer(context),
-            ],
-          ),
+        child: Column(
+          children: [
+            Expanded(
+              child: _loading
+                  ? const Center(child: CircularProgressIndicator())
+                  : _messages.isEmpty
+                      ? Center(
+                          child: Text('No messages yet',
+                              style: TextStyle(color: cs.outline)))
+                      : ListView.builder(
+                          controller: _scroll,
+                          cacheExtent: 400,
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 14, vertical: 8),
+                          itemCount: _messages.length,
+                          itemBuilder: (ctx, i) {
+                            final widgets = <Widget>[];
+                            if (_needsDateSeparator(i)) {
+                              widgets.add(_buildDateSeparator(ctx,
+                                  DateTime.fromMillisecondsSinceEpoch(
+                                      _messages[i].timestamp)));
+                            }
+                            widgets.add(_buildBubble(ctx, _messages[i]));
+                            return RepaintBoundary(
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: widgets,
+                              ),
+                            );
+                          },
+                        ),
+            ),
+            _buildComposerStrip(context),
+          ],
         ),
       ),
+    );
+  }
+
+  // -----------------------------------------------------------------------
+  // Composer + staged strip (desktop: file drop only on this strip, not the message list)
+  // -----------------------------------------------------------------------
+  Widget _buildComposerStrip(BuildContext context) {
+    final bottom = Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (_staged.isNotEmpty) _buildStagedPreview(context),
+        _buildComposer(context),
+      ],
+    );
+    if (!_isDesktop) return bottom;
+    return DropTarget(
+      enable: ModalRoute.of(context)?.isCurrent ?? true,
+      onDragDone: _onDropDone,
+      child: bottom,
     );
   }
 
@@ -1111,46 +1158,17 @@ class _ChatScreenState extends State<ChatScreen> {
                           color: cs.surfaceContainerHighest,
                         ),
                         clipBehavior: Clip.antiAlias,
-                        child: isImg
-                            ? _wrapImageWithContextMenu(
-                                path: sf.path,
-                                fileName: sf.name,
-                                image: Image.file(
-                                  File(sf.path),
-                                  fit: BoxFit.cover,
-                                  width: 64,
-                                  height: 64,
-                                  cacheWidth: 128,
-                                  cacheHeight: 128,
-                                  filterQuality: FilterQuality.low,
-                                  errorBuilder: (_, _, _) => Icon(
-                                    Icons.broken_image,
-                                    size: 24,
-                                    color: cs.outline,
-                                  ),
-                                ),
-                              )
-                            : Column(
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                children: [
-                                  Icon(Icons.insert_drive_file,
-                                      size: 24, color: cs.onSurfaceVariant),
-                                  const SizedBox(height: 2),
-                                  Padding(
-                                    padding: const EdgeInsets.symmetric(
-                                        horizontal: 4),
-                                    child: Text(
-                                      sf.name,
-                                      maxLines: 2,
-                                      overflow: TextOverflow.ellipsis,
-                                      textAlign: TextAlign.center,
-                                      style: TextStyle(
-                                          fontSize: 8,
-                                          color: cs.onSurfaceVariant),
-                                    ),
-                                  ),
-                                ],
-                              ),
+                        child: _StagedThumbTile(
+                          path: sf.path,
+                          name: sf.name,
+                          isImage: isImg,
+                          cs: cs,
+                          imageWrapper: (image) => _wrapImageWithContextMenu(
+                            path: sf.path,
+                            fileName: sf.name,
+                            image: image,
+                          ),
+                        ),
                       ),
                       Positioned(
                         top: -6,
@@ -1247,31 +1265,15 @@ class _ChatScreenState extends State<ChatScreen> {
   static const _cancelledAmber = Color(0xFFFF9500);
 
   Widget _buildBubble(BuildContext context, ChatMessage m) {
-    if (m.attachmentName != null) {
-      return _TransferBubbleScope(
-        messageId: m.id,
-        builder: (context, t) => _buildBubbleWithTransfer(context, m, t),
-      );
-    }
-    return _buildBubbleWithTransfer(context, m, _tm.transfers[m.id]);
-  }
-
-  Widget _buildBubbleWithTransfer(
-    BuildContext context,
-    ChatMessage m,
-    TransferState? t,
-  ) {
     final cs = Theme.of(context).colorScheme;
     final mine = m.isMine;
+    final t = _tm.transfers[m.id];
     final isDark = Theme.of(context).brightness == Brightness.dark;
 
     final bool isFailed = t != null && t.error != null && !t.cancelled;
     final bool isCancelled = t != null && t.cancelled;
-    final bool awaitingPeerAck = t != null &&
-        t.isSending &&
-        t.awaitingRemoteAck &&
-        t.error == null &&
-        !t.cancelled;
+    final bool isPaused =
+        t != null && t.isPaused && t.error == null && !t.cancelled;
     final bool dismissedAborted = m.transferDismissed &&
         m.attachmentName != null &&
         t == null;
@@ -1386,7 +1388,7 @@ class _ChatScreenState extends State<ChatScreen> {
                     const SizedBox(width: 6),
                     Expanded(
                       child: Text(
-                        isFailed ? 'Transfer Failed' : 'Cancelled',
+                        isFailed ? 'Not delivered — transfer failed' : 'Cancelled',
                         style: TextStyle(
                           fontSize: 12,
                           fontWeight: FontWeight.w700,
@@ -1397,33 +1399,31 @@ class _ChatScreenState extends State<ChatScreen> {
                   ],
                 ),
                 const SizedBox(height: 8),
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    _actionButton(
-                      label: 'Dismiss',
-                      icon: Icons.close,
-                      color: cs.outline,
-                      onTap: () => _tm.dismiss(m.id),
-                    ),
-                  ],
+                _actionButton(
+                  label: 'Dismiss',
+                  icon: Icons.close,
+                  color: cs.outline,
+                  onTap: () => _tm.dismiss(m.id),
                 ),
-              ] else if (awaitingPeerAck) ...[
+              ] else if (isPaused) ...[
                 LinearProgressIndicator(
-                  value: null,
+                  value: t.progress.clamp(0, 1).toDouble(),
                   minHeight: 5,
                   borderRadius: BorderRadius.circular(99),
                   backgroundColor: mine ? Colors.white24 : cs.outlineVariant,
-                  color: mine ? Colors.white : _iMessageBlue,
+                  color: mine ? Colors.white70 : cs.outline,
                 ),
                 const SizedBox(height: 6),
                 Row(
                   children: [
-                    Icon(Icons.verified_outlined, size: 16, color: subtleColor),
+                    Icon(Icons.hourglass_empty,
+                        size: 16, color: cs.outline),
                     const SizedBox(width: 6),
                     Expanded(
                       child: Text(
-                        'Verifying with peer…',
+                        t.isSending
+                            ? 'Reconnecting\u2026'
+                            : 'Waiting for sender\u2026',
                         style: TextStyle(
                           fontSize: 12,
                           fontWeight: FontWeight.w600,
@@ -1434,16 +1434,11 @@ class _ChatScreenState extends State<ChatScreen> {
                   ],
                 ),
                 const SizedBox(height: 8),
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    _actionButton(
-                      label: 'Cancel',
-                      icon: Icons.close,
-                      color: cs.outline,
-                      onTap: () => _cancelTransfer(m.id),
-                    ),
-                  ],
+                _actionButton(
+                  label: 'Cancel',
+                  icon: Icons.stop_circle_outlined,
+                  color: _failedRed,
+                  onTap: () => _cancelTransfer(m.id),
                 ),
               ] else ...[
                 LinearProgressIndicator(
@@ -1478,6 +1473,22 @@ class _ChatScreenState extends State<ChatScreen> {
                   ],
                 ),
               ],
+            ],
+            if (mine &&
+                m.attachmentName != null &&
+                t == null &&
+                m.attachmentPath != null &&
+                !m.transferDismissed &&
+                !dismissedAborted) ...[
+              const SizedBox(height: 6),
+              Text(
+                'Delivered',
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: subtleColor,
+                ),
+              ),
             ],
 
             const SizedBox(height: 4),
@@ -1628,7 +1639,6 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Widget _buildAttachment(
       BuildContext context, ChatMessage m, bool mine, bool strikeAborted) {
-    final cs = Theme.of(context).colorScheme;
     final isDark = Theme.of(context).brightness == Brightness.dark;
     final hasPath = m.attachmentPath != null;
     final isImg = hasPath && _isImage(m.attachmentName!);
@@ -1647,34 +1657,6 @@ class _ChatScreenState extends State<ChatScreen> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        if (m.attachmentEncrypted)
-          Padding(
-            padding: const EdgeInsets.only(bottom: 6),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  Icons.lock_outline,
-                  size: 14,
-                  color: mine
-                      ? Colors.white.withValues(alpha: 0.85)
-                      : (isDark ? Colors.greenAccent.shade100 : cs.primary),
-                ),
-                const SizedBox(width: 5),
-                Text(
-                  'Secure transfer',
-                  style: TextStyle(
-                    fontSize: 11,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: 0.2,
-                    color: mine
-                        ? Colors.white.withValues(alpha: 0.9)
-                        : (isDark ? Colors.greenAccent.shade100 : cs.primary),
-                  ),
-                ),
-              ],
-            ),
-          ),
         if (isImg && !strikeAborted)
           Padding(
             padding: const EdgeInsets.only(bottom: 6),
@@ -1824,14 +1806,14 @@ class _ChatScreenState extends State<ChatScreen> {
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [
               IconButton.filled(
-                onPressed: _pickFiles,
+                onPressed: _nativePickerOpen ? null : _pickFiles,
                 tooltip: 'Attach Files',
                 icon: const Icon(Icons.attach_file),
               ),
               if (_isDesktop) ...[
                 const SizedBox(width: 4),
                 IconButton.filled(
-                  onPressed: _pickFolder,
+                  onPressed: _nativePickerOpen ? null : _pickFolder,
                   tooltip: 'Attach Folder',
                   style: IconButton.styleFrom(
                     backgroundColor: cs.secondaryContainer,
@@ -1843,7 +1825,7 @@ class _ChatScreenState extends State<ChatScreen> {
               if (!kIsWeb && Platform.isAndroid) ...[
                 const SizedBox(width: 4),
                 IconButton.filled(
-                  onPressed: _pickGallery,
+                  onPressed: _nativePickerOpen ? null : _pickGallery,
                   tooltip: 'Gallery',
                   style: IconButton.styleFrom(
                     backgroundColor: cs.secondaryContainer,
@@ -1901,6 +1883,100 @@ class _ChatScreenState extends State<ChatScreen> {
           );
         },
       ),
+    );
+  }
+}
+
+/// Staged attachment thumbnail: avoids decoding huge images on the UI thread (Android jank).
+class _StagedThumbTile extends StatefulWidget {
+  final String path;
+  final String name;
+  final bool isImage;
+  final ColorScheme cs;
+  final Widget Function(Widget image) imageWrapper;
+
+  const _StagedThumbTile({
+    required this.path,
+    required this.name,
+    required this.isImage,
+    required this.cs,
+    required this.imageWrapper,
+  });
+
+  @override
+  State<_StagedThumbTile> createState() => _StagedThumbTileState();
+}
+
+class _StagedThumbTileState extends State<_StagedThumbTile> {
+  late final Future<int> _sizeFuture = File(widget.path).length();
+
+  static const _maxPreviewBytes = 6 * 1024 * 1024;
+
+  @override
+  Widget build(BuildContext context) {
+    if (!widget.isImage) {
+      return _fileIconColumn();
+    }
+    return FutureBuilder<int>(
+      future: _sizeFuture,
+      builder: (context, snap) {
+        if (snap.hasError) {
+          return _fileIconColumn();
+        }
+        if (snap.connectionState != ConnectionState.done) {
+          return Center(
+            child: Icon(
+              Icons.image_outlined,
+              size: 28,
+              color: widget.cs.outline,
+            ),
+          );
+        }
+        final len = snap.data ?? 0;
+        if (len > _maxPreviewBytes) {
+          return _fileIconColumn();
+        }
+        return widget.imageWrapper(
+          Image.file(
+            File(widget.path),
+            fit: BoxFit.cover,
+            width: 64,
+            height: 64,
+            cacheWidth: 128,
+            cacheHeight: 128,
+            filterQuality: FilterQuality.low,
+            errorBuilder: (_, _, _) => Icon(
+              Icons.broken_image,
+              size: 24,
+              color: widget.cs.outline,
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _fileIconColumn() {
+    return Column(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        Icon(Icons.insert_drive_file,
+            size: 24, color: widget.cs.onSurfaceVariant),
+        const SizedBox(height: 2),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4),
+          child: Text(
+            widget.name,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: 8,
+              color: widget.cs.onSurfaceVariant,
+            ),
+          ),
+        ),
+      ],
     );
   }
 }
