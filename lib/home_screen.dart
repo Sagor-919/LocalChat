@@ -1,10 +1,12 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import 'android_app_control.dart';
+import 'android_share_inbound.dart';
 import 'app_branding.dart';
 import 'chat_screen.dart';
 import 'connection_service.dart';
@@ -337,6 +339,51 @@ class _HomeScreenState extends State<HomeScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            if (!kIsWeb && Platform.isAndroid)
+              ValueListenableBuilder<int>(
+                valueListenable: AndroidShareInbound.pendingRevision,
+                builder: (context, rev, child) {
+                  final n = AndroidShareInbound.queuedCount;
+                  if (n <= 0) return const SizedBox.shrink();
+                  final cs = Theme.of(context).colorScheme;
+                  return Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                    child: Material(
+                      color: cs.primaryContainer,
+                      borderRadius: BorderRadius.circular(12),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 12, vertical: 10),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Icon(Icons.share_rounded,
+                                size: 22, color: cs.onPrimaryContainer),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                n == 1
+                                    ? '1 file shared — open a chat to attach it'
+                                    : '$n files shared — open a chat to attach them',
+                                style: TextStyle(
+                                  color: cs.onPrimaryContainer,
+                                  fontSize: 13,
+                                  height: 1.35,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                            TextButton(
+                              onPressed: AndroidShareInbound.clearQueued,
+                              child: const Text('Dismiss'),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  );
+                },
+              ),
             Padding(
               padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
               child: _buildProfileCard(context),

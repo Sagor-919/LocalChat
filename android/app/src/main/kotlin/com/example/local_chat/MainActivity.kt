@@ -2,17 +2,131 @@ package com.example.local_chat
 
 import android.content.Context
 import android.content.Intent
+import android.database.Cursor
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
+import android.provider.OpenableColumns
 import android.provider.Settings
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import java.io.File
+import java.io.FileOutputStream
+import java.util.Collections
+import java.util.UUID
+import java.util.concurrent.Executors
 
 class MainActivity : FlutterActivity() {
     private var multicastLock: WifiManager.MulticastLock? = null
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val ioExecutor = Executors.newSingleThreadExecutor()
+    private val pendingShareUris = Collections.synchronizedList(ArrayList<String>())
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        handleIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIntent(intent)
+    }
+
+    private fun handleIntent(intent: Intent?) {
+        if (intent == null) return
+        val action = intent.action ?: return
+        if (action != Intent.ACTION_SEND && action != Intent.ACTION_SEND_MULTIPLE) {
+            return
+        }
+        when (action) {
+            Intent.ACTION_SEND -> {
+                val uri = getSendUriCompat(intent)
+                if (uri != null) {
+                    pendingShareUris.add(uri.toString())
+                }
+            }
+            Intent.ACTION_SEND_MULTIPLE -> {
+                val list = getSendUrisCompat(intent)
+                if (list != null) {
+                    for (u in list) {
+                        pendingShareUris.add(u.toString())
+                    }
+                }
+            }
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun getSendUriCompat(intent: Intent): Uri? {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+        } else {
+            intent.getParcelableExtra(Intent.EXTRA_STREAM)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun getSendUrisCompat(intent: Intent): ArrayList<Uri>? {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java)
+        } else {
+            intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM)
+        }
+    }
+
+    private fun queryDisplayName(uri: Uri): String? {
+        if (uri.scheme == "file") {
+            return uri.lastPathSegment?.let { java.net.URLDecoder.decode(it, Charsets.UTF_8.name()) }
+        }
+        var cursor: Cursor? = null
+        try {
+            cursor = contentResolver.query(uri, null, null, null, null)
+            if (cursor != null && cursor.moveToFirst()) {
+                val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (idx >= 0) {
+                    val n = cursor.getString(idx)
+                    if (!n.isNullOrBlank()) return n
+                }
+            }
+        } catch (_: Exception) {
+        } finally {
+            cursor?.close()
+        }
+        return null
+    }
+
+    private fun materializeUri(uri: Uri): Map<String, String>? {
+        try {
+            if (uri.scheme == "file") {
+                val rawPath = uri.path ?: return null
+                val path = java.net.URLDecoder.decode(rawPath, Charsets.UTF_8.name())
+                val f = File(path)
+                if (!f.exists() || !f.isFile) return null
+                return mapOf("path" to f.absolutePath, "name" to f.name)
+            }
+            if (uri.scheme == "content") {
+                val input = contentResolver.openInputStream(uri) ?: return null
+                val displayName =
+                    queryDisplayName(uri) ?: "shared_${System.currentTimeMillis()}"
+                val safe = displayName.replace(Regex("[/\\\\]"), "_")
+                val outFile = File(cacheDir, "${UUID.randomUUID()}_$safe")
+                FileOutputStream(outFile).use { out ->
+                    input.use { inp -> inp.copyTo(out) }
+                }
+                return mapOf("path" to outFile.absolutePath, "name" to displayName)
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return null
+    }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -95,6 +209,40 @@ class MainActivity : FlutterActivity() {
                         result.success(null)
                     } catch (e: Exception) {
                         result.error("MULTICAST_LOCK", e.message, null)
+                    }
+                }
+                else -> result.notImplemented()
+            }
+        }
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "local_chat/share",
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "getPendingShareMaterialized" -> {
+                    ioExecutor.execute {
+                        try {
+                            val out = ArrayList<Map<String, String>>()
+                            val copy = synchronized(pendingShareUris) {
+                                val c = ArrayList(pendingShareUris)
+                                pendingShareUris.clear()
+                                c
+                            }
+                            for (uriStr in copy) {
+                                val uri = Uri.parse(uriStr)
+                                val m = materializeUri(uri)
+                                if (m != null) {
+                                    out.add(m)
+                                }
+                            }
+                            mainHandler.post {
+                                result.success(out)
+                            }
+                        } catch (e: Exception) {
+                            mainHandler.post {
+                                result.error("SHARE", e.message, null)
+                            }
+                        }
                     }
                 }
                 else -> result.notImplemented()

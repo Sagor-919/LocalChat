@@ -11,6 +11,7 @@ import 'package:window_manager/window_manager.dart';
 
 import 'app_branding.dart';
 import 'app_settings.dart';
+import 'android_share_inbound.dart';
 import 'chat_crypto.dart';
 import 'chat_screen.dart';
 import 'connection_service.dart';
@@ -477,6 +478,9 @@ class _LocalChatAppState extends State<LocalChatApp>
           await showFirstLaunchOnboardingIfNeeded(ctx);
         }
         if (!mounted) return;
+        if (Platform.isAndroid) {
+          await AndroidShareInbound.syncFromNative();
+        }
         unawaited(_tryOpenChatFromColdStartNotification());
       });
     }
@@ -607,6 +611,9 @@ class _LocalChatAppState extends State<LocalChatApp>
         state == AppLifecycleState.inactive;
     if (state == AppLifecycleState.resumed) {
       unawaited(_discovery.recoverAfterNetworkOrResume());
+      if (Platform.isAndroid) {
+        unawaited(AndroidShareInbound.syncFromNative());
+      }
     }
   }
 

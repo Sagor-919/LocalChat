@@ -13,6 +13,7 @@ import 'package:path/path.dart' as p;
 import 'package:super_clipboard/super_clipboard.dart';
 import 'package:uuid/uuid.dart';
 
+import 'android_share_inbound.dart';
 import 'chat_crypto.dart';
 import 'connection_service.dart';
 import 'device.dart';
@@ -216,6 +217,20 @@ class _ChatScreenState extends State<ChatScreen> {
     _connTimer = Timer.periodic(const Duration(seconds: 2), (_) => _syncConnection());
 
     HardwareKeyboard.instance.addHandler(_handleComposerHardwareKey);
+
+    if (!kIsWeb && Platform.isAndroid) {
+      AndroidShareInbound.attachChat(_consumeAndroidShare);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) unawaited(AndroidShareInbound.syncFromNative());
+      });
+    }
+  }
+
+  void _consumeAndroidShare(List<SharedInboundFile> files) {
+    if (!mounted || files.isEmpty) return;
+    _stageFiles(
+      files.map((e) => _StagedFile(e.path, e.name)).toList(),
+    );
   }
 
   /// Desktop: Enter sends (Shift+Enter keeps newline). Uses hardware handler so
@@ -418,6 +433,9 @@ class _ChatScreenState extends State<ChatScreen> {
     _scrollLoadOlderDebounce?.cancel();
     widget.store.messageHistoryRevision.removeListener(_onStoreRevision);
     HardwareKeyboard.instance.removeHandler(_handleComposerHardwareKey);
+    if (!kIsWeb && Platform.isAndroid) {
+      AndroidShareInbound.detachChat();
+    }
     _connTimer?.cancel();
     _scroll.removeListener(_onScroll);
     widget.connections.onMessage = _prevOnMessage;
