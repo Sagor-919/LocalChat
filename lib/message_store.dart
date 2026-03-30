@@ -336,7 +336,7 @@ class MessageStore {
         'messages',
         where: 'peer_id = ?',
         whereArgs: [peerId],
-        orderBy: 'timestamp ASC, id ASC',
+        orderBy: 'timestamp ASC, is_mine ASC, id ASC',
       );
       return rows.map(_rowToMessage).toList();
     });
@@ -350,7 +350,7 @@ class MessageStore {
         'messages',
         where: 'peer_id = ?',
         whereArgs: [peerId],
-        orderBy: 'timestamp DESC, id DESC',
+        orderBy: 'timestamp DESC, is_mine DESC, id DESC',
         limit: limit,
       );
       final list = rows.map(_rowToMessage).toList();
@@ -381,7 +381,7 @@ class MessageStore {
         'messages',
         where: 'peer_id = ?',
         whereArgs: [peerId],
-        orderBy: 'timestamp DESC, id DESC',
+        orderBy: 'timestamp DESC, is_mine DESC, id DESC',
         limit: limit,
       );
       final list = rows.map(_rowToMessage).toList();
@@ -416,7 +416,7 @@ class MessageStore {
         'messages',
         where: 'peer_id = ?',
         whereArgs: [peerId],
-        orderBy: 'timestamp ASC, id ASC',
+        orderBy: 'timestamp ASC, is_mine ASC, id ASC',
         offset: offset,
         limit: want,
       );
@@ -447,7 +447,7 @@ class MessageStore {
         'messages',
         where: 'peer_id = ?',
         whereArgs: [peerId],
-        orderBy: 'timestamp ASC, id ASC',
+        orderBy: 'timestamp ASC, is_mine ASC, id ASC',
         offset: offset,
         limit: limit,
       );
@@ -471,7 +471,7 @@ class MessageStore {
           MessageDelivery.undelivered.name,
           MessageDelivery.awaitingConfirm.name,
         ],
-        orderBy: 'timestamp ASC, id ASC',
+        orderBy: 'timestamp ASC, is_mine ASC, id ASC',
       );
       return rows.map(_rowToMessage).toList();
     });

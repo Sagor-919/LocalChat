@@ -14,6 +14,7 @@ import 'package:super_clipboard/super_clipboard.dart';
 import 'package:uuid/uuid.dart';
 
 import 'android_share_inbound.dart';
+import 'chat_message_ordering.dart';
 import 'chat_crypto.dart';
 import 'connection_service.dart';
 import 'device.dart';
@@ -83,12 +84,9 @@ class _ChatScreenState extends State<ChatScreen> {
   String get _peerId => widget.peer.userId;
   TransferManager get _tm => TransferManager.instance;
 
-  /// Matches SQLite ordering: [timestamp] then [id] for stable order when times tie.
-  static int _compareMessages(ChatMessage a, ChatMessage b) {
-    final c = a.timestamp.compareTo(b.timestamp);
-    if (c != 0) return c;
-    return a.id.compareTo(b.id);
-  }
+  /// Same as [compareChatMessagesChronological] — must match [MessageStore] SQL order.
+  static int _compareMessages(ChatMessage a, ChatMessage b) =>
+      compareChatMessagesChronological(a, b);
 
   void _insertMessageSorted(ChatMessage msg) {
     if (_allMessages.isEmpty) {
@@ -117,19 +115,28 @@ class _ChatScreenState extends State<ChatScreen> {
     _displayCount = (_displayCount + 1).clamp(0, _allMessages.length);
   }
 
-  void _syncSendTimestampSeq() {
-    if (_allMessages.isEmpty) {
-      _sendTimestampSeq = 0;
-      return;
+  /// Largest [ChatMessage.timestamp] in memory (not list position), so outgoing time
+  /// stays strictly after every row after reloads / debounced DB sync.
+  int _maxTimestampInThread() {
+    if (_allMessages.isEmpty) return 0;
+    var m = _allMessages.first.timestamp;
+    for (final x in _allMessages) {
+      if (x.timestamp > m) m = x.timestamp;
     }
-    _sendTimestampSeq = _allMessages.last.timestamp;
+    return m;
   }
 
-  /// Ensures new outgoing messages sort after the latest line in the thread (fixes desktop clock skew).
+  void _syncSendTimestampSeq() {
+    _sendTimestampSeq = _maxTimestampInThread();
+  }
+
+  /// Strictly after every message in the thread and >= local clock (clock skew / races).
+  /// Also uses [_sendTimestampSeq] so two sends before [_allMessages] reflects the first
+  /// row still get strictly increasing times.
   int _nextOutgoingTimestamp() {
     final now = DateTime.now().millisecondsSinceEpoch;
-    final lastTs = _allMessages.isEmpty ? 0 : _allMessages.last.timestamp;
-    final base = max(now, lastTs + 1);
+    final floor = _maxTimestampInThread();
+    final base = max(now, floor + 1);
     final next = max(base, _sendTimestampSeq + 1);
     _sendTimestampSeq = next;
     return next;
@@ -302,6 +309,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _allMessages
       ..clear()
       ..addAll(window.messages);
+    _allMessages.sort(_compareMessages);
     _hasMoreOlder = _allMessages.length < _totalInDb;
     _displayCount = _pageSize.clamp(0, _allMessages.length);
     if (_allMessages.length <= _pageSize) {
@@ -390,6 +398,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
       setState(() {
         _allMessages.insertAll(0, older);
+        _allMessages.sort(_compareMessages);
         _displayCount += older.length;
         _rebuildVisible();
         _hasMoreOlder = _allMessages.length < _totalInDb;
@@ -472,6 +481,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _allMessages
       ..clear()
       ..addAll(window.messages);
+    _allMessages.sort(_compareMessages);
     _hasMoreOlder = _allMessages.length < _totalInDb;
     _displayCount = _displayCount.clamp(0, _allMessages.length);
     if (_allMessages.length <= _pageSize) {
