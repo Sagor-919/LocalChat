@@ -87,7 +87,10 @@ class ConnectionService {
     _pingTimeoutTimers[peerId]?.cancel();
     _pendingPingIds[peerId] = pingId;
     final ok = sendJson(peerId, {'type': 'ping', 'id': pingId});
-    if (!ok) return;
+    if (!ok) {
+      unawaited(disconnect(peerId));
+      return;
+    }
     _pingTimeoutTimers[peerId] = Timer(pingTimeout, () {
       if (_pendingPingIds[peerId] != pingId) return;
       unawaited(disconnect(peerId));

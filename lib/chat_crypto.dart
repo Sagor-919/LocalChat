@@ -3,6 +3,15 @@ import 'dart:convert';
 import 'package:crypto/crypto.dart';
 import 'package:cryptography/cryptography.dart';
 
+/// Outcome of [ChatCrypto.decryptMessage]; distinguishes auth fail vs corruption.
+enum DecryptionResult {
+  success,
+  macFailed,
+  checksumMismatch,
+  invalidJson,
+  unknown,
+}
+
 /// LAN-style confidentiality: AES-256-GCM with a key derived from the two
 /// peer IDs (sorted). Same model as session material in `_ref_lanmessenger`
 /// (per-peer AES), without RSA handshake — suitable for trusted LANs only.
@@ -34,8 +43,8 @@ class ChatCrypto {
     return base64Encode(box.concatenation());
   }
 
-  /// Returns decrypted text, or null if MAC fails or checksum mismatch.
-  static Future<String?> decryptMessage(
+  /// Returns plaintext and [DecryptionResult]; null text means failure reason in result.
+  static Future<(String?, DecryptionResult)> decryptMessage(
     String myId,
     String peerId,
     String b64,
@@ -49,15 +58,25 @@ class ChatCrypto {
         macLength: 16,
       );
       final clear = await _algo.decrypt(box, secretKey: key);
-      final inner =
-          jsonDecode(utf8.decode(clear)) as Map<String, dynamic>;
+      final Map<String, dynamic> inner;
+      try {
+        inner = jsonDecode(utf8.decode(clear)) as Map<String, dynamic>;
+      } catch (_) {
+        return (null, DecryptionResult.invalidJson);
+      }
       final text = inner['text'] as String? ?? '';
       final expect = inner['sha'] as String? ?? '';
       final actual = sha256.convert(utf8.encode(text)).toString();
-      if (expect != actual) return null;
-      return text;
+      if (expect != actual) {
+        return (null, DecryptionResult.checksumMismatch);
+      }
+      return (text, DecryptionResult.success);
+    } on SecretBoxAuthenticationError {
+      return (null, DecryptionResult.macFailed);
+    } on FormatException {
+      return (null, DecryptionResult.unknown);
     } catch (_) {
-      return null;
+      return (null, DecryptionResult.unknown);
     }
   }
 

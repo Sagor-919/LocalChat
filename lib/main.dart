@@ -122,7 +122,7 @@ Future<void> _handleIncomingEncryptedMessage(
     String peerId, Map<String, dynamic> json) async {
   final ct = json['ct'] as String?;
   if (ct == null || ct.isEmpty) return;
-  final text = await ChatCrypto.decryptMessage(_me.userId, peerId, ct);
+  final (text, _) = await ChatCrypto.decryptMessage(_me.userId, peerId, ct);
   if (text == null) return;
   final msg = ChatMessage(
     id: json['id'] as String? ?? '',
