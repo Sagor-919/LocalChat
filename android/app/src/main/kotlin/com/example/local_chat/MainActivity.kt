@@ -18,7 +18,6 @@ import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.io.FileOutputStream
 import java.util.Collections
-import java.util.UUID
 import java.util.concurrent.Executors
 
 class MainActivity : FlutterActivity() {
@@ -102,7 +101,8 @@ class MainActivity : FlutterActivity() {
         return null
     }
 
-    private fun materializeUri(uri: Uri): Map<String, String>? {
+    /// Share rows for Flutter: `file` → path on disk; `content` → URI only (copy at send time).
+    private fun describeShareForDart(uri: Uri): Map<String, String>? {
         try {
             if (uri.scheme == "file") {
                 val rawPath = uri.path ?: return null
@@ -112,20 +112,33 @@ class MainActivity : FlutterActivity() {
                 return mapOf("path" to f.absolutePath, "name" to f.name)
             }
             if (uri.scheme == "content") {
-                val input = contentResolver.openInputStream(uri) ?: return null
                 val displayName =
                     queryDisplayName(uri) ?: "shared_${System.currentTimeMillis()}"
-                val safe = displayName.replace(Regex("[/\\\\]"), "_")
-                val outFile = File(cacheDir, "${UUID.randomUUID()}_$safe")
-                FileOutputStream(outFile).use { out ->
-                    input.use { inp -> inp.copyTo(out) }
-                }
-                return mapOf("path" to outFile.absolutePath, "name" to displayName)
+                return mapOf("contentUri" to uri.toString(), "name" to displayName)
             }
         } catch (e: Exception) {
             e.printStackTrace()
         }
         return null
+    }
+
+    private fun materializeContentUriToFile(uri: Uri, destFile: File): Boolean {
+        try {
+            if (uri.scheme != "content") return false
+            val input = contentResolver.openInputStream(uri) ?: return false
+            destFile.parentFile?.mkdirs()
+            FileOutputStream(destFile).use { out ->
+                input.use { inp -> inp.copyTo(out) }
+            }
+            return destFile.exists()
+        } catch (e: Exception) {
+            e.printStackTrace()
+            try {
+                if (destFile.exists()) destFile.delete()
+            } catch (_: Exception) {
+            }
+        }
+        return false
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -219,7 +232,7 @@ class MainActivity : FlutterActivity() {
             "local_chat/share",
         ).setMethodCallHandler { call, result ->
             when (call.method) {
-                "getPendingShareMaterialized" -> {
+                "drainPendingShares" -> {
                     ioExecutor.execute {
                         try {
                             val out = ArrayList<Map<String, String>>()
@@ -230,13 +243,38 @@ class MainActivity : FlutterActivity() {
                             }
                             for (uriStr in copy) {
                                 val uri = Uri.parse(uriStr)
-                                val m = materializeUri(uri)
+                                val m = describeShareForDart(uri)
                                 if (m != null) {
                                     out.add(m)
                                 }
                             }
                             mainHandler.post {
                                 result.success(out)
+                            }
+                        } catch (e: Exception) {
+                            mainHandler.post {
+                                result.error("SHARE", e.message, null)
+                            }
+                        }
+                    }
+                }
+                "materializeContentUri" -> {
+                    val uriStr = call.argument<String>("uri")
+                    val destPath = call.argument<String>("destPath")
+                    if (uriStr.isNullOrEmpty() || destPath.isNullOrEmpty()) {
+                        result.error("ARG", "uri and destPath required", null)
+                        return@setMethodCallHandler
+                    }
+                    ioExecutor.execute {
+                        try {
+                            val ok =
+                                materializeContentUriToFile(Uri.parse(uriStr), File(destPath))
+                            mainHandler.post {
+                                if (ok) {
+                                    result.success(null)
+                                } else {
+                                    result.error("SHARE", "materialize failed", null)
+                                }
                             }
                         } catch (e: Exception) {
                             mainHandler.post {

@@ -178,3 +178,27 @@ Auto device discovery
 Messenger UI
 Reliable file transfer
 Image preview
+
+---
+
+## Automated tests (attachments)
+
+Run:
+
+`flutter test`
+
+[`test/attachment_prepare_test.dart`](test/attachment_prepare_test.dart) covers chunked copy (progress, missing file, cancel) and `uniqueTempPath`. The folder-zip test runs only when `tar` is on `PATH` (otherwise it is skipped).
+
+## Manual QA — deferred attachments and Android share
+
+**Deferred send (composer):** Stage files or a folder from pickers / desktop drag-drop. Confirm no heavy work until Send: folder should not create a zip until send; duplicate paths in one batch should show **Preparing…** (copy) then **Sending…**. Cancel during prep should stop and clean up.
+
+**Large file:** Send a multi-GB file if possible; UI should stay responsive and progress should update.
+
+**Android — share into Local Chat (critical):** From another app, use *Share* and choose Local Chat.
+
+1. If you are on the **home** screen, you should see a banner like *"N file(s) shared — open a chat to attach"* (see [`lib/home_screen.dart`](lib/home_screen.dart) and [`lib/android_share_inbound.dart`](lib/android_share_inbound.dart)).
+2. Open a chat: [`ChatScreen`](lib/chat_screen.dart) calls `AndroidShareInbound.attachChat` and `syncFromNative`; shared items appear in the **staged row** right away. For typical `content://` shares, only the URI + display name are queued (**no full-file copy** until Send — see [`MainActivity.kt`](android/app/src/main/kotlin/com/example/local_chat/MainActivity.kt) `describeShareForDart` vs `materializeContentUriToFile`).
+3. Tap **Send**: the bubble shows **Preparing…** while the provider stream is copied to a temp file, then **Sending…** for the normal TCP transfer.
+
+Cold start and resume also call `syncFromNative` from [`lib/main.dart`](lib/main.dart) so intents are not lost if the activity was recreated.

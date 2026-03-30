@@ -1,4 +1,4 @@
-import 'dart:async';
+﻿import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' show min;
@@ -342,7 +342,7 @@ class MessageStore {
     });
   }
 
-  /// Recent [limit] messages for [peerId], oldest first — for chat lazy load.
+  /// Recent [limit] messages for [peerId], oldest first â€” for chat lazy load.
   Future<List<ChatMessage>> loadRecent(String peerId, int limit) async {
     if (limit <= 0) return [];
     return _withLock(peerId, () async {
@@ -358,7 +358,7 @@ class MessageStore {
     });
   }
 
-  /// [messageCount] + newest-[take] messages in one lock — avoids offset skew if rows are added concurrently.
+  /// [messageCount] + newest-[take] messages in one lock â€” avoids offset skew if rows are added concurrently.
   Future<({int total, List<ChatMessage> messages})> loadRecentWindow(
     String peerId,
     int take,
@@ -389,7 +389,7 @@ class MessageStore {
     });
   }
 
-  /// [messageCount] + [loadRange] for the next older slice — single lock for consistent paging.
+  /// [messageCount] + [loadRange] for the next older slice â€” single lock for consistent paging.
   Future<({int total, List<ChatMessage> older})> loadOlderBatch(
     String peerId,
     int alreadyLoaded,
@@ -564,7 +564,27 @@ class MessageStore {
     });
   }
 
-  Future<void> updateTransferDismissed(
+
+  Future<void> updateOutboundAttachment(
+    String peerId,
+    String messageId, {
+    String? path,
+    int? size,
+  }) async {
+    await _withLock(peerId, () async {
+      final map = <String, Object?>{};
+      if (path != null) map['attachment_path'] = path;
+      if (size != null) map['attachment_size'] = size;
+      if (map.isEmpty) return;
+      await _db.update(
+        'messages',
+        map,
+        where: 'peer_id = ? AND id = ?',
+        whereArgs: [peerId, messageId],
+      );
+    });
+    messageHistoryRevision.value++;
+  }  Future<void> updateTransferDismissed(
       String peerId, String messageId) async {
     return _withLock(peerId, () async {
       await _db.update(
@@ -593,3 +613,4 @@ class MessageStore {
     await _db.delete('peers', where: 'peer_id = ?', whereArgs: [peerId]);
   }
 }
+

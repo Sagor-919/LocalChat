@@ -21,6 +21,7 @@ import 'device.dart';
 import 'discovery_service.dart';
 import 'message_model.dart';
 import 'message_store.dart';
+import 'deferred_staged_file.dart';
 import 'transfer_manager.dart';
 
 class ChatScreen extends StatefulWidget {
@@ -69,7 +70,7 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _connected = false;
   bool _loading = true;
 
-  final List<_StagedFile> _staged = [];
+  final List<DeferredStagedFile> _staged = [];
   /// Prevents overlapping native file/folder/gallery pickers (multiple explorer windows).
   bool _nativePickerOpen = false;
 
@@ -236,7 +237,13 @@ class _ChatScreenState extends State<ChatScreen> {
   void _consumeAndroidShare(List<SharedInboundFile> files) {
     if (!mounted || files.isEmpty) return;
     _stageFiles(
-      files.map((e) => _StagedFile(e.path, e.name)).toList(),
+      files
+          .map((e) => DeferredStagedFile(
+                displayName: e.name,
+                sourcePath: e.path,
+                androidContentUri: e.contentUri,
+              ))
+          .toList(),
     );
   }
 
@@ -599,7 +606,7 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  void _stageFiles(List<_StagedFile> files) {
+  void _stageFiles(List<DeferredStagedFile> files) {
     if (files.isEmpty) return;
     // Defer so the picker can finish dismissing before a heavy ListView rebuild
     // (helps Android jank with many / large staged items).
@@ -619,7 +626,13 @@ class _ChatScreenState extends State<ChatScreen> {
       if (picked == null) return;
       _stageFiles(picked.files
           .where((f) => f.path != null)
-          .map((f) => _StagedFile(f.path!, f.name))
+          .map(
+            (f) => DeferredStagedFile(
+              sourcePath: f.path!,
+              displayName: f.name,
+              knownSizeBytes: f.size,
+            ),
+          )
           .toList());
     });
   }
@@ -628,42 +641,14 @@ class _ChatScreenState extends State<ChatScreen> {
     await _withSingleNativePicker(() async {
       final dirPath = await FilePicker.platform.getDirectoryPath();
       if (dirPath == null) return;
-
       final folderName = dirPath.split(Platform.pathSeparator).last;
-      final zipPath =
-          '${Directory.systemTemp.path}${Platform.pathSeparator}$folderName.zip';
-
-      try {
-        final zipFile = File(zipPath);
-        if (await zipFile.exists()) await zipFile.delete();
-
-        final parentDir = Directory(dirPath).parent.path;
-        final result = await Process.run(
-          'tar',
-          ['-a', '-cf', zipPath, '-C', parentDir, folderName],
-        );
-        if (result.exitCode != 0) {
-          if (mounted) {
-            ScaffoldMessenger.of(context)
-              ..clearSnackBars()
-              ..showSnackBar(SnackBar(
-                content: Text('Failed to compress folder: ${result.stderr}'),
-                behavior: SnackBarBehavior.floating,
-              ));
-          }
-          return;
-        }
-        _stageFiles([_StagedFile(zipPath, '$folderName.zip')]);
-      } catch (e) {
-        if (mounted) {
-          ScaffoldMessenger.of(context)
-            ..clearSnackBars()
-            ..showSnackBar(SnackBar(
-              content: Text('Failed to compress folder: $e'),
-              behavior: SnackBarBehavior.floating,
-            ));
-        }
-      }
+      _stageFiles([
+        DeferredStagedFile(
+          sourcePath: dirPath,
+          displayName: '$folderName.zip',
+          kind: StagedSourceKind.folderToZip,
+        ),
+      ]);
     });
   }
 
@@ -672,13 +657,24 @@ class _ChatScreenState extends State<ChatScreen> {
       final picker = ImagePicker();
       final images = await picker.pickMultiImage(limit: 20);
       if (images.isEmpty) return;
-      _stageFiles(images.map((x) => _StagedFile(x.path, x.name)).toList());
+      _stageFiles(images
+          .map((x) => DeferredStagedFile(
+                sourcePath: x.path,
+                displayName: x.name,
+              ))
+          .toList());
     });
   }
 
   void _onDropDone(DropDoneDetails details) {
     _stageFiles(
-        details.files.map((x) => _StagedFile(x.path, x.name)).toList());
+      details.files
+          .map((x) => DeferredStagedFile(
+                sourcePath: x.path,
+                displayName: x.name,
+              ))
+          .toList(),
+    );
   }
 
   // -----------------------------------------------------------------------
@@ -731,13 +727,14 @@ class _ChatScreenState extends State<ChatScreen> {
     }
 
     if (hasFiles) {
-      final raw = List<_StagedFile>.from(_staged);
+      final raw = List<DeferredStagedFile>.from(_staged);
       setState(() => _staged.clear());
-      final batch = await _dedupeStagedPaths(raw);
-      // One send at a time so chat TCP lines (file_notify + store.add) stay ordered
-      // and duplicate cache paths (same basename on Android) do not race.
-      for (final sf in batch) {
-        await _sendFile(sf.path, sf.name);
+      final seenKeys = <String>{};
+      for (final df in raw) {
+        final key = df.stagingDedupeKey;
+        final dup = seenKeys.contains(key);
+        if (!dup) seenKeys.add(key);
+        await _sendDeferredFile(df, duplicatePathInBatch: dup);
       }
     }
 
@@ -745,48 +742,52 @@ class _ChatScreenState extends State<ChatScreen> {
     _scrollToBottom();
   }
 
-  /// Picks / drag-drop can reuse one cache path for the same display name; copy so each send is distinct.
-  Future<List<_StagedFile>> _dedupeStagedPaths(List<_StagedFile> files) async {
-    final seen = <String>{};
-    final out = <_StagedFile>[];
-    for (final sf in files) {
-      if (seen.contains(sf.path)) {
-        final dest = await _copyFileToUniqueTemp(sf.path, sf.name);
-        out.add(_StagedFile(dest, sf.name));
-        seen.add(dest);
-      } else {
-        out.add(sf);
-        seen.add(sf.path);
-      }
-    }
-    return out;
-  }
-
-  Future<String> _copyFileToUniqueTemp(String sourcePath, String displayName) async {
-    final safe = displayName.replaceAll(RegExp(r'[/\\]'), '_');
-    final name = '${_uuid.v4()}_$safe';
-    final dest = p.join(Directory.systemTemp.path, name);
-    await File(sourcePath).copy(dest);
-    return dest;
-  }
-
-  Future<void> _sendFile(String filePath, String fileName) async {
+  Future<void> _sendDeferredFile(
+    DeferredStagedFile df, {
+    required bool duplicatePathInBatch,
+  }) async {
     final live = _resolveLivePeer();
     if (!widget.connections.isConnected(_peerId)) {
       await widget.connections.connectTo(live, forceNew: false);
     }
     final fileId = _uuid.v4();
-    final fileSize = await File(filePath).length();
-
-    await _tm.sendFile(
+    final ts = _nextOutgoingTimestamp();
+    final msg = ChatMessage(
+      id: fileId,
+      senderId: widget.me.userId,
+      text: 'File: ${df.displayName}',
+      timestamp: ts,
+      isMine: true,
+      attachmentName: df.displayName,
+      attachmentPath: df.kind == StagedSourceKind.file &&
+              !duplicatePathInBatch &&
+              df.androidContentUri == null &&
+              (df.sourcePath != null && df.sourcePath!.isNotEmpty)
+          ? df.sourcePath
+          : null,
+      attachmentSize: df.knownSizeBytes,
+    );
+    _insertMessageSorted(msg);
+    _growVisibleForNewMessage();
+    setState(() => _rebuildVisible());
+    final inserted = await widget.store.add(
+      _peerId,
+      msg,
+      peerDisplayName: live.name,
+      peerIp: live.ip,
+      peerTcpPort: live.port,
+    );
+    if (inserted) _totalInDb++;
+    if (!mounted) return;
+    await _tm.prepareAndSendOutbound(
+      initialMessage: msg,
       peerId: _peerId,
       peerIp: live.ip,
       peerDisplayName: live.name,
-      fileId: fileId,
-      fileName: fileName,
-      filePath: filePath,
-      fileSize: fileSize,
-      timestamp: _nextOutgoingTimestamp(),
+      sourcePath: df.sourcePath ?? '',
+      androidContentUri: df.androidContentUri,
+      kind: df.kind,
+      duplicatePathInBatch: duplicatePathInBatch,
     );
   }
 
@@ -1171,8 +1172,12 @@ class _ChatScreenState extends State<ChatScreen> {
               scrollDirection: Axis.horizontal,
               itemCount: _staged.length,
               itemBuilder: (ctx, i) {
-                final sf = _staged[i];
-                final isImg = _isImage(sf.name);
+                final df = _staged[i];
+                final isFolder = df.kind == StagedSourceKind.folderToZip;
+                final previewPath = df.localPathForPreview;
+                final isImg = previewPath != null &&
+                    _isImage(df.displayName) &&
+                    !isFolder;
                 return Padding(
                   padding: const EdgeInsets.only(right: 8),
                   child: Stack(
@@ -1187,13 +1192,15 @@ class _ChatScreenState extends State<ChatScreen> {
                         ),
                         clipBehavior: Clip.antiAlias,
                         child: _StagedThumbTile(
-                          path: sf.path,
-                          name: sf.name,
+                          path: previewPath,
+                          name: df.displayName,
                           isImage: isImg,
+                          isFolder: isFolder,
+                          knownSizeBytes: df.knownSizeBytes,
                           cs: cs,
                           imageWrapper: (image) => _wrapImageWithContextMenu(
-                            path: sf.path,
-                            fileName: sf.name,
+                            path: previewPath!,
+                            fileName: df.displayName,
                             image: image,
                           ),
                         ),
@@ -1468,6 +1475,42 @@ class _ChatScreenState extends State<ChatScreen> {
                   color: _failedRed,
                   onTap: () => _cancelTransfer(m.id),
                 ),
+              ] else if (t.isSending &&
+                  t.outgoingPhase == OutgoingTransferPhase.preparing) ...[
+                LinearProgressIndicator(
+                  value: t.totalBytes > 0
+                      ? t.progress.clamp(0, 1).toDouble()
+                      : null,
+                  minHeight: 5,
+                  borderRadius: BorderRadius.circular(99),
+                  backgroundColor: mine ? Colors.white24 : cs.outlineVariant,
+                  color: mine ? Colors.white : _iMessageBlue,
+                ),
+                const SizedBox(height: 6),
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        t.totalBytes > 0
+                            ? 'Preparing\u2026 ${(t.progress * 100).toStringAsFixed(0)}%'
+                                ' \u2022 ${_fmtBytes(t.transferredBytes)}/${_fmtBytes(t.totalBytes)}'
+                            : 'Preparing\u2026',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          color: subtleColor,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    _actionButton(
+                      label: 'Cancel',
+                      icon: Icons.stop_circle_outlined,
+                      color: _failedRed,
+                      onTap: () => _cancelTransfer(m.id),
+                    ),
+                  ],
+                ),
               ] else ...[
                 LinearProgressIndicator(
                   value: t.progress.clamp(0, 1).toDouble(),
@@ -1481,6 +1524,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   children: [
                     Expanded(
                       child: Text(
+                        '${t.isSending ? "Sending\u2026 " : "Receiving\u2026 "}'
                         '${(t.progress * 100).toStringAsFixed(0)}%'
                         ' \u2022 ${_fmtBytes(t.transferredBytes)}/${_fmtBytes(t.totalBytes)}'
                         ' \u2022 ${_fmtSpeed(t.currentSpeed)}',
@@ -1917,16 +1961,20 @@ class _ChatScreenState extends State<ChatScreen> {
 
 /// Staged attachment thumbnail: avoids decoding huge images on the UI thread (Android jank).
 class _StagedThumbTile extends StatefulWidget {
-  final String path;
+  final String? path;
   final String name;
   final bool isImage;
+  final bool isFolder;
+  final int? knownSizeBytes;
   final ColorScheme cs;
   final Widget Function(Widget image) imageWrapper;
 
   const _StagedThumbTile({
-    required this.path,
+    this.path,
     required this.name,
     required this.isImage,
+    this.isFolder = false,
+    this.knownSizeBytes,
     required this.cs,
     required this.imageWrapper,
   });
@@ -1936,17 +1984,70 @@ class _StagedThumbTile extends StatefulWidget {
 }
 
 class _StagedThumbTileState extends State<_StagedThumbTile> {
-  late final Future<int> _sizeFuture = File(widget.path).length();
+  Future<int>? _sizeFuture;
 
   static const _maxPreviewBytes = 6 * 1024 * 1024;
 
   @override
+  void initState() {
+    super.initState();
+    _refreshSizeFuture();
+  }
+
+  @override
+  void didUpdateWidget(_StagedThumbTile oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.path != widget.path) {
+      _refreshSizeFuture();
+    }
+  }
+
+  void _refreshSizeFuture() {
+    final p = widget.path;
+    _sizeFuture =
+        p != null && p.isNotEmpty ? File(p).length() : null;
+  }
+
+  @override
   Widget build(BuildContext context) {
+    if (widget.isFolder) {
+      return _folderIconColumn();
+    }
+    final p = widget.path;
+    if (p == null || p.isEmpty) {
+      return _fileIconColumn();
+    }
     if (!widget.isImage) {
       return _fileIconColumn();
     }
+    final kb = widget.knownSizeBytes;
+    if (kb != null) {
+      if (kb > _maxPreviewBytes) {
+        return _fileIconColumn();
+      }
+      return widget.imageWrapper(
+        Image.file(
+          File(p),
+          fit: BoxFit.cover,
+          width: 64,
+          height: 64,
+          cacheWidth: 128,
+          cacheHeight: 128,
+          filterQuality: FilterQuality.low,
+          errorBuilder: (_, _, _) => Icon(
+            Icons.broken_image,
+            size: 24,
+            color: widget.cs.outline,
+          ),
+        ),
+      );
+    }
+    final fut = _sizeFuture;
+    if (fut == null) {
+      return _fileIconColumn();
+    }
     return FutureBuilder<int>(
-      future: _sizeFuture,
+      future: fut,
       builder: (context, snap) {
         if (snap.hasError) {
           return _fileIconColumn();
@@ -1966,7 +2067,7 @@ class _StagedThumbTileState extends State<_StagedThumbTile> {
         }
         return widget.imageWrapper(
           Image.file(
-            File(widget.path),
+            File(p),
             fit: BoxFit.cover,
             width: 64,
             height: 64,
@@ -1981,6 +2082,30 @@ class _StagedThumbTileState extends State<_StagedThumbTile> {
           ),
         );
       },
+    );
+  }
+
+  Widget _folderIconColumn() {
+    return Column(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        Icon(Icons.folder_zip_outlined,
+            size: 24, color: widget.cs.onSurfaceVariant),
+        const SizedBox(height: 2),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4),
+          child: Text(
+            widget.name,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: 8,
+              color: widget.cs.onSurfaceVariant,
+            ),
+          ),
+        ),
+      ],
     );
   }
 
@@ -2007,11 +2132,4 @@ class _StagedThumbTileState extends State<_StagedThumbTile> {
       ],
     );
   }
-}
-
-// ---------------------------------------------------------------------------
-class _StagedFile {
-  final String path;
-  final String name;
-  const _StagedFile(this.path, this.name);
 }
