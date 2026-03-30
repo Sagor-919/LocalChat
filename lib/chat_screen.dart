@@ -13,6 +13,7 @@ import 'package:path/path.dart' as p;
 import 'package:super_clipboard/super_clipboard.dart';
 import 'package:uuid/uuid.dart';
 
+import 'android_attachment_picker.dart';
 import 'android_share_inbound.dart';
 import 'chat_session_cache.dart';
 import 'chat_message_ordering.dart';
@@ -660,16 +661,51 @@ class _ChatScreenState extends State<ChatScreen> {
 
   void _stageFiles(List<DeferredStagedFile> files) {
     if (files.isEmpty) return;
+    final existingKeys = _staged.map((e) => e.stagingDedupeKey).toSet();
+    final added = <DeferredStagedFile>[];
+    var duplicateCount = 0;
+    for (final f in files) {
+      final k = f.stagingDedupeKey;
+      if (k.isEmpty) {
+        added.add(f);
+        continue;
+      }
+      if (existingKeys.contains(k)) {
+        duplicateCount++;
+        continue;
+      }
+      existingKeys.add(k);
+      added.add(f);
+    }
     // Defer so the picker can finish dismissing before a heavy ListView rebuild
     // (helps Android jank with many / large staged items).
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      setState(() => _staged.addAll(files));
+      if (added.isNotEmpty) {
+        setState(() => _staged.addAll(added));
+      }
+      if (duplicateCount > 0) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text('Duplicate Removed'),
+            behavior: SnackBarBehavior.floating,
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      }
     });
   }
 
   Future<void> _pickFiles() async {
     await _withSingleNativePicker(() async {
+      // Android: native SAF picker returns content:// URIs only — no cache copy at pick time.
+      // The file_picker plugin always streams content:// into app cache before returning.
+      if (Platform.isAndroid) {
+        final staged = await AndroidAttachmentPicker.pickFiles();
+        if (staged.isEmpty) return;
+        _stageFiles(staged);
+        return;
+      }
       final picked = await FilePicker.platform.pickFiles(
         type: FileType.any,
         allowMultiple: true,
@@ -1259,19 +1295,24 @@ class _ChatScreenState extends State<ChatScreen> {
                         ),
                       ),
                       Positioned(
-                        top: -6,
-                        right: -6,
-                        child: GestureDetector(
-                          onTap: () => setState(() => _staged.removeAt(i)),
-                          child: Container(
-                            width: 20,
-                            height: 20,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              color: cs.error,
+                        top: -4,
+                        right: -4,
+                        child: Material(
+                          elevation: 4,
+                          shadowColor: Colors.black54,
+                          shape: const CircleBorder(),
+                          color: cs.surface,
+                          child: InkWell(
+                            customBorder: const CircleBorder(),
+                            onTap: () => setState(() => _staged.removeAt(i)),
+                            child: Padding(
+                              padding: const EdgeInsets.all(4),
+                              child: Icon(
+                                Icons.close_rounded,
+                                size: 18,
+                                color: cs.onSurface,
+                              ),
                             ),
-                            child:
-                                Icon(Icons.close, size: 12, color: cs.onError),
                           ),
                         ),
                       ),

@@ -208,6 +208,8 @@ Run:
 2. Open a chat: [`ChatScreen`](lib/chat_screen.dart) calls `AndroidShareInbound.attachChat` and `syncFromNative`; shared items appear in the **staged row** right away. For typical `content://` shares, only the URI + display name are queued (**no full-file copy** until Send — see [`MainActivity.kt`](android/app/src/main/kotlin/com/example/local_chat/MainActivity.kt) `describeShareForDart` vs `materializeContentUriToFile`).
 3. Tap **Send**: the bubble shows **Preparing…** while the provider stream is copied to a temp file, then **Sending…** for the normal TCP transfer.
 
+**Android — attach file (paperclip):** The in-chat **Attach file** action uses a native SAF flow ([`lib/android_attachment_picker.dart`](lib/android_attachment_picker.dart) → `local_chat/attachments` in [`MainActivity.kt`](android/app/src/main/kotlin/com/example/local_chat/MainActivity.kt)) that returns `content://` URIs and display names only. The `file_picker` plugin copies every `content://` selection into app cache before returning to Dart, which defeated deferred preparation; we avoid that here so the heavy copy runs on **Send** (same **Preparing…** path as share). While the system picker is open, attachment controls stay disabled (`_nativePickerOpen` in [`lib/chat_screen.dart`](lib/chat_screen.dart)) and re-enable when the picker finishes.
+
 Cold start and resume also call `syncFromNative` from [`lib/main.dart`](lib/main.dart) so intents are not lost if the activity was recreated.
 
 ## Peer identity and deduplication (LAN stable tag)

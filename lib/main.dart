@@ -34,6 +34,12 @@ final FlutterLocalNotificationsPlugin _notifications =
     FlutterLocalNotificationsPlugin();
 bool _appInForeground = true;
 
+/// Set from `main` args on Windows when launched from HKCU\...\Run with `--autostart`.
+bool _windowsAutostartLaunch = false;
+
+/// If true, [showFirstLaunchOnboardingIfNeeded] runs on first tray/window show instead of cold start.
+bool _deferOnboardingUntilWindowShown = false;
+
 /// Last connectivity snapshot for online/offline edge detection.
 List<ConnectivityResult>? _lastConnectivityResults;
 
@@ -106,16 +112,55 @@ Future<void> _pulseWindowsTaskbarForAttention() async {
   } catch (_) {}
 }
 
+/// Windows toast XML passes the payload in a `launch` attribute; JSON with `"` breaks
+/// the attribute and the native layer often delivers an empty payload. Use a plain
+/// [peerId] string in the payload on Windows (see [_notificationPayloadForPeer]).
 String? _parsePeerIdFromPayload(String? payload) {
   if (payload == null || payload.isEmpty) return null;
-  try {
-    final map = jsonDecode(payload) as Map<String, dynamic>?;
-    final id = map?['peerId'] as String?;
-    if (id == null || id.isEmpty) return null;
-    return id;
-  } catch (_) {
+  final trimmed = payload.trim();
+  if (trimmed.startsWith('{')) {
+    try {
+      final map = jsonDecode(trimmed) as Map<String, dynamic>?;
+      final id = map?['peerId'] as String?;
+      if (id != null && id.isNotEmpty) return id;
+    } catch (_) {}
     return null;
   }
+  return trimmed.isNotEmpty ? trimmed : null;
+}
+
+String _notificationPayloadForPeer(String peerId) {
+  if (Platform.isWindows) {
+    return peerId;
+  }
+  return jsonEncode({'peerId': peerId});
+}
+
+String? _peerIdFromNotificationResponse(NotificationResponse r) {
+  var p = _parsePeerIdFromPayload(r.payload);
+  if (p != null) return p;
+  if (r.data.isEmpty) return null;
+  for (final key in <String>['payload', 'launch', 'Payload', 'Launch']) {
+    final v = r.data[key];
+    if (v is String) {
+      p = _parsePeerIdFromPayload(v);
+      if (p != null) return p;
+    }
+  }
+  return null;
+}
+
+bool _isOpenChatNotificationTap(NotificationResponse r) {
+  if (r.notificationResponseType ==
+      NotificationResponseType.selectedNotification) {
+    return true;
+  }
+  if (Platform.isWindows &&
+      r.notificationResponseType ==
+          NotificationResponseType.selectedNotificationAction) {
+    return true;
+  }
+  return false;
 }
 
 Future<void> _handleIncomingEncryptedMessage(
@@ -156,7 +201,7 @@ Future<void> _handleIncomingTextMessage(String peerId, ChatMessage msg) async {
       name,
       msg.text,
       _incomingMessageNotificationDetails(),
-      payload: jsonEncode({'peerId': peerId}),
+      payload: _notificationPayloadForPeer(peerId),
     );
     unawaited(_pulseWindowsTaskbarForAttention());
   }
@@ -193,6 +238,18 @@ Future<PeerDevice?> _peerDeviceFromStore(String peerId) async {
   );
 }
 
+Future<void> _maybePresentDeferredOnboarding() async {
+  if (!_deferOnboardingUntilWindowShown) return;
+  if (AppSettings.instance.firstLaunchOnboardingComplete) {
+    _deferOnboardingUntilWindowShown = false;
+    return;
+  }
+  final ctx = appNavigatorKey.currentContext;
+  if (ctx == null || !ctx.mounted) return;
+  _deferOnboardingUntilWindowShown = false;
+  await showFirstLaunchOnboardingIfNeeded(ctx);
+}
+
 /// Show desktop window (from tray/minimized), then open the chat for [peerId].
 Future<void> openChatFromNotificationPayload(String peerId) async {
   if (peerId.isEmpty) return;
@@ -204,6 +261,7 @@ Future<void> openChatFromNotificationPayload(String peerId) async {
     }
     await windowManager.focus();
     await Future<void>.delayed(const Duration(milliseconds: 60));
+    await _maybePresentDeferredOnboarding();
   }
 
   final ctx = appNavigatorKey.currentContext;
@@ -237,15 +295,51 @@ Future<void> openChatFromNotificationPayload(String peerId) async {
 }
 
 void _onNotificationTapped(NotificationResponse response) {
-  if (response.notificationResponseType !=
-      NotificationResponseType.selectedNotification) {
+  if (!_isOpenChatNotificationTap(response)) {
     return;
   }
-  final peerId = _parsePeerIdFromPayload(response.payload);
-  if (peerId == null) return;
-  WidgetsBinding.instance.addPostFrameCallback((_) {
-    unawaited(openChatFromNotificationPayload(peerId));
-  });
+  final peerId = _peerIdFromNotificationResponse(response);
+  if (peerId == null) {
+    debugPrint(
+      'LocalChat: notification tap with no peer id (payload=${response.payload})',
+    );
+    return;
+  }
+  void run() {
+    if (_isDesktop && Platform.isWindows) {
+      unawaited(_ensureWindowVisibleThenOpenChat(peerId));
+    } else {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        unawaited(openChatFromNotificationPayload(peerId));
+      });
+    }
+  }
+
+  if (Platform.isWindows && _isDesktop) {
+    WidgetsBinding.instance.addPostFrameCallback((_) => run());
+  } else {
+    run();
+  }
+}
+
+/// Windows: notification taps can fire before the navigator is mounted; activate the window
+/// and poll briefly for [appNavigatorKey] before navigating.
+Future<void> _ensureWindowVisibleThenOpenChat(String peerId) async {
+  try {
+    await windowManager.show();
+    if (await windowManager.isMinimized()) {
+      await windowManager.restore();
+    }
+    await windowManager.focus();
+    var retries = 0;
+    while (appNavigatorKey.currentContext == null && retries < 200) {
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      retries++;
+    }
+    await openChatFromNotificationPayload(peerId);
+  } catch (e, st) {
+    debugPrint('Windows notification tap failed: $e\n$st');
+  }
 }
 
 Future<void> _tryOpenChatFromColdStartNotification() async {
@@ -253,14 +347,16 @@ Future<void> _tryOpenChatFromColdStartNotification() async {
     final details = await _notifications.getNotificationAppLaunchDetails();
     if (details?.didNotificationLaunchApp != true) return;
     final r = details!.notificationResponse;
-    if (r == null ||
-        r.notificationResponseType !=
-            NotificationResponseType.selectedNotification) {
+    if (r == null || !_isOpenChatNotificationTap(r)) {
       return;
     }
-    final peerId = _parsePeerIdFromPayload(r.payload);
+    final peerId = _peerIdFromNotificationResponse(r);
     if (peerId == null) return;
-    await openChatFromNotificationPayload(peerId);
+    if (_isDesktop && Platform.isWindows) {
+      await _ensureWindowVisibleThenOpenChat(peerId);
+    } else {
+      await openChatFromNotificationPayload(peerId);
+    }
   } catch (e, st) {
     debugPrint('Launch notification handling failed: $e\n$st');
   }
@@ -286,8 +382,18 @@ NotificationDetails _incomingMessageNotificationDetails() {
   );
 }
 
-Future<void> main() async {
+Future<void> main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  if (Platform.isWindows) {
+    _windowsAutostartLaunch = args.contains('--autostart');
+  }
+
+  await AppSettings.instance.init();
+  if (Platform.isWindows && _windowsAutostartLaunch) {
+    _deferOnboardingUntilWindowShown =
+        !AppSettings.instance.firstLaunchOnboardingComplete;
+  }
 
   if (_isDesktop) {
     await windowManager.ensureInitialized();
@@ -300,10 +406,12 @@ Future<void> main() async {
     await windowManager.center();
     await windowManager.setTitle('Local Chat');
     await windowManager.setPreventClose(true);
-    await windowManager.show();
+    if (Platform.isWindows && _windowsAutostartLaunch) {
+      await windowManager.hide();
+    } else {
+      await windowManager.show();
+    }
   }
-
-  await AppSettings.instance.init();
   _me = await DeviceInfo.load();
   _store = await MessageStore.init();
   _discovery = DiscoveryService(me: _me);
@@ -430,7 +538,7 @@ Future<void> main() async {
         name,
         'Sent you $fileName',
         _incomingMessageNotificationDetails(),
-        payload: jsonEncode({'peerId': event.peerId}),
+        payload: _notificationPayloadForPeer(event.peerId),
       );
       unawaited(_pulseWindowsTaskbarForAttention());
     }
@@ -473,7 +581,7 @@ class _LocalChatAppState extends State<LocalChatApp>
         await _syncDesktopNotifyForIncomingMessages();
         WidgetsBinding.instance.addPostFrameCallback((_) async {
           final ctx = appNavigatorKey.currentContext;
-          if (ctx != null && ctx.mounted) {
+          if (ctx != null && ctx.mounted && !_deferOnboardingUntilWindowShown) {
             await showFirstLaunchOnboardingIfNeeded(ctx);
           }
           unawaited(_tryOpenChatFromColdStartNotification());
@@ -539,6 +647,7 @@ class _LocalChatAppState extends State<LocalChatApp>
       await windowManager.show();
       await windowManager.focus();
       await Future<void>.delayed(const Duration(milliseconds: 80));
+      await _maybePresentDeferredOnboarding();
       await _syncDesktopNotifyForIncomingMessages();
     }());
   }
@@ -568,7 +677,11 @@ class _LocalChatAppState extends State<LocalChatApp>
 
   @override
   void onWindowFocus() {
-    if (_isDesktop) unawaited(_syncDesktopNotifyForIncomingMessages());
+    if (!_isDesktop) return;
+    unawaited(() async {
+      await _maybePresentDeferredOnboarding();
+      await _syncDesktopNotifyForIncomingMessages();
+    }());
   }
 
   @override
@@ -583,6 +696,7 @@ class _LocalChatAppState extends State<LocalChatApp>
       await windowManager.show();
       await windowManager.focus();
       await Future<void>.delayed(const Duration(milliseconds: 80));
+      await _maybePresentDeferredOnboarding();
       await _syncDesktopNotifyForIncomingMessages();
     }());
   }
@@ -601,6 +715,7 @@ class _LocalChatAppState extends State<LocalChatApp>
           await windowManager.show();
           await windowManager.focus();
           await Future<void>.delayed(const Duration(milliseconds: 80));
+          await _maybePresentDeferredOnboarding();
           await _syncDesktopNotifyForIncomingMessages();
         }());
         break;

@@ -98,13 +98,15 @@ class AppSettings {
     if (!Platform.isWindows) return;
     startWithWindows.value = enabled;
     final exe = Platform.resolvedExecutable;
+    /// Logon startup: pass `--autostart` so [main] can hide the window and stay in tray only.
+    final runValue = '"$exe" --autostart';
     if (enabled) {
       await Process.run('reg', [
         'add',
         r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
         '/v', 'LocalChat',
         '/t', 'REG_SZ',
-        '/d', exe,
+        '/d', runValue,
         '/f',
       ]);
     } else {
