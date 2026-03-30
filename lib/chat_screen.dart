@@ -14,6 +14,7 @@ import 'package:super_clipboard/super_clipboard.dart';
 import 'package:uuid/uuid.dart';
 
 import 'android_share_inbound.dart';
+import 'chat_session_cache.dart';
 import 'chat_message_ordering.dart';
 import 'chat_crypto.dart';
 import 'connection_service.dart';
@@ -46,11 +47,12 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> {
   static const _uuid = Uuid();
-  static const _pageSize = 50;
-  /// First DB fetch: newest N messages (SQLite indexed).
-  static const _initialHistoryWindow = 100;
-  /// Each scroll-up load of older messages.
-  static const _historyBatchSize = 50;
+  /// Visible slice of [_allMessages] (newest); smaller = faster first paint.
+  static const _pageSize = 25;
+  /// First DB fetch when opening chat (newest N only).
+  static const _initialHistoryWindow = 25;
+  /// Each scroll-up load of older messages from SQLite.
+  static const _historyBatchSize = 25;
 
   final List<ChatMessage> _allMessages = [];
   /// Keeps outgoing timestamps strictly after the latest row (clock skew + rapid sends).
@@ -309,6 +311,41 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _loadHistory() async {
+    final cached = ChatSessionCache.take(_peerId);
+    if (cached != null) {
+      final dbTotal = await widget.store.messageCount(_peerId);
+      if (!mounted) return;
+      if (dbTotal == cached.totalInDb) {
+        _applySessionSnapshot(cached);
+        unawaited(_rememberPeerRecord());
+        setState(() => _loading = false);
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (_scroll.hasClients) {
+            _scroll.jumpTo(_scroll.position.maxScrollExtent);
+          }
+        });
+        if (_connected) unawaited(_syncOutboundMessagesAfterConnect());
+        return;
+      }
+    }
+    await _loadHistoryFromDatabase();
+  }
+
+  void _applySessionSnapshot(ChatSessionSnapshot snap) {
+    _allMessages
+      ..clear()
+      ..addAll(snap.allMessages);
+    _totalInDb = snap.totalInDb;
+    _displayCount = snap.displayCount.clamp(0, _allMessages.length);
+    if (_allMessages.length <= _pageSize) {
+      _displayCount = _allMessages.length;
+    }
+    _hasMoreOlder = snap.hasMoreOlder;
+    _rebuildVisible();
+    _syncSendTimestampSeq();
+  }
+
+  Future<void> _loadHistoryFromDatabase() async {
     final window =
         await widget.store.loadRecentWindow(_peerId, _initialHistoryWindow);
     if (!mounted) return;
@@ -446,6 +483,17 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void dispose() {
+    if (_allMessages.isNotEmpty) {
+      ChatSessionCache.save(
+        _peerId,
+        ChatSessionSnapshot(
+          allMessages: _allMessages,
+          totalInDb: _totalInDb,
+          displayCount: _displayCount,
+          hasMoreOlder: _hasMoreOlder,
+        ),
+      );
+    }
     _storeRevisionDebounce?.cancel();
     _scrollLoadOlderDebounce?.cancel();
     widget.store.messageHistoryRevision.removeListener(_onStoreRevision);
@@ -480,9 +528,12 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _reloadMessagesFromStore() async {
-    final grow = _totalInDb > _allMessages.length ? 1 : 0;
-    // Do not cap by [_totalInDb] here — it can be stale; [loadRecentWindow] clamps to DB total.
-    final take = max(_allMessages.length + grow, _initialHistoryWindow);
+    final dbTotal = await widget.store.messageCount(_peerId);
+    if (!mounted) return;
+    final grow = dbTotal > _allMessages.length ? 1 : 0;
+    final need = _allMessages.length + grow;
+    // Newest N only; no fixed min of 100 (that was forcing huge reloads on every sync).
+    final take = min(max(need, _pageSize), dbTotal);
     final window = await widget.store.loadRecentWindow(_peerId, take);
     if (!mounted) return;
     _totalInDb = window.total;
@@ -828,6 +879,7 @@ class _ChatScreenState extends State<ChatScreen> {
           FilledButton(
             onPressed: () async {
               Navigator.pop(ctx);
+              ChatSessionCache.invalidate(_peerId);
               await widget.store.clear(_peerId);
               if (mounted) {
                 setState(() {

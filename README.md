@@ -189,6 +189,13 @@ Run:
 
 [`test/attachment_prepare_test.dart`](test/attachment_prepare_test.dart) covers chunked copy (progress, missing file, cancel) and `uniqueTempPath`. The folder-zip test runs only when `tar` is on `PATH` (otherwise it is skipped).
 
+## Chat history loading and session cache
+
+- **Initial load:** Opening a chat loads at most **25** recent messages from SQLite (`_pageSize`, `_initialHistoryWindow`, and `_historyBatchSize` in [`lib/chat_screen.dart`](lib/chat_screen.dart)). This keeps first paint light on long threads.
+- **Pagination:** The list shows a sliding slice of loaded messages; scrolling up reveals older ones in batches of 25. When in-memory history is exhausted but the database has more, the screen loads older rows via `loadOlderBatch` in [`lib/message_store.dart`](lib/message_store.dart).
+- **Reopen without a full disk reload:** On `dispose`, [`ChatSessionCache`](lib/chat_session_cache.dart) stores a snapshot of the session. When you open the same chat again, if the peer’s **message count in the DB matches** the cached total, the UI restores from cache and skips reloading history from SQLite. If the count changed (new messages while you were away), history is loaded from the database again.
+- **Clear chat:** Clearing the chat invalidates the session cache for that peer so the next open does not show stale data.
+
 ## Manual QA — deferred attachments and Android share
 
 **Deferred send (composer):** Stage files or a folder from pickers / desktop drag-drop. Confirm no heavy work until Send: folder should not create a zip until send; duplicate paths in one batch should show **Preparing…** (copy) then **Sending…**. Cancel during prep should stop and clean up.
