@@ -1,1 +1,6 @@
 include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  exclude:
+    - _ref_peer_zip_extract/**
+    - _ref_lanmessenger/**

@@ -10,42 +10,66 @@ import 'services/device_identity_service.dart';
 class DeviceInfo {
   final String userId;
   String displayName;
-  /// Opaque LAN tag (from [DeviceIdentityService]); empty if unsupported.
-  final String lanStableTag;
 
-  DeviceInfo({
-    required this.userId,
-    required this.displayName,
-    this.lanStableTag = '',
-  });
+  DeviceInfo({required this.userId, required this.displayName});
 
+  /// Load device info with new identity service.
+  /// 
+  /// Migration path:
+  /// 1. Check if old device_id exists in prefs
+  /// 2. Initialize new DeviceIdentityService
+  /// 3. Attempt recovery if hardware same
+  /// 4. Migrate display name
+  /// 
+  /// This ensures no duplicate devices after app clear.
   static Future<DeviceInfo> load() async {
     final prefs = await SharedPreferences.getInstance();
-    var id = prefs.getString('device_id');
-    if (id == null) {
-      id = const Uuid().v4();
-      await prefs.setString('device_id', id);
-    }
+    
+    // Step 1: Get old UUID if exists (for migration)
+    final oldUuid = prefs.getString('device_id');
+    
+    // Step 2: Initialize device identity service
+    final identityService = DeviceIdentityService();
+    final identity = await identityService.initializeDeviceIdentity();
+    
+    final userId = identity.userId;
+    final wasRecovered = identity.wasRecovered;
 
+    // Step 3: Migrate display name from old prefs or generate new
     final saved = prefs.getString('device_name')?.trim();
     String name;
-    if (saved != null && saved.isNotEmpty && !_isUnsuitableDisplayName(saved)) {
+    
+    if (saved != null && saved.isNotEmpty && 
+        !_isUnsuitableDisplayName(saved)) {
+      // Keep existing name
       name = saved;
+    } else if (wasRecovered) {
+      // Device recovered - keep trying to get old name
+      final oldName = prefs.getString('device_name_backup');
+      if (oldName != null && oldName.isNotEmpty) {
+        name = oldName;
+      } else {
+        name = _generateDisplayName(userId);
+      }
     } else {
+      // New device - generate name
       final host = Platform.localHostname.trim();
       if (!_isUnsuitableDisplayName(host)) {
         name = host;
       } else {
-        name = _randomGamingName(id);
+        name = _generateDisplayName(userId);
       }
-      await prefs.setString('device_name', name);
     }
 
-    final tag = await DeviceIdentityService.computeLanStableTag();
-    return DeviceInfo(userId: id, displayName: name, lanStableTag: tag);
+    await prefs.setString('device_name', name);
+    
+    // Step 4: Backup current UUID in case of future recovery
+    await prefs.setString('device_id_backup', userId);
+
+    return DeviceInfo(userId: userId, displayName: name);
   }
 
-  /// Hostnames like `localhost` after reinstall, or generic placeholders.
+  /// Hostnames that are too generic to use as device name.
   static bool _isUnsuitableDisplayName(String raw) {
     if (raw.isEmpty) return true;
     final s = raw.toLowerCase().trim();
@@ -61,7 +85,11 @@ class DeviceInfo {
     return false;
   }
 
-  static String _randomGamingName(String userId) {
+  /// Generate a gaming name from device UUID.
+  /// 
+  /// Uses seeded random so same UUID always generates same name.
+  /// This name changes only when UUID changes (new device).
+  static String _generateDisplayName(String userId) {
     final r = Random(userId.hashCode);
     const adjectives = [
       'Swift', 'Neon', 'Shadow', 'Pixel', 'Storm', 'Frost', 'Blaze', 'Volt',
@@ -79,9 +107,12 @@ class DeviceInfo {
     return '$a$n$tag';
   }
 
+  /// Update device display name in preferences.
   static Future<void> setName(String name) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('device_name', name.trim());
+    final trimmed = name.trim();
+    if (trimmed.isEmpty) return; // Don't allow empty names
+    await prefs.setString('device_name', trimmed);
   }
 
   Color get avatarColor {
@@ -107,8 +138,6 @@ class PeerDevice {
   final String ip;
   final int port;
   DateTime lastSeen;
-  /// From discovery payload; null if legacy peer or wire omitted.
-  final String? lanStableTag;
 
   PeerDevice({
     required this.userId,
@@ -116,7 +145,6 @@ class PeerDevice {
     required this.ip,
     required this.port,
     required this.lastSeen,
-    this.lanStableTag,
   });
 
   Color get avatarColor {

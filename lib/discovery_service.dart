@@ -192,7 +192,10 @@ class DiscoveryService {
   }
 
   void _broadcast() {
-    final msg = 'LOCALCHAT|${me.userId}|${me.displayName}|$tcpPort';
+    final tag = me.lanStableTag.trim();
+    final msg = tag.isEmpty
+        ? 'LOCALCHAT|${me.userId}|${me.displayName}|$tcpPort'
+        : 'LOCALCHAT|${me.userId}|${me.displayName}|$tcpPort|$tag';
     final data = utf8.encode(msg);
     try {
       _socket?.send(data, InternetAddress('255.255.255.255'), udpPort);
@@ -215,21 +218,29 @@ class DiscoveryService {
     final userId = parts[1];
     final name = parts[2];
     final port = int.tryParse(parts[3]) ?? tcpPort;
+    String? wireTag;
+    if (parts.length >= 5) {
+      final raw = parts[4].trim();
+      if (raw.isNotEmpty && raw != '-') wireTag = raw;
+    }
 
     if (userId == me.userId) return;
 
     final existing = _peers[userId];
+    final effectiveTag = wireTag ?? existing?.lanStableTag;
     if (existing != null) {
       existing.lastSeen = DateTime.now();
       if (existing.name != name ||
           existing.ip != senderIp ||
-          existing.port != port) {
+          existing.port != port ||
+          existing.lanStableTag != effectiveTag) {
         _peers[userId] = PeerDevice(
           userId: userId,
           name: name,
           ip: senderIp,
           port: port,
           lastSeen: DateTime.now(),
+          lanStableTag: effectiveTag,
         );
       }
     } else {
@@ -239,6 +250,7 @@ class DiscoveryService {
         ip: senderIp,
         port: port,
         lastSeen: DateTime.now(),
+        lanStableTag: effectiveTag,
       );
     }
     onPeersChanged?.call();

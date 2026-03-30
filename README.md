@@ -202,3 +202,11 @@ Run:
 3. Tap **Send**: the bubble shows **Preparing…** while the provider stream is copied to a temp file, then **Sending…** for the normal TCP transfer.
 
 Cold start and resume also call `syncFromNative` from [`lib/main.dart`](lib/main.dart) so intents are not lost if the activity was recreated.
+
+## Peer identity and deduplication (LAN stable tag)
+
+- Each device computes a **non-secret LAN tag** (`DeviceInfo.lanStableTag`) from OS-level identifiers via [`lib/services/device_identity_service.dart`](lib/services/device_identity_service.dart) and advertises it in UDP discovery (`LOCALCHAT|userId|name|port|tag`). See [`lib/discovery_service.dart`](lib/discovery_service.dart).
+- The prefs UUID (`device_id`) is still the **protocol peer id** for TCP/chat; after a neighbor **clears app data** they get a new UUID but usually the **same LAN tag** on the same hardware.
+- The **viewer’s** SQLite DB stores `lan_stable_tag` on the `peers` row ([`lib/message_store.dart`](lib/message_store.dart)). When a discovered peer’s tag matches an older peer id, history is **merged** into the new id (`mergePeerLanIdentity`) and the old TCP slot is disconnected — see [`lib/home_screen.dart`](lib/home_screen.dart) `_applyDiscoverySavesAndRefresh`.
+- **Fast reconnect UI:** [`ConnectionService`](lib/connection_service.dart) exposes `disconnectedPeerEvents` so the home list refreshes as soon as chat TCP drops, not only after UDP stale timing.
+- **Limits:** Merge by tag requires the older `peers` row to have been saved with a tag (this build or later). Legacy rows with only a UUID cannot auto-merge. Very old Android peers that omit the 5th discovery field still work; the tag is optional on the wire.

@@ -51,6 +51,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Timer? _discoveryDebounce;
 
   StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
+  StreamSubscription<String>? _tcpDisconnectSub;
   /// Null until the first [Connectivity.checkConnectivity] completes.
   List<ConnectivityResult>? _connectivityResults;
 
@@ -89,6 +90,12 @@ class _HomeScreenState extends State<HomeScreen> {
     });
 
     widget.discovery.onPeersChanged = _onDiscoveryPeersChanged;
+
+    _tcpDisconnectSub =
+        widget.connections.disconnectedPeerEvents.listen((_) {
+      if (!mounted) return;
+      unawaited(_refreshPeerList());
+    });
 
     unawaited(_initConnectivity());
 
@@ -138,13 +145,41 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _onDiscoveryPeersChanged() {
     _discoveryDebounce?.cancel();
-    _discoveryDebounce = Timer(const Duration(milliseconds: 400), () {
-      if (!mounted) return;
-      for (final p in widget.discovery.peers) {
-        unawaited(widget.store.savePeerInfo(p.userId, p.name, p.ip, p.port));
-      }
-      unawaited(_refreshPeerList());
+    _discoveryDebounce = Timer(const Duration(milliseconds: 160), () {
+      unawaited(_applyDiscoverySavesAndRefresh());
     });
+  }
+
+  /// LAN-tag merge (same device, new UUID), then persist discovery hints.
+  Future<void> _applyDiscoverySavesAndRefresh() async {
+    if (!mounted) return;
+    for (final p in widget.discovery.peers) {
+      final tag = p.lanStableTag?.trim() ?? '';
+      if (tag.isNotEmpty) {
+        final conflicts =
+            await widget.store.peerIdsMatchingLanTag(tag, p.userId);
+        for (final oldId in conflicts) {
+          await widget.store.mergePeerLanIdentity(
+            fromPeerId: oldId,
+            toPeerId: p.userId,
+            name: p.name,
+            ip: p.ip,
+            port: p.port,
+            lanStableTag: tag,
+          );
+          await widget.connections.disconnect(oldId);
+        }
+      }
+      await widget.store.savePeerInfo(
+        p.userId,
+        p.name,
+        p.ip,
+        p.port,
+        lanStableTag: p.lanStableTag,
+      );
+    }
+    if (!mounted) return;
+    await _refreshPeerList();
   }
 
   Future<void> _refreshPeerList() async {
@@ -249,6 +284,7 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void dispose() {
     _connectivitySub?.cancel();
+    _tcpDisconnectSub?.cancel();
     _discoveryDebounce?.cancel();
     widget.store.messageHistoryRevision.removeListener(_onMessageHistoryRevision);
     _fileMsgSub?.cancel();

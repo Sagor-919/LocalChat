@@ -1,4 +1,4 @@
-﻿import 'dart:async';
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' show min;
@@ -52,7 +52,7 @@ class MessageStore {
 
   MessageStore._();
 
-  static const int _dbVersion = 1;
+  static const int _dbVersion = 2;
   static const int _defaultChatTcpPort = 4041;
 
   static Future<MessageStore> init() async {
@@ -68,6 +68,12 @@ class MessageStore {
       onCreate: (db, version) async {
         await _createSchema(db);
       },
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          await db.execute(
+              'ALTER TABLE peers ADD COLUMN lan_stable_tag TEXT');
+        }
+      },
     );
     await store._migrateFromLegacyJsonIfNeeded();
     return store;
@@ -79,7 +85,8 @@ class MessageStore {
         peer_id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         ip TEXT NOT NULL,
-        port INTEGER NOT NULL
+        port INTEGER NOT NULL,
+        lan_stable_tag TEXT
       )
     ''');
     await db.execute('''
@@ -264,7 +271,12 @@ class MessageStore {
   // Peer metadata
   // ---------------------------------------------------------------------------
   Future<void> savePeerInfo(
-      String peerId, String name, String ip, int port) async {
+    String peerId,
+    String name,
+    String ip,
+    int port, {
+    String? lanStableTag,
+  }) async {
     final all = await loadAllPeerInfos();
     final prev = all[peerId];
 
@@ -286,6 +298,20 @@ class MessageStore {
     }
     if (resolvedPort <= 0) resolvedPort = _defaultChatTcpPort;
 
+    var resolvedTag = lanStableTag?.trim();
+    if (resolvedTag == null || resolvedTag.isEmpty) {
+      final prevRow = await _db.query(
+        'peers',
+        columns: ['lan_stable_tag'],
+        where: 'peer_id = ?',
+        whereArgs: [peerId],
+        limit: 1,
+      );
+      if (prevRow.isNotEmpty) {
+        resolvedTag = prevRow.first['lan_stable_tag'] as String?;
+      }
+    }
+
     await _db.insert(
       'peers',
       {
@@ -293,9 +319,66 @@ class MessageStore {
         'name': resolvedName,
         'ip': resolvedIp,
         'port': resolvedPort,
+        'lan_stable_tag': resolvedTag,
       },
       conflictAlgorithm: ConflictAlgorithm.replace,
     );
+  }
+
+  /// Peers whose stored [lan_stable_tag] matches [tag] but id is not [exceptPeerId].
+  Future<List<String>> peerIdsMatchingLanTag(
+    String tag,
+    String exceptPeerId,
+  ) async {
+    final t = tag.trim();
+    if (t.isEmpty) return [];
+    final rows = await _db.query(
+      'peers',
+      columns: ['peer_id'],
+      where: 'lan_stable_tag = ? AND peer_id != ?',
+      whereArgs: [t, exceptPeerId],
+    );
+    return [for (final r in rows) r['peer_id'] as String];
+  }
+
+  /// Rewrites history when a neighbor keeps the same device but gets a new UUID.
+  Future<void> mergePeerLanIdentity({
+    required String fromPeerId,
+    required String toPeerId,
+    required String name,
+    required String ip,
+    required int port,
+    String? lanStableTag,
+  }) async {
+    if (fromPeerId == toPeerId) return;
+    await _db.transaction((txn) async {
+      await txn.update(
+        'messages',
+        {'peer_id': toPeerId},
+        where: 'peer_id = ?',
+        whereArgs: [fromPeerId],
+      );
+      await txn.update(
+        'messages',
+        {'sender_id': toPeerId},
+        where: 'peer_id = ? AND sender_id = ?',
+        whereArgs: [toPeerId, fromPeerId],
+      );
+      await txn.delete('peers', where: 'peer_id = ?', whereArgs: [fromPeerId]);
+      final tag = lanStableTag?.trim();
+      await txn.insert(
+        'peers',
+        {
+          'peer_id': toPeerId,
+          'name': name,
+          'ip': ip,
+          'port': port,
+          if (tag != null && tag.isNotEmpty) 'lan_stable_tag': tag,
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+    });
+    messageHistoryRevision.value++;
   }
 
   Future<Map<String, Map<String, dynamic>>> loadAllPeerInfos() async {
@@ -306,6 +389,7 @@ class MessageStore {
           'name': r['name'],
           'ip': r['ip'],
           'port': r['port'],
+          'lan_stable_tag': r['lan_stable_tag'],
         }
     };
   }
@@ -584,7 +668,9 @@ class MessageStore {
       );
     });
     messageHistoryRevision.value++;
-  }  Future<void> updateTransferDismissed(
+  }
+
+  Future<void> updateTransferDismissed(
       String peerId, String messageId) async {
     return _withLock(peerId, () async {
       await _db.update(

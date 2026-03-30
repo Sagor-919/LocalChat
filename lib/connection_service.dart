@@ -34,6 +34,18 @@ class ConnectionService {
   void Function(String peerId)? onDisconnected;
   void Function(Socket socket, String peerId)? onIncomingConnection;
 
+  /// Additional observers (e.g. [HomeScreen]) without replacing [onDisconnected].
+  final StreamController<String> _disconnectEvents =
+      StreamController<String>.broadcast();
+
+  /// Fired for every chat TCP loss / local [disconnect] — use for fast list refresh.
+  Stream<String> get disconnectedPeerEvents => _disconnectEvents.stream;
+
+  void _notifyDisconnected(String peerId) {
+    onDisconnected?.call(peerId);
+    if (!_disconnectEvents.isClosed) _disconnectEvents.add(peerId);
+  }
+
   ConnectionService({required this.me});
 
   Future<Socket> _connectChatSocket(String host, int port) async {
@@ -158,7 +170,7 @@ class ConnectionService {
           _buffers.remove(peerId);
           if (had) {
             _clearPingState(id);
-            onDisconnected?.call(peerId!);
+            _notifyDisconnected(peerId!);
           }
         }
       },
@@ -169,7 +181,7 @@ class ConnectionService {
           _buffers.remove(peerId);
           if (had) {
             _clearPingState(id);
-            onDisconnected?.call(peerId!);
+            _notifyDisconnected(peerId!);
           }
         }
       },
@@ -233,7 +245,7 @@ class ConnectionService {
       try {
         socket.destroy();
       } catch (_) {}
-      onDisconnected?.call(peerId);
+      _notifyDisconnected(peerId);
       return false;
     }
   }
@@ -250,7 +262,7 @@ class ConnectionService {
     } catch (_) {}
     // Socket was removed before close(); onDone may not fire with a mapped
     // peer — notify explicitly so UI and discovery stay in sync.
-    if (s != null) onDisconnected?.call(peerId);
+    if (s != null) _notifyDisconnected(peerId);
   }
 
   /// Closes every outbound/inbound chat socket (e.g. Wi‑Fi lost). Invokes
@@ -276,5 +288,8 @@ class ConnectionService {
     _buffers.clear();
     await _server?.close();
     _server = null;
+    if (!_disconnectEvents.isClosed) {
+      await _disconnectEvents.close();
+    }
   }
 }

@@ -440,6 +440,7 @@ class _ChatScreenState extends State<ChatScreen> {
       live.name,
       live.ip,
       live.port,
+      lanStableTag: live.lanStableTag,
     );
   }
 

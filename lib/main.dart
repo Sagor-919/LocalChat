@@ -182,12 +182,14 @@ Future<PeerDevice?> _peerDeviceFromStore(String peerId) async {
   final infos = await _store.loadAllPeerInfos();
   final info = infos[peerId];
   if (info == null) return null;
+  final tag = info['lan_stable_tag'] as String?;
   return PeerDevice(
     userId: peerId,
     name: info['name'] as String? ?? 'Unknown',
     ip: info['ip'] as String? ?? '',
     port: (info['port'] as num?)?.toInt() ?? ConnectionService.tcpPort,
     lastSeen: DateTime.now(),
+    lanStableTag: tag != null && tag.isNotEmpty ? tag : null,
   );
 }
 
@@ -355,7 +357,13 @@ Future<void> main() async {
       final displayName = name.isNotEmpty
           ? name
           : ((peer?.name ?? '').trim().isNotEmpty ? peer!.name : 'Peer');
-      unawaited(_store.savePeerInfo(peerId, displayName, ip, port));
+      unawaited(_store.savePeerInfo(
+        peerId,
+        displayName,
+        ip,
+        port,
+        lanStableTag: peer?.lanStableTag,
+      ));
       return;
     }
 
