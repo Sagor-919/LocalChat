@@ -10,6 +10,7 @@ import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'app_branding.dart';
+import 'app_metadata.dart';
 import 'app_settings.dart';
 import 'android_share_inbound.dart';
 import 'chat_crypto.dart';
@@ -404,7 +405,7 @@ Future<void> main(List<String> args) async {
     await windowManager.setSize(const Size(windowWidth, windowHeight));
     await windowManager.setMinimumSize(const Size(360, 500));
     await windowManager.center();
-    await windowManager.setTitle('Local Chat');
+    await windowManager.setTitle('Local Chat · ${AppMetadata.releaseLabel}');
     await windowManager.setPreventClose(true);
     if (Platform.isWindows && _windowsAutostartLaunch) {
       await windowManager.hide();
@@ -747,7 +748,7 @@ class _LocalChatAppState extends State<LocalChatApp>
       builder: (_, mode, child) {
         return MaterialApp(
           navigatorKey: appNavigatorKey,
-          title: 'Local Chat',
+          title: 'Local Chat · ${AppMetadata.releaseLabel}',
           debugShowCheckedModeBanner: false,
           themeMode: mode,
           theme: ThemeData(

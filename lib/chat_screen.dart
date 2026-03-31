@@ -16,6 +16,7 @@ import 'package:super_clipboard/super_clipboard.dart';
 import 'package:uuid/uuid.dart';
 
 import 'app_settings.dart';
+import 'app_snackbar.dart';
 import 'android_attachment_picker.dart';
 import 'android_share_inbound.dart';
 import 'chat_message_ordering.dart';
@@ -88,8 +89,8 @@ class _ChatScreenState extends State<ChatScreen> {
   /// Prevents overlapping native file/folder/gallery pickers (multiple explorer windows).
   bool _nativePickerOpen = false;
 
-  /// Desktop clipboard image filenames: Image_01, Image_02, …
-  int _desktopPasteImageSeq = 1;
+  /// Clipboard image filenames: Image_01, Image_02, … (non-web)
+  int _clipboardPasteImageSeq = 1;
 
   /// Pasted image hashes currently represented in [_staged] (duplicate paste guard).
   final Set<String> _stagedClipboardHashes = {};
@@ -715,14 +716,9 @@ class _ChatScreenState extends State<ChatScreen> {
 
       try {
         final dir = await getTemporaryDirectory();
-        final String name;
-        if (_isDesktop) {
-          final n = _desktopPasteImageSeq;
-          _desktopPasteImageSeq++;
-          name = 'Image_${n.toString().padLeft(2, '0')}.$ext';
-        } else {
-          name = 'paste_${_uuid.v4()}.$ext';
-        }
+        final n = _clipboardPasteImageSeq;
+        _clipboardPasteImageSeq++;
+        final name = 'Image_${n.toString().padLeft(2, '0')}.$ext';
         final outPath = p.join(dir.path, name);
         await File(outPath).writeAsBytes(bytes);
         if (!mounted) return;
@@ -1588,14 +1584,6 @@ class _ChatScreenState extends State<ChatScreen> {
     }
     _lastSnackMessage = message;
     _lastSnackAt = now;
-    final mq = MediaQuery.of(context);
-    final composerBand =
-        12 +
-        12 +
-        48 +
-        (_staged.isNotEmpty ? 92.0 : 0.0) +
-        100.0;
-    final bottom = mq.viewInsets.bottom + mq.padding.bottom + composerBand;
     final ms = ScaffoldMessenger.of(context);
     ms.clearSnackBars();
     ms.showSnackBar(
@@ -1603,11 +1591,8 @@ class _ChatScreenState extends State<ChatScreen> {
         content: Text(message),
         duration: const Duration(milliseconds: 1800),
         behavior: SnackBarBehavior.floating,
-        margin: EdgeInsets.only(
-          left: 16,
-          right: 16,
-          bottom: bottom,
-        ),
+        margin: appSnackBarMargin(context),
+        dismissDirection: DismissDirection.up,
       ),
     );
   }
@@ -2259,13 +2244,15 @@ class _ChatScreenState extends State<ChatScreen> {
 
   /// Right-click / long-press: default text operations + paste image (desktop + Android).
   Widget _composerContextMenu(BuildContext context, EditableTextState state) {
-    return AdaptiveTextSelectionToolbar.buttonItems(
+    final cs = Theme.of(context).colorScheme;
+    final isAndroid = !kIsWeb && Platform.isAndroid;
+    final toolbar = AdaptiveTextSelectionToolbar.buttonItems(
       anchors: state.contextMenuAnchors,
       buttonItems: <ContextMenuButtonItem>[
         ...state.contextMenuButtonItems,
-        if (_isDesktop || (!kIsWeb && Platform.isAndroid))
+        if (_isDesktop || isAndroid)
           ContextMenuButtonItem(
-            label: 'Paste image from clipboard',
+            label: isAndroid ? 'Paste image' : 'Paste image from clipboard',
             onPressed: () {
               state.hideToolbar();
               unawaited(_pasteClipboardImageToStaging());
@@ -2273,6 +2260,18 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
       ],
     );
+    if (isAndroid) {
+      return Material(
+        elevation: 4,
+        surfaceTintColor: cs.surfaceTint,
+        shadowColor: Colors.black.withValues(alpha: 0.28),
+        borderRadius: BorderRadius.circular(14),
+        color: cs.surfaceContainerHigh,
+        clipBehavior: Clip.antiAlias,
+        child: toolbar,
+      );
+    }
+    return toolbar;
   }
 
   // -----------------------------------------------------------------------

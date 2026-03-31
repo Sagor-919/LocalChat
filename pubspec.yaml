@@ -1,7 +1,7 @@
 name: local_chat
-description: "Local Chat — Simplified LAN Messenger"
+description: "Local Chat — peer-to-peer LAN messenger (Alpha). Publisher: RecklessGalaxy.com"
 publish_to: 'none'
-version: 1.0.0+1
+version: 1.7.0+7
 
 environment:
   sdk: ^3.11.4
@@ -31,6 +31,7 @@ dependencies:
   sqflite_common_ffi: ^2.4.0+2
   synchronized: ^3.4.0
   device_info_plus: ^11.5.0
+  package_info_plus: ^8.1.2
 
 dev_dependencies:
   flutter_test:
