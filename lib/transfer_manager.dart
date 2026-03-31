@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:path_provider/path_provider.dart';
 
 import 'connection_service.dart';
 import 'file_transfer_service.dart';
@@ -143,6 +144,30 @@ class TransferManager {
       } catch (_) {}
     }
     t.tempPathsForCleanup.clear();
+  }
+
+  static String _sanitizeOutboundFilename(String name) {
+    final s = name.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_').trim();
+    if (s.isEmpty) return 'file';
+    return s.length > 120 ? s.substring(0, 120) : s;
+  }
+
+  /// Copy to app documents so we never store a path that [cleanupOutgoingTemps] will delete later.
+  Future<String> _persistOutboundFileToDocuments(
+    String sourcePath,
+    String messageId,
+    String attachmentName,
+  ) async {
+    final root = await getApplicationDocumentsDirectory();
+    final dir = Directory(p.join(root.path, 'outbound_attachments'));
+    if (!await dir.exists()) {
+      await dir.create(recursive: true);
+    }
+    final ext = p.extension(attachmentName);
+    final base = _sanitizeOutboundFilename(p.basenameWithoutExtension(attachmentName));
+    final destPath = p.join(dir.path, '${messageId}_$base$ext');
+    await File(sourcePath).copy(destPath);
+    return destPath;
   }
 
   /// [initialMessage] must already be in [MessageStore]. Prepares file (copy / folder zip), then sends.
@@ -298,20 +323,31 @@ class TransferManager {
 
       if (t.cancelRequested) throw const AttachmentPrepareCancelled();
 
+      // Temp prep paths (content URI, duplicate batch, zip) are deleted after send; DB must
+      // reference a permanent copy so thumbnails and open keep working.
+      var outboundPath = sendPath;
+      if (t.tempPathsForCleanup.contains(sendPath)) {
+        outboundPath = await _persistOutboundFileToDocuments(
+          sendPath,
+          initialMessage.id,
+          initialMessage.attachmentName!,
+        );
+      }
+
       await _store.updateOutboundAttachment(
         peerId,
         initialMessage.id,
-        path: sendPath,
+        path: outboundPath,
         size: sendSize,
       );
 
       final updated = initialMessage.copyWith(
-        attachmentPath: sendPath,
+        attachmentPath: outboundPath,
         attachmentSize: sendSize,
       );
       _fileMessages.add(FileMessageEvent(peerId, updated));
 
-      t.filePath = sendPath;
+      t.filePath = outboundPath;
       t.totalBytes = sendSize;
       t.transferredBytes = 0;
       t.progress = 0;

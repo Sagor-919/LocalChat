@@ -8,11 +8,13 @@ import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.provider.OpenableColumns
 import android.provider.Settings
+import androidx.core.content.FileProvider
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -320,6 +322,30 @@ class MainActivity : FlutterActivity() {
                         result.error("SETTINGS", e.message, null)
                     }
                 }
+                "openFolderInFileManager" -> {
+                    val path = call.argument<String>("path") ?: ""
+                    val folder = File(path)
+                    if (!folder.exists()) {
+                        result.error("NOT_FOUND", "path missing", null)
+                        return@setMethodCallHandler
+                    }
+                    val target = if (folder.isFile) folder.parentFile else folder
+                    if (target == null || !target.exists()) {
+                        result.error("NOT_FOUND", "bad folder", null)
+                        return@setMethodCallHandler
+                    }
+                    try {
+                        when {
+                            tryOpenFolderAsDocumentUri(target) -> result.success(null)
+                            tryOpenAndroidDataInDocumentsUi() -> result.success(null)
+                            tryOpenFolderWithFileProvider(target) -> result.success(null)
+                            tryOpenAppSettingsForStorage() -> result.success(null)
+                            else -> result.error("OPEN", "Could not open folder", null)
+                        }
+                    } catch (e: Exception) {
+                        result.error("OPEN", e.message, null)
+                    }
+                }
                 else -> result.notImplemented()
             }
         }
@@ -447,6 +473,81 @@ class MainActivity : FlutterActivity() {
                 }
                 else -> result.notImplemented()
             }
+        }
+    }
+
+    /// Opens a folder in the system Documents / Files UI (primary external storage).
+    /// Avoids FileProvider + `vnd.android.document/directory`, which often routes to archive/extractor apps.
+    private fun tryOpenFolderAsDocumentUri(target: File): Boolean {
+        return try {
+            if (!target.exists()) return false
+            val folder = if (target.isDirectory) target else target.parentFile ?: return false
+            val extRoot = Environment.getExternalStorageDirectory()?.canonicalFile?.canonicalPath
+                ?: return false
+            val folderPath = folder.canonicalFile.canonicalPath
+            if (!folderPath.startsWith(extRoot)) return false
+            val relative = folderPath.removePrefix(extRoot).trimStart('/')
+            val docId = "primary:$relative"
+            val encoded = Uri.encode(docId)
+            val uri = Uri.parse(
+                "content://com.android.externalstorage.documents/document/$encoded",
+            )
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                data = uri
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(intent)
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun tryOpenFolderWithFileProvider(target: File): Boolean {
+        return try {
+            val uri = FileProvider.getUriForFile(
+                this,
+                "$packageName.flutter_local_chat_files",
+                target,
+            )
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "vnd.android.document/directory")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(intent)
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun tryOpenAndroidDataInDocumentsUi(): Boolean {
+        return try {
+            val docId = "primary:Android/data/$packageName"
+            val uri = Uri.parse(
+                "content://com.android.externalstorage.documents/document/" +
+                    Uri.encode(docId),
+            )
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                data = uri
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(intent)
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun tryOpenAppSettingsForStorage(): Boolean {
+        return try {
+            val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                data = Uri.parse("package:$packageName")
+            }
+            startActivity(intent)
+            true
+        } catch (_: Exception) {
+            false
         }
     }
 }

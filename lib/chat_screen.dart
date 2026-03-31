@@ -14,6 +14,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:super_clipboard/super_clipboard.dart';
 import 'package:uuid/uuid.dart';
 
+import 'app_settings.dart';
 import 'android_attachment_picker.dart';
 import 'android_share_inbound.dart';
 import 'chat_message_ordering.dart';
@@ -48,6 +49,8 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> {
   static const _uuid = Uuid();
+  static const MethodChannel _appControlChannel =
+      MethodChannel('local_chat/app_control');
 
   static const _pageSize = 50;
 
@@ -947,18 +950,109 @@ class _ChatScreenState extends State<ChatScreen> {
     _tm.cancel(fileId);
   }
 
-  void _openFolder(String filePath) {
-    if (Platform.isWindows) {
-      Process.run('explorer.exe', ['/select,', filePath]);
-    } else {
-      final dir = File(filePath).parent.path;
-      OpenFilex.open(dir);
+  String? _mimeTypeForPath(String path) {
+    switch (p.extension(path).toLowerCase()) {
+      case '.png':
+        return 'image/png';
+      case '.jpg':
+      case '.jpeg':
+        return 'image/jpeg';
+      case '.gif':
+        return 'image/gif';
+      case '.webp':
+        return 'image/webp';
+      case '.bmp':
+        return 'image/bmp';
+      case '.heic':
+      case '.heif':
+        return 'image/heic';
+      default:
+        return null;
     }
   }
 
-  void _locateFileAndroid(String filePath) {
-    final dir = File(filePath).parent.path;
-    OpenFilex.open(dir);
+  Future<void> _openAttachmentPath(String path) async {
+    final f = File(path);
+    if (!await f.exists()) {
+      if (mounted) _showCopyFeedback('File not found');
+      return;
+    }
+    final mime = _mimeTypeForPath(path);
+    final r = await OpenFilex.open(path, type: mime);
+    if (!mounted) return;
+    if (r.type != ResultType.done) {
+      _showCopyFeedback('Could not open file');
+    }
+  }
+
+  void _openFolder(String filePath) {
+    final fallback = AppSettings.instance.downloadPath.value;
+    final file = File(filePath);
+    if (file.existsSync()) {
+      if (Platform.isWindows) {
+        Process.run('explorer.exe', ['/select,', filePath]);
+      } else if (Platform.isMacOS) {
+        Process.run('open', ['-R', filePath]);
+      } else {
+        unawaited(OpenFilex.open(file.parent.path));
+      }
+      return;
+    }
+    if (fallback.isNotEmpty) {
+      final d = Directory(fallback);
+      if (d.existsSync()) {
+        if (Platform.isWindows) {
+          Process.run('explorer.exe', [fallback]);
+        } else if (Platform.isMacOS) {
+          Process.run('open', [fallback]);
+        } else {
+          unawaited(OpenFilex.open(fallback));
+        }
+        return;
+      }
+    }
+    final parent = file.parent.path;
+    if (Directory(parent).existsSync()) {
+      if (Platform.isWindows) {
+        Process.run('explorer.exe', [parent]);
+      } else if (Platform.isMacOS) {
+        Process.run('open', [parent]);
+      } else {
+        unawaited(OpenFilex.open(parent));
+      }
+    } else if (mounted) {
+      _showCopyFeedback('File not found');
+    }
+  }
+
+  Future<void> _locateFileAndroid(String filePath) async {
+    final f = File(filePath);
+    final dl = AppSettings.instance.downloadPath.value;
+    final String folderToOpen;
+    if (await f.exists()) {
+      folderToOpen = f.parent.path;
+    } else if (dl.isNotEmpty && await Directory(dl).exists()) {
+      folderToOpen = dl;
+    } else {
+      final parent = f.parent.path;
+      if (await Directory(parent).exists()) {
+        folderToOpen = parent;
+      } else {
+        if (mounted) _showCopyFeedback('File not found');
+        return;
+      }
+    }
+    try {
+      await _appControlChannel.invokeMethod<void>('openFolderInFileManager', {
+        'path': folderToOpen,
+      });
+    } catch (_) {
+      try {
+        await _appControlChannel.invokeMethod<void>('openApplicationDetailsSettings');
+      } catch (_) {
+        if (mounted) _showCopyFeedback('Could not open folder');
+      }
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -1850,7 +1944,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }) {
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
-      onTap: () => OpenFilex.open(path),
+      onTap: () => unawaited(_openAttachmentPath(path)),
       onLongPressStart: (d) => unawaited(
         _showAttachmentImageMenu(
           context,
@@ -1876,6 +1970,7 @@ class _ChatScreenState extends State<ChatScreen> {
   Widget _bubbleAttachmentImage(String messageId, String path) {
     final dpr = MediaQuery.devicePixelRatioOf(context);
     final decodeW = (_bubbleImageW * dpr).round();
+    final skipDecodeResize = !kIsWeb && Platform.isAndroid;
     final subtle = Theme.of(context).colorScheme.outline;
     final bg = Theme.of(context).brightness == Brightness.dark
         ? Colors.black.withValues(alpha: 0.22)
@@ -1895,7 +1990,7 @@ class _ChatScreenState extends State<ChatScreen> {
           filterQuality: FilterQuality.low,
           gaplessPlayback: true,
           isAntiAlias: false,
-          cacheWidth: decodeW,
+          cacheWidth: skipDecodeResize ? null : decodeW,
           errorBuilder: (_, _, _) => SizedBox(
             width: _bubbleImageW,
             height: _bubbleImageH,
@@ -1981,7 +2076,7 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
         GestureDetector(
           onTap: hasPath && !strikeAborted
-              ? () => OpenFilex.open(m.attachmentPath!)
+              ? () => unawaited(_openAttachmentPath(m.attachmentPath!))
               : null,
           child: Row(
             mainAxisSize: MainAxisSize.min,
@@ -2281,6 +2376,7 @@ class _StagedThumbTileState extends State<_StagedThumbTile> {
       }
       final dpr = MediaQuery.devicePixelRatioOf(context);
       final cw = (64 * dpr).round();
+      final skipDecodeResize = !kIsWeb && Platform.isAndroid;
       return widget.imageWrapper(
         Image.file(
           File(p),
@@ -2289,7 +2385,7 @@ class _StagedThumbTileState extends State<_StagedThumbTile> {
           width: 64,
           height: 64,
           alignment: Alignment.center,
-          cacheWidth: cw,
+          cacheWidth: skipDecodeResize ? null : cw,
           filterQuality: FilterQuality.low,
           gaplessPlayback: true,
           errorBuilder: (_, _, _) =>
@@ -2322,6 +2418,7 @@ class _StagedThumbTileState extends State<_StagedThumbTile> {
         }
         final dpr = MediaQuery.devicePixelRatioOf(context);
         final cw = (64 * dpr).round();
+        final skipDecodeResize = !kIsWeb && Platform.isAndroid;
         return widget.imageWrapper(
           Image.file(
             File(p),
@@ -2330,7 +2427,7 @@ class _StagedThumbTileState extends State<_StagedThumbTile> {
             width: 64,
             height: 64,
             alignment: Alignment.center,
-            cacheWidth: cw,
+            cacheWidth: skipDecodeResize ? null : cw,
             filterQuality: FilterQuality.low,
             gaplessPlayback: true,
             errorBuilder: (_, _, _) =>
