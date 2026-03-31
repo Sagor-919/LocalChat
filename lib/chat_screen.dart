@@ -10,12 +10,12 @@ import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 import 'package:super_clipboard/super_clipboard.dart';
 import 'package:uuid/uuid.dart';
 
 import 'android_attachment_picker.dart';
 import 'android_share_inbound.dart';
-import 'chat_session_cache.dart';
 import 'chat_message_ordering.dart';
 import 'chat_crypto.dart';
 import 'connection_service.dart';
@@ -48,14 +48,20 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> {
   static const _uuid = Uuid();
-  /// Visible slice of [_allMessages] (newest); smaller = faster first paint.
-  static const _pageSize = 25;
-  /// First DB fetch when opening chat (newest N only).
-  static const _initialHistoryWindow = 25;
-  /// Each scroll-up load of older messages from SQLite.
-  static const _historyBatchSize = 25;
+
+  static const _pageSize = 50;
+
+  /// First DB fetch: newest N messages (SQLite indexed).
+  static const _initialHistoryWindow = 100;
+
+  /// Each scroll-up load of older messages.
+  static const _historyBatchSize = 50;
+
+  static const double _bubbleImageW = 220;
+  static const double _bubbleImageH = 160;
 
   final List<ChatMessage> _allMessages = [];
+
   /// Keeps outgoing timestamps strictly after the latest row (clock skew + rapid sends).
   int _sendTimestampSeq = 0;
   List<ChatMessage> _messages = [];
@@ -74,6 +80,7 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _loading = true;
 
   final List<DeferredStagedFile> _staged = [];
+
   /// Prevents overlapping native file/folder/gallery pickers (multiple explorer windows).
   bool _nativePickerOpen = false;
 
@@ -223,9 +230,12 @@ class _ChatScreenState extends State<ChatScreen> {
 
     _scroll.addListener(_onScroll);
     if (!_connected) _connect();
-    _loadHistory();
+    unawaited(_loadHistory());
 
-    _connTimer = Timer.periodic(const Duration(seconds: 2), (_) => _syncConnection());
+    _connTimer = Timer.periodic(
+      const Duration(seconds: 2),
+      (_) => _syncConnection(),
+    );
 
     HardwareKeyboard.instance.addHandler(_handleComposerHardwareKey);
 
@@ -241,30 +251,39 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!mounted || files.isEmpty) return;
     _stageFiles(
       files
-          .map((e) => DeferredStagedFile(
-                displayName: e.name,
-                sourcePath: e.path,
-                androidContentUri: e.contentUri,
-              ))
+          .map(
+            (e) => DeferredStagedFile(
+              displayName: e.name,
+              sourcePath: e.path,
+              androidContentUri: e.contentUri,
+            ),
+          )
           .toList(),
     );
   }
 
   /// Desktop: Enter sends (Shift+Enter keeps newline). Uses hardware handler so
   /// it does not compete with a second [Focus] on the same [FocusNode].
+  /// Ctrl/Cmd+Shift+V pastes an image from the clipboard into staging (not plain Ctrl+V — that stays text).
   bool _handleComposerHardwareKey(KeyEvent event) {
     if (!_isDesktop) return false;
     if (!_focus.hasFocus) return false;
     if (event is! KeyDownEvent) return false;
     final k = event.logicalKey;
+    if (k == LogicalKeyboardKey.keyV &&
+        (HardwareKeyboard.instance.isControlPressed ||
+            HardwareKeyboard.instance.isMetaPressed) &&
+        HardwareKeyboard.instance.isShiftPressed) {
+      unawaited(_pasteClipboardImageToStaging());
+      return true;
+    }
     if (k != LogicalKeyboardKey.enter && k != LogicalKeyboardKey.numpadEnter) {
       return false;
     }
     if (HardwareKeyboard.instance.isShiftPressed) return false;
     if (!mounted) return false;
     final textReady = normalizeOutgoingMessageText(_input.text).isNotEmpty;
-    final canSend =
-        textReady || (_connected && _staged.isNotEmpty);
+    final canSend = textReady || (_connected && _staged.isNotEmpty);
     if (!canSend) return false;
     unawaited(_sendAll());
     return true;
@@ -286,8 +305,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final socketConnected = widget.connections.isConnected(_peerId);
     final wasConnected = _connected;
     final live = _resolveLivePeer();
-    final inDiscovery =
-        widget.discovery.peers.any((p) => p.userId == _peerId);
+    final inDiscovery = widget.discovery.peers.any((p) => p.userId == _peerId);
     final hasLanAddress = live.ip.trim().isNotEmpty;
     // UDP may have pruned the peer after Wi‑Fi flap; we still have IP from route/store.
     final canTryReconnect = inDiscovery || hasLanAddress;
@@ -300,53 +318,15 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!socketConnected && canTryReconnect) {
       final now = DateTime.now();
       if (_lastAutoReconnect != null &&
-          now.difference(_lastAutoReconnect!) <
-              const Duration(seconds: 4)) {
+          now.difference(_lastAutoReconnect!) < const Duration(seconds: 4)) {
         return;
       }
       _lastAutoReconnect = now;
-      unawaited(
-        widget.connections.connectTo(live, forceNew: true),
-      );
+      unawaited(widget.connections.connectTo(live, forceNew: true));
     }
   }
 
   Future<void> _loadHistory() async {
-    final cached = ChatSessionCache.take(_peerId);
-    if (cached != null) {
-      final dbTotal = await widget.store.messageCount(_peerId);
-      if (!mounted) return;
-      if (dbTotal == cached.totalInDb) {
-        _applySessionSnapshot(cached);
-        unawaited(_rememberPeerRecord());
-        setState(() => _loading = false);
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (_scroll.hasClients) {
-            _scroll.jumpTo(_scroll.position.maxScrollExtent);
-          }
-        });
-        if (_connected) unawaited(_syncOutboundMessagesAfterConnect());
-        return;
-      }
-    }
-    await _loadHistoryFromDatabase();
-  }
-
-  void _applySessionSnapshot(ChatSessionSnapshot snap) {
-    _allMessages
-      ..clear()
-      ..addAll(snap.allMessages);
-    _totalInDb = snap.totalInDb;
-    _displayCount = snap.displayCount.clamp(0, _allMessages.length);
-    if (_allMessages.length <= _pageSize) {
-      _displayCount = _allMessages.length;
-    }
-    _hasMoreOlder = snap.hasMoreOlder;
-    _rebuildVisible();
-    _syncSendTimestampSeq();
-  }
-
-  Future<void> _loadHistoryFromDatabase() async {
     final window =
         await widget.store.loadRecentWindow(_peerId, _initialHistoryWindow);
     if (!mounted) return;
@@ -373,8 +353,10 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _rebuildVisible() {
-    final start =
-        (_allMessages.length - _displayCount).clamp(0, _allMessages.length);
+    final start = (_allMessages.length - _displayCount).clamp(
+      0,
+      _allMessages.length,
+    );
     _messages = _allMessages.sublist(start);
   }
 
@@ -421,10 +403,10 @@ class _ChatScreenState extends State<ChatScreen> {
         return;
       }
 
-      final prevMax =
-          _scroll.hasClients ? _scroll.position.maxScrollExtent : 0.0;
-      final prevPixels =
-          _scroll.hasClients ? _scroll.position.pixels : 0.0;
+      final prevMax = _scroll.hasClients
+          ? _scroll.position.maxScrollExtent
+          : 0.0;
+      final prevPixels = _scroll.hasClients ? _scroll.position.pixels : 0.0;
 
       final result = await widget.store.loadOlderBatch(
         _peerId,
@@ -460,8 +442,10 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _connect() async {
-    final socket =
-        await widget.connections.connectTo(_resolveLivePeer(), forceNew: false);
+    final socket = await widget.connections.connectTo(
+      _resolveLivePeer(),
+      forceNew: false,
+    );
     if (socket != null && mounted) {
       setState(() => _connected = true);
       unawaited(_rememberPeerRecord());
@@ -484,17 +468,6 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void dispose() {
-    if (_allMessages.isNotEmpty) {
-      ChatSessionCache.save(
-        _peerId,
-        ChatSessionSnapshot(
-          allMessages: _allMessages,
-          totalInDb: _totalInDb,
-          displayCount: _displayCount,
-          hasMoreOlder: _hasMoreOlder,
-        ),
-      );
-    }
     _storeRevisionDebounce?.cancel();
     _scrollLoadOlderDebounce?.cancel();
     widget.store.messageHistoryRevision.removeListener(_onStoreRevision);
@@ -529,12 +502,9 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _reloadMessagesFromStore() async {
-    final dbTotal = await widget.store.messageCount(_peerId);
-    if (!mounted) return;
-    final grow = dbTotal > _allMessages.length ? 1 : 0;
-    final need = _allMessages.length + grow;
-    // Newest N only; no fixed min of 100 (that was forcing huge reloads on every sync).
-    final take = min(max(need, _pageSize), dbTotal);
+    final grow = _totalInDb > _allMessages.length ? 1 : 0;
+    // Do not cap by [_totalInDb] here — it can be stale; [loadRecentWindow] clamps to DB total.
+    final take = max(_allMessages.length + grow, _initialHistoryWindow);
     final window = await widget.store.loadRecentWindow(_peerId, take);
     if (!mounted) return;
     _totalInDb = window.total;
@@ -564,7 +534,10 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _transmitEncryptedText(ChatMessage msg) async {
     final b64 = await ChatCrypto.encryptMessage(
-        widget.me.userId, _peerId, msg.text);
+      widget.me.userId,
+      _peerId,
+      msg.text,
+    );
     if (b64 == null) {
       await _setMessageDelivery(msg.id, MessageDelivery.undelivered);
       return;
@@ -659,6 +632,93 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  /// Reads an image from the system clipboard ([super_clipboard]), writes a temp file, stages it.
+  /// Desktop: also bound to Ctrl/Cmd+Shift+V in [_handleComposerHardwareKey] so Ctrl+V stays text paste.
+  Future<void> _pasteClipboardImageToStaging() async {
+    if (!mounted) return;
+    if (kIsWeb) {
+      _showCopyFeedback('Paste image is not supported in the web build');
+      return;
+    }
+    final clipboard = SystemClipboard.instance;
+    if (clipboard == null) {
+      _showCopyFeedback('Clipboard is not available');
+      return;
+    }
+    late final ClipboardReader reader;
+    try {
+      reader = await clipboard.read();
+    } catch (_) {
+      if (mounted) _showCopyFeedback('Could not read clipboard');
+      return;
+    }
+
+    final ordered = <(FileFormat, String)>[
+      (Formats.png, 'png'),
+      (Formats.jpeg, 'jpg'),
+      (Formats.webp, 'webp'),
+      (Formats.gif, 'gif'),
+      (Formats.bmp, 'bmp'),
+      (Formats.tiff, 'tiff'),
+      (Formats.heic, 'heic'),
+      (Formats.heif, 'heif'),
+    ];
+
+    for (final entry in ordered) {
+      final format = entry.$1;
+      final ext = entry.$2;
+      if (!reader.canProvide(format)) continue;
+
+      final completer = Completer<Uint8List?>();
+      final progress = reader.getFile(
+        format,
+        (file) async {
+          try {
+            final bytes = await file.readAll();
+            if (!completer.isCompleted) completer.complete(bytes);
+          } catch (_) {
+            if (!completer.isCompleted) completer.complete(null);
+          }
+        },
+        onError: (_) {
+          if (!completer.isCompleted) completer.complete(null);
+        },
+      );
+      if (progress == null) continue;
+
+      final bytes = await completer.future.timeout(
+        const Duration(seconds: 20),
+        onTimeout: () => null,
+      );
+      if (bytes == null || bytes.isEmpty) continue;
+
+      try {
+        final dir = await getTemporaryDirectory();
+        final name = 'paste_${_uuid.v4()}.$ext';
+        final outPath = p.join(dir.path, name);
+        await File(outPath).writeAsBytes(bytes);
+        if (!mounted) return;
+        _stageFiles([
+          DeferredStagedFile(
+            sourcePath: outPath,
+            displayName: name,
+            kind: StagedSourceKind.file,
+          ),
+        ]);
+        _showCopyFeedback('Image pasted');
+      } catch (_) {
+        if (mounted) {
+          _showCopyFeedback('Could not save pasted image');
+        }
+      }
+      return;
+    }
+
+    if (mounted) {
+      _showCopyFeedback('No image in clipboard');
+    }
+  }
+
   void _stageFiles(List<DeferredStagedFile> files) {
     if (files.isEmpty) return;
     final existingKeys = _staged.map((e) => e.stagingDedupeKey).toSet();
@@ -712,16 +772,18 @@ class _ChatScreenState extends State<ChatScreen> {
         withData: false,
       );
       if (picked == null) return;
-      _stageFiles(picked.files
-          .where((f) => f.path != null)
-          .map(
-            (f) => DeferredStagedFile(
-              sourcePath: f.path!,
-              displayName: f.name,
-              knownSizeBytes: f.size,
-            ),
-          )
-          .toList());
+      _stageFiles(
+        picked.files
+            .where((f) => f.path != null)
+            .map(
+              (f) => DeferredStagedFile(
+                sourcePath: f.path!,
+                displayName: f.name,
+                knownSizeBytes: f.size,
+              ),
+            )
+            .toList(),
+      );
     });
   }
 
@@ -745,22 +807,23 @@ class _ChatScreenState extends State<ChatScreen> {
       final picker = ImagePicker();
       final images = await picker.pickMultiImage(limit: 20);
       if (images.isEmpty) return;
-      _stageFiles(images
-          .map((x) => DeferredStagedFile(
-                sourcePath: x.path,
-                displayName: x.name,
-              ))
-          .toList());
+      _stageFiles(
+        images
+            .map(
+              (x) =>
+                  DeferredStagedFile(sourcePath: x.path, displayName: x.name),
+            )
+            .toList(),
+      );
     });
   }
 
   void _onDropDone(DropDoneDetails details) {
     _stageFiles(
       details.files
-          .map((x) => DeferredStagedFile(
-                sourcePath: x.path,
-                displayName: x.name,
-              ))
+          .map(
+            (x) => DeferredStagedFile(sourcePath: x.path, displayName: x.name),
+          )
           .toList(),
     );
   }
@@ -847,7 +910,8 @@ class _ChatScreenState extends State<ChatScreen> {
       timestamp: ts,
       isMine: true,
       attachmentName: df.displayName,
-      attachmentPath: df.kind == StagedSourceKind.file &&
+      attachmentPath:
+          df.kind == StagedSourceKind.file &&
               !duplicatePathInBatch &&
               df.androidContentUri == null &&
               (df.sourcePath != null && df.sourcePath!.isNotEmpty)
@@ -905,8 +969,9 @@ class _ChatScreenState extends State<ChatScreen> {
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Clear Chat'),
-        content:
-            const Text('Delete all messages in this conversation? This cannot be undone.'),
+        content: const Text(
+          'Delete all messages in this conversation? This cannot be undone.',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx),
@@ -915,7 +980,6 @@ class _ChatScreenState extends State<ChatScreen> {
           FilledButton(
             onPressed: () async {
               Navigator.pop(ctx);
-              ChatSessionCache.invalidate(_peerId);
               await widget.store.clear(_peerId);
               if (mounted) {
                 setState(() {
@@ -928,7 +992,8 @@ class _ChatScreenState extends State<ChatScreen> {
               }
             },
             style: FilledButton.styleFrom(
-                backgroundColor: Theme.of(context).colorScheme.error),
+              backgroundColor: Theme.of(context).colorScheme.error,
+            ),
             child: const Text('Clear'),
           ),
         ],
@@ -942,8 +1007,11 @@ class _ChatScreenState extends State<ChatScreen> {
   void _scrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_scroll.hasClients) return;
-      _scroll.animateTo(_scroll.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 150), curve: Curves.easeOut);
+      _scroll.animateTo(
+        _scroll.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 150),
+        curve: Curves.easeOut,
+      );
     });
   }
 
@@ -962,16 +1030,31 @@ class _ChatScreenState extends State<ChatScreen> {
     if (msgDay == today) return 'Today';
     if (msgDay == today.subtract(const Duration(days: 1))) return 'Yesterday';
     const months = [
-      '', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+      '',
+      'Jan',
+      'Feb',
+      'Mar',
+      'Apr',
+      'May',
+      'Jun',
+      'Jul',
+      'Aug',
+      'Sep',
+      'Oct',
+      'Nov',
+      'Dec',
     ];
     return '${months[dt.month]} ${dt.day}, ${dt.year}';
   }
 
   bool _needsDateSeparator(int index) {
     if (index == 0) return true;
-    final prev = DateTime.fromMillisecondsSinceEpoch(_messages[index - 1].timestamp);
-    final curr = DateTime.fromMillisecondsSinceEpoch(_messages[index].timestamp);
+    final prev = DateTime.fromMillisecondsSinceEpoch(
+      _messages[index - 1].timestamp,
+    );
+    final curr = DateTime.fromMillisecondsSinceEpoch(
+      _messages[index].timestamp,
+    );
     return prev.year != curr.year ||
         prev.month != curr.month ||
         prev.day != curr.day;
@@ -983,7 +1066,9 @@ class _ChatScreenState extends State<ChatScreen> {
       padding: const EdgeInsets.symmetric(vertical: 12),
       child: Row(
         children: [
-          Expanded(child: Divider(color: cs.outlineVariant.withValues(alpha: 0.4))),
+          Expanded(
+            child: Divider(color: cs.outlineVariant.withValues(alpha: 0.4)),
+          ),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 12),
             child: Text(
@@ -995,7 +1080,9 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
             ),
           ),
-          Expanded(child: Divider(color: cs.outlineVariant.withValues(alpha: 0.4))),
+          Expanded(
+            child: Divider(color: cs.outlineVariant.withValues(alpha: 0.4)),
+          ),
         ],
       ),
     );
@@ -1032,18 +1119,12 @@ class _ChatScreenState extends State<ChatScreen> {
   bool get _isDesktop =>
       !kIsWeb && (Platform.isWindows || Platform.isLinux || Platform.isMacOS);
 
-  static TextStyle _messageBodyStyle(Color color) => TextStyle(
-        color: color,
-        fontSize: 15,
-        height: 1.35,
-      );
+  static TextStyle _messageBodyStyle(Color color) =>
+      TextStyle(color: color, fontSize: 15, height: 1.35);
 
   /// Preserves line breaks and spacing; selection toolbar includes Copy.
   Widget _buildSelectableMessageBody(String text, Color color) {
-    return SelectableText(
-      text,
-      style: _messageBodyStyle(color),
-    );
+    return SelectableText(text, style: _messageBodyStyle(color));
   }
 
   static String _fileTypeLabel(String name) {
@@ -1051,8 +1132,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (dot < 0) return 'File';
     final ext = name.substring(dot + 1).toLowerCase();
     return switch (ext) {
-      'png' || 'jpg' || 'jpeg' || 'gif' || 'webp' || 'bmp' || 'svg' =>
-        'Image',
+      'png' || 'jpg' || 'jpeg' || 'gif' || 'webp' || 'bmp' || 'svg' => 'Image',
       'mp4' || 'mkv' || 'avi' || 'mov' || 'wmv' || 'flv' => 'Video',
       'mp3' || 'wav' || 'flac' || 'aac' || 'ogg' || 'wma' => 'Audio',
       'pdf' => 'PDF Document',
@@ -1070,8 +1150,7 @@ class _ChatScreenState extends State<ChatScreen> {
       'java' ||
       'cpp' ||
       'c' ||
-      'h' =>
-        'Source Code',
+      'h' => 'Source Code',
       'json' || 'xml' || 'yaml' || 'yml' => 'Data File',
       _ => '${ext.toUpperCase()} File',
     };
@@ -1097,18 +1176,23 @@ class _ChatScreenState extends State<ChatScreen> {
                     ? widget.peer.name[0].toUpperCase()
                     : '?',
                 style: const TextStyle(
-                    color: Colors.white,
-                    fontWeight: FontWeight.bold,
-                    fontSize: 16),
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                  fontSize: 16,
+                ),
               ),
             ),
             const SizedBox(width: 10),
             Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(widget.peer.name,
-                    style: const TextStyle(
-                        fontSize: 16, fontWeight: FontWeight.w700)),
+                Text(
+                  widget.peer.name,
+                  style: const TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
                 Row(
                   children: [
                     Container(
@@ -1123,9 +1207,7 @@ class _ChatScreenState extends State<ChatScreen> {
                     Text(
                       _connected ? 'Connected' : 'Disconnected',
                       style: TextStyle(
-                        color: _connected
-                            ? Colors.green
-                            : cs.error,
+                        color: _connected ? Colors.green : cs.error,
                         fontWeight: FontWeight.w500,
                         fontSize: 12,
                       ),
@@ -1162,31 +1244,42 @@ class _ChatScreenState extends State<ChatScreen> {
               child: _loading
                   ? const Center(child: CircularProgressIndicator())
                   : _messages.isEmpty
-                      ? Center(
-                          child: Text('No messages yet',
-                              style: TextStyle(color: cs.outline)))
-                      : ListView.builder(
-                          controller: _scroll,
-                          cacheExtent: 400,
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 14, vertical: 8),
-                          itemCount: _messages.length,
-                          itemBuilder: (ctx, i) {
-                            final widgets = <Widget>[];
-                            if (_needsDateSeparator(i)) {
-                              widgets.add(_buildDateSeparator(ctx,
-                                  DateTime.fromMillisecondsSinceEpoch(
-                                      _messages[i].timestamp)));
-                            }
-                            widgets.add(_buildBubble(ctx, _messages[i]));
-                            return RepaintBoundary(
-                              child: Column(
-                                mainAxisSize: MainAxisSize.min,
-                                children: widgets,
+                  ? Center(
+                      child: Text(
+                        'No messages yet',
+                        style: TextStyle(color: cs.outline),
+                      ),
+                    )
+                  : ListView.builder(
+                      controller: _scroll,
+                      cacheExtent: 400,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 8,
+                      ),
+                      itemCount: _messages.length,
+                      itemBuilder: (ctx, i) {
+                        final widgets = <Widget>[];
+                        if (_needsDateSeparator(i)) {
+                          widgets.add(
+                            _buildDateSeparator(
+                              ctx,
+                              DateTime.fromMillisecondsSinceEpoch(
+                                _messages[i].timestamp,
                               ),
-                            );
-                          },
-                        ),
+                            ),
+                          );
+                        }
+                        widgets.add(_buildBubble(ctx, _messages[i]));
+                        return RepaintBoundary(
+                          key: ValueKey<String>(_messages[i].id),
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: widgets,
+                          ),
+                        );
+                      },
+                    ),
             ),
             _buildComposerStrip(context),
           ],
@@ -1264,7 +1357,8 @@ class _ChatScreenState extends State<ChatScreen> {
                 final df = _staged[i];
                 final isFolder = df.kind == StagedSourceKind.folderToZip;
                 final previewPath = df.localPathForPreview;
-                final isImg = previewPath != null &&
+                final isImg =
+                    previewPath != null &&
                     _isImage(df.displayName) &&
                     !isFolder;
                 return Padding(
@@ -1377,10 +1471,12 @@ class _ChatScreenState extends State<ChatScreen> {
     showMenu<String>(
       context: context,
       position: RelativeRect.fromLTRB(
-          position.dx, position.dy, position.dx, position.dy),
-      items: const [
-        PopupMenuItem(value: 'copy', child: Text('Copy')),
-      ],
+        position.dx,
+        position.dy,
+        position.dx,
+        position.dy,
+      ),
+      items: const [PopupMenuItem(value: 'copy', child: Text('Copy'))],
     ).then((value) {
       if (value == 'copy') _copyMessage(m);
     });
@@ -1403,9 +1499,8 @@ class _ChatScreenState extends State<ChatScreen> {
     final bool isCancelled = t != null && t.cancelled;
     final bool isPaused =
         t != null && t.isPaused && t.error == null && !t.cancelled;
-    final bool dismissedAborted = m.transferDismissed &&
-        m.attachmentName != null &&
-        t == null;
+    final bool dismissedAborted =
+        m.transferDismissed && m.attachmentName != null && t == null;
 
     Color bubbleColor;
     if (dismissedAborted) {
@@ -1417,253 +1512,253 @@ class _ChatScreenState extends State<ChatScreen> {
     } else if (isCancelled) {
       bubbleColor = _cancelledAmber.withValues(alpha: 0.12);
     } else {
-      bubbleColor =
-          mine ? _iMessageBlue : (isDark ? _iMessageDarkGray : _iMessageGray);
+      bubbleColor = mine
+          ? _iMessageBlue
+          : (isDark ? _iMessageDarkGray : _iMessageGray);
     }
 
     final textColor = (isFailed || isCancelled)
         ? (isDark ? Colors.white : Colors.black87)
         : dismissedAborted
-            ? (isDark ? Colors.white54 : Colors.black45)
-            : (mine ? Colors.white : (isDark ? Colors.white : Colors.black));
+        ? (isDark ? Colors.white54 : Colors.black45)
+        : (mine ? Colors.white : (isDark ? Colors.white : Colors.black));
     final subtleColor = (isFailed || isCancelled)
         ? (isDark ? Colors.white60 : Colors.black54)
         : dismissedAborted
-            ? (isDark ? Colors.white38 : Colors.black38)
-            : (mine
-                ? Colors.white.withValues(alpha: 0.6)
-                : (isDark ? Colors.white60 : Colors.black54));
+        ? (isDark ? Colors.white38 : Colors.black38)
+        : (mine
+              ? Colors.white.withValues(alpha: 0.6)
+              : (isDark ? Colors.white60 : Colors.black54));
 
     final bubble = Container(
-        constraints: const BoxConstraints(maxWidth: 520),
-        margin: const EdgeInsets.symmetric(vertical: 3),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        decoration: BoxDecoration(
-          color: bubbleColor,
-          border: dismissedAborted
-              ? Border.all(
-                  color: isDark
-                      ? Colors.white24
-                      : Colors.black26,
-                  width: 1)
-              : (isFailed || isCancelled)
-                  ? Border.all(
-                      color: isFailed ? _failedRed : _cancelledAmber,
-                      width: 1.2)
-                  : null,
-          borderRadius: BorderRadius.only(
-            topLeft: const Radius.circular(18),
-            topRight: const Radius.circular(18),
-            bottomLeft: Radius.circular(mine ? 18 : 4),
-            bottomRight: Radius.circular(mine ? 4 : 18),
-          ),
+      constraints: const BoxConstraints(maxWidth: 520),
+      margin: const EdgeInsets.symmetric(vertical: 3),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(
+        color: bubbleColor,
+        border: dismissedAborted
+            ? Border.all(
+                color: isDark ? Colors.white24 : Colors.black26,
+                width: 1,
+              )
+            : (isFailed || isCancelled)
+            ? Border.all(
+                color: isFailed ? _failedRed : _cancelledAmber,
+                width: 1.2,
+              )
+            : null,
+        borderRadius: BorderRadius.only(
+          topLeft: const Radius.circular(18),
+          topRight: const Radius.circular(18),
+          bottomLeft: Radius.circular(mine ? 18 : 4),
+          bottomRight: Radius.circular(mine ? 4 : 18),
         ),
-        child: Column(
-          crossAxisAlignment:
-              mine ? CrossAxisAlignment.end : CrossAxisAlignment.start,
-          children: [
-            if (m.attachmentName != null)
-              _buildAttachment(context, m, mine, dismissedAborted)
-            else
-              _buildSelectableMessageBody(m.text, textColor),
+      ),
+      child: Column(
+        crossAxisAlignment: mine
+            ? CrossAxisAlignment.end
+            : CrossAxisAlignment.start,
+        children: [
+          if (m.attachmentName != null)
+            _buildAttachment(context, m, mine, dismissedAborted)
+          else
+            _buildSelectableMessageBody(m.text, textColor),
 
-            if (mine &&
-                m.attachmentName == null &&
-                m.delivery != null) ...[
-              const SizedBox(height: 6),
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(
-                    _deliveryStatusLabel(m.delivery!),
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: subtleColor,
-                      fontWeight: FontWeight.w600,
-                    ),
+          if (mine && m.attachmentName == null && m.delivery != null) ...[
+            const SizedBox(height: 6),
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  _deliveryStatusLabel(m.delivery!),
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: subtleColor,
+                    fontWeight: FontWeight.w600,
                   ),
-                  if (m.delivery == MessageDelivery.undelivered ||
-                      m.delivery == MessageDelivery.awaitingConfirm) ...[
-                    const SizedBox(width: 10),
-                    InkWell(
-                      onTap: () => unawaited(_resendTextMessage(m)),
-                      child: Text(
-                        'Resend',
-                        style: TextStyle(
-                          fontSize: 11,
-                          color: mine ? Colors.white : cs.primary,
-                          fontWeight: FontWeight.w700,
-                          decoration: TextDecoration.underline,
-                          decorationColor:
-                              mine ? Colors.white70 : cs.primary,
-                        ),
+                ),
+                if (m.delivery == MessageDelivery.undelivered ||
+                    m.delivery == MessageDelivery.awaitingConfirm) ...[
+                  const SizedBox(width: 10),
+                  InkWell(
+                    onTap: () => unawaited(_resendTextMessage(m)),
+                    child: Text(
+                      'Resend',
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: mine ? Colors.white : cs.primary,
+                        fontWeight: FontWeight.w700,
+                        decoration: TextDecoration.underline,
+                        decorationColor: mine ? Colors.white70 : cs.primary,
                       ),
                     ),
-                  ],
+                  ),
+                ],
+              ],
+            ),
+          ],
+
+          if (t != null) ...[
+            const SizedBox(height: 8),
+            if (isFailed || isCancelled) ...[
+              Row(
+                children: [
+                  Icon(
+                    isFailed ? Icons.error_outline : Icons.cancel_outlined,
+                    size: 16,
+                    color: isFailed ? _failedRed : _cancelledAmber,
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      isFailed
+                          ? 'Not delivered — transfer failed'
+                          : 'Cancelled',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                        color: isFailed ? _failedRed : _cancelledAmber,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              _actionButton(
+                label: 'Dismiss',
+                icon: Icons.close,
+                color: cs.outline,
+                onTap: () => _tm.dismiss(m.id),
+              ),
+            ] else if (isPaused) ...[
+              LinearProgressIndicator(
+                value: t.progress.clamp(0, 1).toDouble(),
+                minHeight: 5,
+                borderRadius: BorderRadius.circular(99),
+                backgroundColor: mine ? Colors.white24 : cs.outlineVariant,
+                color: mine ? Colors.white70 : cs.outline,
+              ),
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  Icon(Icons.hourglass_empty, size: 16, color: cs.outline),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      t.isSending
+                          ? 'Reconnecting\u2026'
+                          : 'Waiting for sender\u2026',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: subtleColor,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              _actionButton(
+                label: 'Cancel',
+                icon: Icons.stop_circle_outlined,
+                color: _failedRed,
+                onTap: () => _cancelTransfer(m.id),
+              ),
+            ] else if (t.isSending &&
+                t.outgoingPhase == OutgoingTransferPhase.preparing) ...[
+              LinearProgressIndicator(
+                value: t.totalBytes > 0
+                    ? t.progress.clamp(0, 1).toDouble()
+                    : null,
+                minHeight: 5,
+                borderRadius: BorderRadius.circular(99),
+                backgroundColor: mine ? Colors.white24 : cs.outlineVariant,
+                color: mine ? Colors.white : _iMessageBlue,
+              ),
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      t.totalBytes > 0
+                          ? 'Preparing\u2026 ${(t.progress * 100).toStringAsFixed(0)}%'
+                                ' \u2022 ${_fmtBytes(t.transferredBytes)}/${_fmtBytes(t.totalBytes)}'
+                          : 'Preparing\u2026',
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                        color: subtleColor,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  _actionButton(
+                    label: 'Cancel',
+                    icon: Icons.stop_circle_outlined,
+                    color: _failedRed,
+                    onTap: () => _cancelTransfer(m.id),
+                  ),
+                ],
+              ),
+            ] else ...[
+              LinearProgressIndicator(
+                value: t.progress.clamp(0, 1).toDouble(),
+                minHeight: 5,
+                borderRadius: BorderRadius.circular(99),
+                backgroundColor: mine ? Colors.white24 : cs.outlineVariant,
+                color: mine ? Colors.white : _iMessageBlue,
+              ),
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      '${t.isSending ? "Sending\u2026 " : "Receiving\u2026 "}'
+                      '${(t.progress * 100).toStringAsFixed(0)}%'
+                      ' \u2022 ${_fmtBytes(t.transferredBytes)}/${_fmtBytes(t.totalBytes)}'
+                      ' \u2022 ${_fmtSpeed(t.currentSpeed)}',
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                        color: subtleColor,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  _actionButton(
+                    label: 'Cancel',
+                    icon: Icons.stop_circle_outlined,
+                    color: _failedRed,
+                    onTap: () => _cancelTransfer(m.id),
+                  ),
                 ],
               ),
             ],
-
-            if (t != null) ...[
-              const SizedBox(height: 8),
-              if (isFailed || isCancelled) ...[
-                Row(
-                  children: [
-                    Icon(
-                      isFailed ? Icons.error_outline : Icons.cancel_outlined,
-                      size: 16,
-                      color: isFailed ? _failedRed : _cancelledAmber,
-                    ),
-                    const SizedBox(width: 6),
-                    Expanded(
-                      child: Text(
-                        isFailed ? 'Not delivered — transfer failed' : 'Cancelled',
-                        style: TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.w700,
-                          color: isFailed ? _failedRed : _cancelledAmber,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                _actionButton(
-                  label: 'Dismiss',
-                  icon: Icons.close,
-                  color: cs.outline,
-                  onTap: () => _tm.dismiss(m.id),
-                ),
-              ] else if (isPaused) ...[
-                LinearProgressIndicator(
-                  value: t.progress.clamp(0, 1).toDouble(),
-                  minHeight: 5,
-                  borderRadius: BorderRadius.circular(99),
-                  backgroundColor: mine ? Colors.white24 : cs.outlineVariant,
-                  color: mine ? Colors.white70 : cs.outline,
-                ),
-                const SizedBox(height: 6),
-                Row(
-                  children: [
-                    Icon(Icons.hourglass_empty,
-                        size: 16, color: cs.outline),
-                    const SizedBox(width: 6),
-                    Expanded(
-                      child: Text(
-                        t.isSending
-                            ? 'Reconnecting\u2026'
-                            : 'Waiting for sender\u2026',
-                        style: TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.w600,
-                          color: subtleColor,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                _actionButton(
-                  label: 'Cancel',
-                  icon: Icons.stop_circle_outlined,
-                  color: _failedRed,
-                  onTap: () => _cancelTransfer(m.id),
-                ),
-              ] else if (t.isSending &&
-                  t.outgoingPhase == OutgoingTransferPhase.preparing) ...[
-                LinearProgressIndicator(
-                  value: t.totalBytes > 0
-                      ? t.progress.clamp(0, 1).toDouble()
-                      : null,
-                  minHeight: 5,
-                  borderRadius: BorderRadius.circular(99),
-                  backgroundColor: mine ? Colors.white24 : cs.outlineVariant,
-                  color: mine ? Colors.white : _iMessageBlue,
-                ),
-                const SizedBox(height: 6),
-                Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        t.totalBytes > 0
-                            ? 'Preparing\u2026 ${(t.progress * 100).toStringAsFixed(0)}%'
-                                ' \u2022 ${_fmtBytes(t.transferredBytes)}/${_fmtBytes(t.totalBytes)}'
-                            : 'Preparing\u2026',
-                        style: TextStyle(
-                          fontSize: 11,
-                          fontWeight: FontWeight.w600,
-                          color: subtleColor,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    _actionButton(
-                      label: 'Cancel',
-                      icon: Icons.stop_circle_outlined,
-                      color: _failedRed,
-                      onTap: () => _cancelTransfer(m.id),
-                    ),
-                  ],
-                ),
-              ] else ...[
-                LinearProgressIndicator(
-                  value: t.progress.clamp(0, 1).toDouble(),
-                  minHeight: 5,
-                  borderRadius: BorderRadius.circular(99),
-                  backgroundColor: mine ? Colors.white24 : cs.outlineVariant,
-                  color: mine ? Colors.white : _iMessageBlue,
-                ),
-                const SizedBox(height: 6),
-                Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        '${t.isSending ? "Sending\u2026 " : "Receiving\u2026 "}'
-                        '${(t.progress * 100).toStringAsFixed(0)}%'
-                        ' \u2022 ${_fmtBytes(t.transferredBytes)}/${_fmtBytes(t.totalBytes)}'
-                        ' \u2022 ${_fmtSpeed(t.currentSpeed)}',
-                        style: TextStyle(
-                          fontSize: 11,
-                          fontWeight: FontWeight.w600,
-                          color: subtleColor,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    _actionButton(
-                      label: 'Cancel',
-                      icon: Icons.stop_circle_outlined,
-                      color: _failedRed,
-                      onTap: () => _cancelTransfer(m.id),
-                    ),
-                  ],
-                ),
-              ],
-            ],
-            if (mine &&
-                m.attachmentName != null &&
-                t == null &&
-                m.attachmentPath != null &&
-                !m.transferDismissed &&
-                !dismissedAborted) ...[
-              const SizedBox(height: 6),
-              Text(
-                'Delivered',
-                style: TextStyle(
-                  fontSize: 11,
-                  fontWeight: FontWeight.w600,
-                  color: subtleColor,
-                ),
-              ),
-            ],
-
-            const SizedBox(height: 4),
+          ],
+          if (mine &&
+              m.attachmentName != null &&
+              t == null &&
+              m.attachmentPath != null &&
+              !m.transferDismissed &&
+              !dismissedAborted) ...[
+            const SizedBox(height: 6),
             Text(
-              _fmtTime(m.timestamp),
-              style: TextStyle(fontSize: 11, color: subtleColor),
+              'Delivered',
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+                color: subtleColor,
+              ),
             ),
           ],
-        ),
+
+          const SizedBox(height: 4),
+          Text(
+            _fmtTime(m.timestamp),
+            style: TextStyle(fontSize: 11, color: subtleColor),
+          ),
+        ],
+      ),
     );
 
     return Align(
@@ -1686,8 +1781,7 @@ class _ChatScreenState extends State<ChatScreen> {
     required String fileName,
   }) async {
     final overlayState = Overlay.maybeOf(context);
-    final overlayBox =
-        overlayState?.context.findRenderObject() as RenderBox?;
+    final overlayBox = overlayState?.context.findRenderObject() as RenderBox?;
     if (overlayBox == null) return;
 
     final topLeft = overlayBox.globalToLocal(globalPosition);
@@ -1713,7 +1807,9 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _copyImageBytesToClipboard(
-      String path, String displayFileName) async {
+    String path,
+    String displayFileName,
+  ) async {
     final clipboard = SystemClipboard.instance;
     if (clipboard == null) {
       if (!context.mounted) return;
@@ -1723,8 +1819,7 @@ class _ChatScreenState extends State<ChatScreen> {
     try {
       final bytes = await File(path).readAsBytes();
       if (!context.mounted) return;
-      final item =
-          DataWriterItem(suggestedName: p.basename(displayFileName));
+      final item = DataWriterItem(suggestedName: p.basename(displayFileName));
       final ext = p.extension(displayFileName).toLowerCase();
       if (ext == '.png') {
         item.add(Formats.png(bytes));
@@ -1756,19 +1851,60 @@ class _ChatScreenState extends State<ChatScreen> {
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTap: () => OpenFilex.open(path),
-      onLongPressStart: (d) => unawaited(_showAttachmentImageMenu(
-            context,
-            d.globalPosition,
-            path: path,
-            fileName: fileName,
-          )),
-      onSecondaryTapDown: (d) => unawaited(_showAttachmentImageMenu(
-            context,
-            d.globalPosition,
-            path: path,
-            fileName: fileName,
-          )),
+      onLongPressStart: (d) => unawaited(
+        _showAttachmentImageMenu(
+          context,
+          d.globalPosition,
+          path: path,
+          fileName: fileName,
+        ),
+      ),
+      onSecondaryTapDown: (d) => unawaited(
+        _showAttachmentImageMenu(
+          context,
+          d.globalPosition,
+          path: path,
+          fileName: fileName,
+        ),
+      ),
       child: image,
+    );
+  }
+
+  /// Thumbnail in bubble: [cacheWidth] only preserves aspect ratio; [BoxFit.contain] avoids stretch.
+  /// [messageId] + [path] in [ValueKey] prevents ListView recycle from swapping Image state (Android).
+  Widget _bubbleAttachmentImage(String messageId, String path) {
+    final dpr = MediaQuery.devicePixelRatioOf(context);
+    final decodeW = (_bubbleImageW * dpr).round();
+    final subtle = Theme.of(context).colorScheme.outline;
+    final bg = Theme.of(context).brightness == Brightness.dark
+        ? Colors.black.withValues(alpha: 0.22)
+        : Colors.black.withValues(alpha: 0.06);
+    return SizedBox(
+      width: _bubbleImageW,
+      height: _bubbleImageH,
+      child: ColoredBox(
+        color: bg,
+        child: Image.file(
+          File(path),
+          key: ValueKey<String>('bubble-img-$messageId-$path'),
+          width: _bubbleImageW,
+          height: _bubbleImageH,
+          fit: BoxFit.contain,
+          alignment: Alignment.center,
+          filterQuality: FilterQuality.low,
+          gaplessPlayback: true,
+          isAntiAlias: false,
+          cacheWidth: decodeW,
+          errorBuilder: (_, _, _) => SizedBox(
+            width: _bubbleImageW,
+            height: _bubbleImageH,
+            child: Center(
+              child: Icon(Icons.broken_image_outlined, size: 40, color: subtle),
+            ),
+          ),
+        ),
+      ),
     );
   }
 
@@ -1791,11 +1927,14 @@ class _ChatScreenState extends State<ChatScreen> {
             children: [
               Icon(icon, size: 15, color: color),
               const SizedBox(width: 4),
-              Text(label,
-                  style: TextStyle(
-                      fontSize: 12,
-                      fontWeight: FontWeight.w700,
-                      color: color)),
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                  color: color,
+                ),
+              ),
             ],
           ),
         ),
@@ -1804,7 +1943,11 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Widget _buildAttachment(
-      BuildContext context, ChatMessage m, bool mine, bool strikeAborted) {
+    BuildContext context,
+    ChatMessage m,
+    bool mine,
+    bool strikeAborted,
+  ) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
     final hasPath = m.attachmentPath != null;
     final isImg = hasPath && _isImage(m.attachmentName!);
@@ -1817,8 +1960,9 @@ class _ChatScreenState extends State<ChatScreen> {
         : (isDark ? Colors.white60 : Colors.black54);
 
     final typeLabel = _fileTypeLabel(m.attachmentName!);
-    final sizeLabel =
-        m.attachmentSize != null ? _fmtBytes(m.attachmentSize!) : null;
+    final sizeLabel = m.attachmentSize != null
+        ? _fmtBytes(m.attachmentSize!)
+        : null;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -1831,14 +1975,7 @@ class _ChatScreenState extends State<ChatScreen> {
               child: _wrapImageWithContextMenu(
                 path: m.attachmentPath!,
                 fileName: m.attachmentName!,
-                image: Image.file(
-                  File(m.attachmentPath!),
-                  width: 220,
-                  height: 160,
-                  fit: BoxFit.cover,
-                  errorBuilder: (_, _, _) =>
-                      const Icon(Icons.broken_image, size: 48),
-                ),
+                image: _bubbleAttachmentImage(m.id, m.attachmentPath!),
               ),
             ),
           ),
@@ -1866,11 +2003,10 @@ class _ChatScreenState extends State<ChatScreen> {
                     decoration: strikeAborted
                         ? TextDecoration.lineThrough
                         : (hasPath
-                            ? TextDecoration.underline
-                            : TextDecoration.none),
+                              ? TextDecoration.underline
+                              : TextDecoration.none),
                     decorationThickness: strikeAborted ? 2.8 : 1,
-                    decorationColor:
-                        strikeAborted ? fgColor : null,
+                    decorationColor: strikeAborted ? fgColor : null,
                   ),
                 ),
               ),
@@ -1896,8 +2032,7 @@ class _ChatScreenState extends State<ChatScreen> {
               borderRadius: BorderRadius.circular(8),
               onTap: () => _openFolder(m.attachmentPath!),
               child: Padding(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
+                padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
@@ -1923,12 +2058,15 @@ class _ChatScreenState extends State<ChatScreen> {
               borderRadius: BorderRadius.circular(8),
               onTap: () => _locateFileAndroid(m.attachmentPath!),
               child: Padding(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
+                padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Icon(Icons.file_open_outlined, size: 14, color: subtleColor),
+                    Icon(
+                      Icons.file_open_outlined,
+                      size: 14,
+                      color: subtleColor,
+                    ),
                     const SizedBox(width: 4),
                     Text(
                       'Locate File',
@@ -1955,8 +2093,8 @@ class _ChatScreenState extends State<ChatScreen> {
     final hint = _staged.isNotEmpty
         ? 'Add a message (optional)...'
         : (_isDesktop
-            ? 'Message — Enter send · Shift+Enter new line'
-            : 'Message');
+              ? 'Message — Enter send · Shift+Enter new line · Ctrl+Shift+V paste image'
+              : 'Message');
 
     // Rebuild only the composer row on typing — not the whole chat (avoids jank).
     return Padding(
@@ -1964,10 +2102,10 @@ class _ChatScreenState extends State<ChatScreen> {
       child: ListenableBuilder(
         listenable: _input,
         builder: (context, _) {
-          final textReady =
-              normalizeOutgoingMessageText(_input.text).isNotEmpty;
-          final canSend =
-              textReady || (_connected && _staged.isNotEmpty);
+          final textReady = normalizeOutgoingMessageText(
+            _input.text,
+          ).isNotEmpty;
+          final canSend = textReady || (_connected && _staged.isNotEmpty);
           return Row(
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [
@@ -2000,6 +2138,22 @@ class _ChatScreenState extends State<ChatScreen> {
                   icon: const Icon(Icons.photo_library),
                 ),
               ],
+              if (!kIsWeb) ...[
+                const SizedBox(width: 4),
+                IconButton.filled(
+                  onPressed: _nativePickerOpen
+                      ? null
+                      : () => unawaited(_pasteClipboardImageToStaging()),
+                  tooltip: _isDesktop
+                      ? 'Paste image from clipboard (Ctrl+Shift+V or Cmd+Shift+V)'
+                      : 'Paste image from clipboard',
+                  style: IconButton.styleFrom(
+                    backgroundColor: cs.secondaryContainer,
+                    foregroundColor: cs.onSecondaryContainer,
+                  ),
+                  icon: const Icon(Icons.content_paste_go),
+                ),
+              ],
               const SizedBox(width: 8),
               Expanded(
                 child: ConstrainedBox(
@@ -2019,10 +2173,13 @@ class _ChatScreenState extends State<ChatScreen> {
                       minLines: 1,
                       maxLines: null,
                       textAlignVertical: TextAlignVertical.top,
-                      scrollPadding: const EdgeInsets.only(bottom: 120, top: 16),
-                      style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                            height: 1.35,
-                          ),
+                      scrollPadding: const EdgeInsets.only(
+                        bottom: 120,
+                        top: 16,
+                      ),
+                      style: Theme.of(
+                        context,
+                      ).textTheme.bodyLarge?.copyWith(height: 1.35),
                       scrollPhysics: const ClampingScrollPhysics(),
                       decoration: InputDecoration(
                         hintText: hint,
@@ -2033,8 +2190,12 @@ class _ChatScreenState extends State<ChatScreen> {
                         border: InputBorder.none,
                         filled: false,
                         isDense: true,
-                        contentPadding:
-                            const EdgeInsets.fromLTRB(16, 12, 16, 12),
+                        contentPadding: const EdgeInsets.fromLTRB(
+                          16,
+                          12,
+                          16,
+                          12,
+                        ),
                       ),
                     ),
                   ),
@@ -2098,8 +2259,7 @@ class _StagedThumbTileState extends State<_StagedThumbTile> {
 
   void _refreshSizeFuture() {
     final p = widget.path;
-    _sizeFuture =
-        p != null && p.isNotEmpty ? File(p).length() : null;
+    _sizeFuture = p != null && p.isNotEmpty ? File(p).length() : null;
   }
 
   @override
@@ -2119,20 +2279,21 @@ class _StagedThumbTileState extends State<_StagedThumbTile> {
       if (kb > _maxPreviewBytes) {
         return _fileIconColumn();
       }
+      final dpr = MediaQuery.devicePixelRatioOf(context);
+      final cw = (64 * dpr).round();
       return widget.imageWrapper(
         Image.file(
           File(p),
-          fit: BoxFit.cover,
+          key: ValueKey<String>('staged-$p'),
+          fit: BoxFit.contain,
           width: 64,
           height: 64,
-          cacheWidth: 128,
-          cacheHeight: 128,
+          alignment: Alignment.center,
+          cacheWidth: cw,
           filterQuality: FilterQuality.low,
-          errorBuilder: (_, _, _) => Icon(
-            Icons.broken_image,
-            size: 24,
-            color: widget.cs.outline,
-          ),
+          gaplessPlayback: true,
+          errorBuilder: (_, _, _) =>
+              Icon(Icons.broken_image, size: 24, color: widget.cs.outline),
         ),
       );
     }
@@ -2159,20 +2320,21 @@ class _StagedThumbTileState extends State<_StagedThumbTile> {
         if (len > _maxPreviewBytes) {
           return _fileIconColumn();
         }
+        final dpr = MediaQuery.devicePixelRatioOf(context);
+        final cw = (64 * dpr).round();
         return widget.imageWrapper(
           Image.file(
             File(p),
-            fit: BoxFit.cover,
+            key: ValueKey<String>('staged-$p'),
+            fit: BoxFit.contain,
             width: 64,
             height: 64,
-            cacheWidth: 128,
-            cacheHeight: 128,
+            alignment: Alignment.center,
+            cacheWidth: cw,
             filterQuality: FilterQuality.low,
-            errorBuilder: (_, _, _) => Icon(
-              Icons.broken_image,
-              size: 24,
-              color: widget.cs.outline,
-            ),
+            gaplessPlayback: true,
+            errorBuilder: (_, _, _) =>
+                Icon(Icons.broken_image, size: 24, color: widget.cs.outline),
           ),
         );
       },
@@ -2183,8 +2345,11 @@ class _StagedThumbTileState extends State<_StagedThumbTile> {
     return Column(
       mainAxisAlignment: MainAxisAlignment.center,
       children: [
-        Icon(Icons.folder_zip_outlined,
-            size: 24, color: widget.cs.onSurfaceVariant),
+        Icon(
+          Icons.folder_zip_outlined,
+          size: 24,
+          color: widget.cs.onSurfaceVariant,
+        ),
         const SizedBox(height: 2),
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 4),
@@ -2193,10 +2358,7 @@ class _StagedThumbTileState extends State<_StagedThumbTile> {
             maxLines: 2,
             overflow: TextOverflow.ellipsis,
             textAlign: TextAlign.center,
-            style: TextStyle(
-              fontSize: 8,
-              color: widget.cs.onSurfaceVariant,
-            ),
+            style: TextStyle(fontSize: 8, color: widget.cs.onSurfaceVariant),
           ),
         ),
       ],
@@ -2207,8 +2369,11 @@ class _StagedThumbTileState extends State<_StagedThumbTile> {
     return Column(
       mainAxisAlignment: MainAxisAlignment.center,
       children: [
-        Icon(Icons.insert_drive_file,
-            size: 24, color: widget.cs.onSurfaceVariant),
+        Icon(
+          Icons.insert_drive_file,
+          size: 24,
+          color: widget.cs.onSurfaceVariant,
+        ),
         const SizedBox(height: 2),
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 4),
@@ -2217,10 +2382,7 @@ class _StagedThumbTileState extends State<_StagedThumbTile> {
             maxLines: 2,
             overflow: TextOverflow.ellipsis,
             textAlign: TextAlign.center,
-            style: TextStyle(
-              fontSize: 8,
-              color: widget.cs.onSurfaceVariant,
-            ),
+            style: TextStyle(fontSize: 8, color: widget.cs.onSurfaceVariant),
           ),
         ),
       ],
