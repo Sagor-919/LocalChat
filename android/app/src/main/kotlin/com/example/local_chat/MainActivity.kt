@@ -1,6 +1,8 @@
 package com.example.local_chat
 
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.database.Cursor
@@ -320,6 +322,42 @@ class MainActivity : FlutterActivity() {
                         result.success(null)
                     } catch (e: Exception) {
                         result.error("SETTINGS", e.message, null)
+                    }
+                }
+                "copyImageToClipboard" -> {
+                    val path = call.argument<String>("path") ?: run {
+                        result.error("ARG", "path required", null)
+                        return@setMethodCallHandler
+                    }
+                    val file = File(path)
+                    if (!file.exists() || !file.isFile) {
+                        result.error("NOT_FOUND", "file missing", null)
+                        return@setMethodCallHandler
+                    }
+                    try {
+                        val uri = try {
+                            FileProvider.getUriForFile(
+                                this,
+                                "$packageName.flutter_local_chat_files",
+                                file,
+                            )
+                        } catch (_: Exception) {
+                            val clipDir = File(cacheDir, "clipboard")
+                            clipDir.mkdirs()
+                            val dest = File(clipDir, "${System.currentTimeMillis()}_${file.name}")
+                            file.copyTo(dest, overwrite = true)
+                            FileProvider.getUriForFile(
+                                this,
+                                "$packageName.flutter_local_chat_files",
+                                dest,
+                            )
+                        }
+                        val clip = ClipData.newUri(contentResolver, "Image", uri)
+                        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        cm.setPrimaryClip(clip)
+                        result.success(null)
+                    } catch (e: Exception) {
+                        result.error("CLIPBOARD", e.message, null)
                     }
                 }
                 "openFolderInFileManager" -> {

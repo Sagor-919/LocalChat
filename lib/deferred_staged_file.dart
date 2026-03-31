@@ -27,6 +27,8 @@ class DeferredStagedFile {
   final StagedSourceKind kind;
   /// From [PlatformFile.size] when the picker supplies it; otherwise null.
   final int? knownSizeBytes;
+  /// SHA-256 hex of pasted image bytes — duplicate pastes into staging are skipped.
+  final String? clipboardPasteHash;
 
   DeferredStagedFile({
     this.sourcePath,
@@ -34,6 +36,7 @@ class DeferredStagedFile {
     required this.displayName,
     this.kind = StagedSourceKind.file,
     this.knownSizeBytes,
+    this.clipboardPasteHash,
   }) {
     if (kind == StagedSourceKind.folderToZip) {
       assert(sourcePath != null && sourcePath!.isNotEmpty);

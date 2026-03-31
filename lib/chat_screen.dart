@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math' show max, min;
 
+import 'package:crypto/crypto.dart';
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
@@ -86,6 +87,15 @@ class _ChatScreenState extends State<ChatScreen> {
 
   /// Prevents overlapping native file/folder/gallery pickers (multiple explorer windows).
   bool _nativePickerOpen = false;
+
+  /// Desktop clipboard image filenames: Image_01, Image_02, …
+  int _desktopPasteImageSeq = 1;
+
+  /// Pasted image hashes currently represented in [_staged] (duplicate paste guard).
+  final Set<String> _stagedClipboardHashes = {};
+
+  String? _lastSnackMessage;
+  DateTime? _lastSnackAt;
 
   StreamSubscription<void>? _transferSub;
   StreamSubscription<FileMessageEvent>? _fileMsgSub;
@@ -695,9 +705,24 @@ class _ChatScreenState extends State<ChatScreen> {
       );
       if (bytes == null || bytes.isEmpty) continue;
 
+      final hashHex = sha256.convert(bytes).toString();
+      if (_stagedClipboardHashes.contains(hashHex)) {
+        if (mounted) {
+          _showCopyFeedback('Same image already in composer');
+        }
+        return;
+      }
+
       try {
         final dir = await getTemporaryDirectory();
-        final name = 'paste_${_uuid.v4()}.$ext';
+        final String name;
+        if (_isDesktop) {
+          final n = _desktopPasteImageSeq;
+          _desktopPasteImageSeq++;
+          name = 'Image_${n.toString().padLeft(2, '0')}.$ext';
+        } else {
+          name = 'paste_${_uuid.v4()}.$ext';
+        }
         final outPath = p.join(dir.path, name);
         await File(outPath).writeAsBytes(bytes);
         if (!mounted) return;
@@ -706,6 +731,7 @@ class _ChatScreenState extends State<ChatScreen> {
             sourcePath: outPath,
             displayName: name,
             kind: StagedSourceKind.file,
+            clipboardPasteHash: hashHex,
           ),
         ]);
         _showCopyFeedback('Image pasted');
@@ -728,6 +754,13 @@ class _ChatScreenState extends State<ChatScreen> {
     final added = <DeferredStagedFile>[];
     var duplicateCount = 0;
     for (final f in files) {
+      final clipHash = f.clipboardPasteHash;
+      if (clipHash != null &&
+          clipHash.isNotEmpty &&
+          _stagedClipboardHashes.contains(clipHash)) {
+        duplicateCount++;
+        continue;
+      }
       final k = f.stagingDedupeKey;
       if (k.isEmpty) {
         added.add(f);
@@ -745,16 +778,18 @@ class _ChatScreenState extends State<ChatScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       if (added.isNotEmpty) {
-        setState(() => _staged.addAll(added));
+        setState(() {
+          _staged.addAll(added);
+          for (final f in added) {
+            final h = f.clipboardPasteHash;
+            if (h != null && h.isNotEmpty) {
+              _stagedClipboardHashes.add(h);
+            }
+          }
+        });
       }
       if (duplicateCount > 0) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: const Text('Duplicate Removed'),
-            behavior: SnackBarBehavior.floating,
-            duration: const Duration(seconds: 2),
-          ),
-        );
+        _showCopyFeedback('Duplicate removed');
       }
     });
   }
@@ -882,7 +917,10 @@ class _ChatScreenState extends State<ChatScreen> {
 
     if (hasFiles) {
       final raw = List<DeferredStagedFile>.from(_staged);
-      setState(() => _staged.clear());
+      setState(() {
+        _staged.clear();
+        _stagedClipboardHashes.clear();
+      });
       final seenKeys = <String>{};
       for (final df in raw) {
         final key = df.stagingDedupeKey;
@@ -1429,7 +1467,10 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
               const Spacer(),
               GestureDetector(
-                onTap: () => setState(() => _staged.clear()),
+                onTap: () => setState(() {
+                  _staged.clear();
+                  _stagedClipboardHashes.clear();
+                }),
                 child: Text(
                   'Clear all',
                   style: TextStyle(
@@ -1492,7 +1533,13 @@ class _ChatScreenState extends State<ChatScreen> {
                           color: cs.surface,
                           child: InkWell(
                             customBorder: const CircleBorder(),
-                            onTap: () => setState(() => _staged.removeAt(i)),
+                            onTap: () => setState(() {
+                              final r = _staged.removeAt(i);
+                              final h = r.clipboardPasteHash;
+                              if (h != null && h.isNotEmpty) {
+                                _stagedClipboardHashes.remove(h);
+                              }
+                            }),
                             child: Padding(
                               padding: const EdgeInsets.all(4),
                               child: Icon(
@@ -1533,8 +1580,25 @@ class _ChatScreenState extends State<ChatScreen> {
 
   void _showCopyFeedback(String message) {
     if (!mounted) return;
+    final now = DateTime.now();
+    if (_lastSnackMessage == message &&
+        _lastSnackAt != null &&
+        now.difference(_lastSnackAt!) < const Duration(seconds: 2)) {
+      return;
+    }
+    _lastSnackMessage = message;
+    _lastSnackAt = now;
     final mq = MediaQuery.of(context);
-    ScaffoldMessenger.of(context).showSnackBar(
+    final composerBand =
+        12 +
+        12 +
+        48 +
+        (_staged.isNotEmpty ? 92.0 : 0.0) +
+        100.0;
+    final bottom = mq.viewInsets.bottom + mq.padding.bottom + composerBand;
+    final ms = ScaffoldMessenger.of(context);
+    ms.clearSnackBars();
+    ms.showSnackBar(
       SnackBar(
         content: Text(message),
         duration: const Duration(milliseconds: 1800),
@@ -1542,7 +1606,7 @@ class _ChatScreenState extends State<ChatScreen> {
         margin: EdgeInsets.only(
           left: 16,
           right: 16,
-          bottom: mq.viewInsets.bottom + mq.padding.bottom + 96,
+          bottom: bottom,
         ),
       ),
     );
@@ -1904,6 +1968,19 @@ class _ChatScreenState extends State<ChatScreen> {
     String path,
     String displayFileName,
   ) async {
+    if (!kIsWeb && Platform.isAndroid) {
+      try {
+        await _appControlChannel.invokeMethod<void>('copyImageToClipboard', {
+          'path': path,
+        });
+        if (!context.mounted) return;
+        _showCopyFeedback('Image copied to clipboard');
+      } catch (e) {
+        if (!context.mounted) return;
+        _showCopyFeedback('Could not copy image: $e');
+      }
+      return;
+    }
     final clipboard = SystemClipboard.instance;
     if (clipboard == null) {
       if (!context.mounted) return;
@@ -2180,6 +2257,24 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  /// Right-click / long-press: default text operations + paste image (desktop + Android).
+  Widget _composerContextMenu(BuildContext context, EditableTextState state) {
+    return AdaptiveTextSelectionToolbar.buttonItems(
+      anchors: state.contextMenuAnchors,
+      buttonItems: <ContextMenuButtonItem>[
+        ...state.contextMenuButtonItems,
+        if (_isDesktop || (!kIsWeb && Platform.isAndroid))
+          ContextMenuButtonItem(
+            label: 'Paste image from clipboard',
+            onPressed: () {
+              state.hideToolbar();
+              unawaited(_pasteClipboardImageToStaging());
+            },
+          ),
+      ],
+    );
+  }
+
   // -----------------------------------------------------------------------
   // Composer
   // -----------------------------------------------------------------------
@@ -2189,7 +2284,9 @@ class _ChatScreenState extends State<ChatScreen> {
         ? 'Add a message (optional)...'
         : (_isDesktop
               ? 'Message — Enter send · Shift+Enter new line · Ctrl+Shift+V paste image'
-              : 'Message');
+              : (!kIsWeb && Platform.isAndroid
+                    ? 'Message — long-press field for paste text / paste image'
+                    : 'Message'));
 
     // Rebuild only the composer row on typing — not the whole chat (avoids jank).
     return Padding(
@@ -2233,7 +2330,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   icon: const Icon(Icons.photo_library),
                 ),
               ],
-              if (!kIsWeb) ...[
+              if (!kIsWeb && !Platform.isAndroid) ...[
                 const SizedBox(width: 4),
                 IconButton.filled(
                   onPressed: _nativePickerOpen
@@ -2267,6 +2364,7 @@ class _ChatScreenState extends State<ChatScreen> {
                       textInputAction: TextInputAction.newline,
                       minLines: 1,
                       maxLines: null,
+                      contextMenuBuilder: kIsWeb ? null : _composerContextMenu,
                       textAlignVertical: TextAlignVertical.top,
                       scrollPadding: const EdgeInsets.only(
                         bottom: 120,
