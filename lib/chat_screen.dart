@@ -5,6 +5,7 @@ import 'dart:math' show max, min;
 import 'package:crypto/crypto.dart';
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -28,6 +29,7 @@ import 'message_model.dart';
 import 'message_store.dart';
 import 'deferred_staged_file.dart';
 import 'desktop_drop_queue.dart';
+import 'staged_from_drop.dart';
 import 'transfer_manager.dart';
 
 class ChatScreen extends StatefulWidget {
@@ -266,14 +268,7 @@ class _ChatScreenState extends State<ChatScreen> {
         final dropped = DesktopDropQueue.takeAll();
         if (dropped.isEmpty) return;
         _stageFiles(
-          dropped
-              .map(
-                (path) => DeferredStagedFile(
-                  sourcePath: path,
-                  displayName: p.basename(path),
-                ),
-              )
-              .toList(),
+          dropped.map(deferredStagedFileFromLocalPath).whereType<DeferredStagedFile>().toList(),
         );
       });
     }
@@ -873,9 +868,8 @@ class _ChatScreenState extends State<ChatScreen> {
   void _onDropDone(DropDoneDetails details) {
     _stageFiles(
       details.files
-          .map(
-            (x) => DeferredStagedFile(sourcePath: x.path, displayName: x.name),
-          )
+          .map(deferredStagedFileFromDropItem)
+          .whereType<DeferredStagedFile>()
           .toList(),
     );
   }
@@ -2284,43 +2278,41 @@ class _ChatScreenState extends State<ChatScreen> {
 
   /// Right-click / long-press: default text operations + paste image (desktop + Android).
   Widget _composerContextMenu(BuildContext context, EditableTextState state) {
-    final cs = Theme.of(context).colorScheme;
     final isAndroid = !kIsWeb && Platform.isAndroid;
-    final toolbar = AdaptiveTextSelectionToolbar.buttonItems(
-      anchors: state.contextMenuAnchors,
-      buttonItems: <ContextMenuButtonItem>[
-        ...state.contextMenuButtonItems,
-        if (_isDesktop || isAndroid)
-          ContextMenuButtonItem(
+    final pasteImage = (_isDesktop || isAndroid)
+        ? ContextMenuButtonItem(
             label: 'Paste image',
             onPressed: () {
               state.hideToolbar();
               unawaited(_pasteClipboardImageToStaging());
             },
-          ),
-      ],
-    );
+          )
+        : null;
+    final items = <ContextMenuButtonItem>[
+      ...state.contextMenuButtonItems,
+      ?pasteImage,
+    ];
+
+    // Android Material [TextSelectionToolbar] is laid out against full screen width; use the
+    // Cupertino toolbar here so the menu stays a compact strip (no sheet-like backdrop).
     if (isAndroid) {
-      return DecoratedBox(
-        decoration: BoxDecoration(
-          color: cs.surface,
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: cs.outlineVariant, width: 1),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withValues(alpha: 0.12),
-              blurRadius: 8,
-              offset: const Offset(0, 2),
-            ),
-          ],
-        ),
-        child: ClipRRect(
-          borderRadius: BorderRadius.circular(8),
-          child: toolbar,
-        ),
+      final withHandlers = items.where((e) => e.onPressed != null).toList();
+      if (withHandlers.isEmpty) return const SizedBox.shrink();
+      return CupertinoTextSelectionToolbar(
+        anchorAbove: state.contextMenuAnchors.primaryAnchor,
+        anchorBelow: state.contextMenuAnchors.secondaryAnchor ??
+            state.contextMenuAnchors.primaryAnchor,
+        children: [
+          for (final item in withHandlers)
+            CupertinoTextSelectionToolbarButton.buttonItem(buttonItem: item),
+        ],
       );
     }
-    return toolbar;
+
+    return AdaptiveTextSelectionToolbar.buttonItems(
+      anchors: state.contextMenuAnchors,
+      buttonItems: items,
+    );
   }
 
   // -----------------------------------------------------------------------

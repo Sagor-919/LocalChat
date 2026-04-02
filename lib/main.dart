@@ -18,6 +18,7 @@ import 'chat_screen.dart';
 import 'connection_service.dart';
 import 'desktop_drop_queue.dart';
 import 'device.dart';
+import 'staged_from_drop.dart';
 import 'first_launch_prompt.dart';
 import 'discovery_service.dart';
 import 'home_screen.dart';
@@ -398,7 +399,7 @@ Future<void> main(List<String> args) async {
     for (var i = 0; i < args.length; i++) {
       if (args[i] == '--share-file' && i + 1 < args.length) {
         final p = args[++i];
-        if (p.isNotEmpty && File(p).existsSync()) {
+        if (p.isNotEmpty && stagedDropPathExists(p)) {
           DesktopDropQueue.enqueue([p]);
         }
       }

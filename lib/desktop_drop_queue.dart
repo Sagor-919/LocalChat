@@ -1,6 +1,6 @@
-import 'dart:io';
-
 import 'package:flutter/foundation.dart';
+
+import 'staged_from_drop.dart';
 
 /// Files dropped on the home screen (desktop / Android with desktop_drop).
 /// Open a chat to [takeAll] into the composer, similar to Android share-inbound.
@@ -14,7 +14,7 @@ class DesktopDropQueue {
 
   static void enqueue(Iterable<String> paths) {
     if (kIsWeb) return;
-    final ok = paths.where((p) => p.isNotEmpty && File(p).existsSync()).toList();
+    final ok = paths.where((p) => stagedDropPathExists(p)).toList();
     if (ok.isEmpty) return;
     _paths.addAll(ok);
     revision.value++;
