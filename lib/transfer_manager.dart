@@ -37,6 +37,8 @@ class TransferState {
   final List<String> tempPathsForCleanup = [];
   OutgoingTransferPhase outgoingPhase;
   final Stopwatch stopwatch = Stopwatch()..start();
+  /// Peer's file listener port (WAN may use forwarded port).
+  int peerFileTcpPort = kFileTransferPort;
 
   TransferState({
     required this.fileId,
@@ -46,6 +48,7 @@ class TransferState {
     required this.isSending,
     this.filePath,
     this.outgoingPhase = OutgoingTransferPhase.transferring,
+    this.peerFileTcpPort = kFileTransferPort,
   });
 
   double get currentSpeed {
@@ -180,6 +183,7 @@ class TransferManager {
     String? androidContentUri,
     required StagedSourceKind kind,
     required bool duplicatePathInBatch,
+    int peerFileTcpPort = kFileTransferPort,
   }) async {
     final id = initialMessage.id;
     final hasContentUri =
@@ -197,6 +201,7 @@ class TransferManager {
       outgoingPhase: preparing
           ? OutgoingTransferPhase.preparing
           : OutgoingTransferPhase.transferring,
+      peerFileTcpPort: peerFileTcpPort,
     );
     transfers[id] = t;
     _notify();
@@ -423,6 +428,7 @@ class TransferManager {
         fileSize: t.totalBytes,
         file: File(t.filePath!),
         startOffset: startOff,
+        tcpPort: t.peerFileTcpPort,
         onProgress: (sent, total) {
           t.transferredBytes = sent;
           t.progress = total == 0 ? 0 : sent / total;

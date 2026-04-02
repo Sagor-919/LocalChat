@@ -17,7 +17,7 @@ This app discovers nearby devices on **Wi‑Fi / Ethernet**, opens **TCP chat** 
 
 | Document | Contents |
 |----------|----------|
-| [**docs/FEATURES.md**](docs/FEATURES.md) | Feature-by-feature reference (what exists and where in code). |
+| [**docs/FEATURES.md**](docs/FEATURES.md) | Feature-by-feature reference (what exists and where in code), including [**global discovery (WAN)**](docs/FEATURES.md#global-discovery-wan). |
 | [**docs/RELEASE_ALPHA.md**](docs/RELEASE_ALPHA.md) | Signing, builds, release checklist. |
 | [**CHANGELOG.md**](CHANGELOG.md) | Alpha 1.7.0 notes. |
 | [**docs/phases_archive.md**](docs/phases_archive.md) | Original phased implementation plan (historical). |
@@ -34,6 +34,14 @@ flutter run
 
 - **Android:** connect device or emulator with LAN access for discovery.
 - **Windows:** `flutter run -d windows`
+
+Optional **reference signaling server** (for global discovery testing on a LAN):
+
+```bash
+dart run bin/signaling_server.dart
+```
+
+Point **Settings → Signaling WebSocket URL** at `ws://<that-machine-ip>:4576/`. Full behavior and caveats: [**docs/FEATURES.md — Global discovery**](docs/FEATURES.md#global-discovery-wan).
 
 ---
 
@@ -52,6 +60,7 @@ flutter test
 - **UDP** — discovery (`broadcast_port` / handshake in [`lib/discovery_service.dart`](lib/discovery_service.dart)).
 - **TCP** — JSON chat + control; [`lib/connection_service.dart`](lib/connection_service.dart).
 - **File transfer** — dedicated socket protocol; [`lib/file_transfer_service.dart`](lib/file_transfer_service.dart), [`lib/transfer_manager.dart`](lib/transfer_manager.dart).
+- **Global discovery (optional)** — same UDP/TCP ports as LAN; adds **STUN** (or **manual public IP**) + **WebSocket** presence ([`lib/global_signaling.dart`](lib/global_signaling.dart)), optional hub [`bin/signaling_server.dart`](bin/signaling_server.dart). **UPnP** ([`lib/nat_port_mapping.dart`](lib/nat_port_mapping.dart)) can request automatic port forwarding when both advertised ports are 0. Settings include **advertised TCP ports** for manual router rules. No cloud chat relay. See [**docs/FEATURES.md — Global discovery (WAN)**](docs/FEATURES.md#global-discovery-wan).
 - **Persistence** — SQLite `sqflite` ([`lib/message_store.dart`](lib/message_store.dart)); attachments on disk per app settings.
 - **Crypto** — [`lib/chat_crypto.dart`](lib/chat_crypto.dart).
 

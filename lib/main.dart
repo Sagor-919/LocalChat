@@ -18,6 +18,7 @@ import 'chat_screen.dart';
 import 'connection_service.dart';
 import 'device.dart';
 import 'first_launch_prompt.dart';
+import 'global_signaling.dart';
 import 'discovery_service.dart';
 import 'home_screen.dart';
 import 'message_model.dart';
@@ -421,6 +422,13 @@ Future<void> main(List<String> args) async {
   await _connections.startServer();
   await _discovery.start();
 
+  unawaited(
+    GlobalSignalingService.instance.init(
+      discovery: _discovery,
+      me: _me,
+    ),
+  );
+
   await TransferManager.instance.init(
     connections: _connections,
     store: _store,
@@ -605,6 +613,7 @@ class _LocalChatAppState extends State<LocalChatApp>
 
   @override
   void dispose() {
+    GlobalSignalingService.instance.dispose();
     _connectivitySub?.cancel();
     if (_isDesktop) {
       windowManager.removeListener(this);

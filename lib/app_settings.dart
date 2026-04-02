@@ -22,6 +22,22 @@ class AppSettings {
   /// Desktop: when true, closing the window hides to tray and keeps LAN active; when false, exit the app.
   final desktopRunInBackground = ValueNotifier<bool>(true);
 
+  /// WAN presence (WebSocket + STUN). LAN discovery unchanged when false.
+  final globalDiscoveryEnabled = ValueNotifier<bool>(false);
+  final signalingServerUrl = ValueNotifier<String>('');
+  final stunHost = ValueNotifier<String>('stun.l.google.com');
+  final stunPort = ValueNotifier<int>(19302);
+
+  /// If non-empty, replaces STUN for the public address (`wip`) sent to signaling.
+  final wanManualPublicIp = ValueNotifier<String>('');
+  /// 0 = use [ConnectionService.tcpPort] in `reg`; else advertised WAN chat port.
+  final wanAdvertisedChatTcpPort = ValueNotifier<int>(0);
+  /// 0 = use [kFileTransferPort] in `reg`; else advertised WAN file port.
+  final wanAdvertisedFileTcpPort = ValueNotifier<int>(0);
+
+  /// When true (default), try UPnP to open chat/file TCP on the router if both advertised ports are 0.
+  final upnpPortMappingEnabled = ValueNotifier<bool>(true);
+
   Future<void> init() async {
     _prefs = await SharedPreferences.getInstance();
 
@@ -54,6 +70,62 @@ class AppSettings {
     if (Platform.isWindows) {
       startWithWindows.value = await _readStartupRegistry();
     }
+
+    globalDiscoveryEnabled.value =
+        _prefs.getBool('global_discovery_enabled') ?? false;
+    signalingServerUrl.value =
+        _prefs.getString('signaling_server_url') ?? '';
+    stunHost.value = _prefs.getString('stun_host') ?? 'stun.l.google.com';
+    stunPort.value = _prefs.getInt('stun_port') ?? 19302;
+    wanManualPublicIp.value = _prefs.getString('wan_manual_public_ip') ?? '';
+    wanAdvertisedChatTcpPort.value =
+        _prefs.getInt('wan_adv_chat_tcp') ?? 0;
+    wanAdvertisedFileTcpPort.value =
+        _prefs.getInt('wan_adv_file_tcp') ?? 0;
+    upnpPortMappingEnabled.value =
+        _prefs.getBool('upnp_port_mapping_enabled') ?? true;
+  }
+
+  Future<void> setGlobalDiscoveryEnabled(bool v) async {
+    globalDiscoveryEnabled.value = v;
+    await _prefs.setBool('global_discovery_enabled', v);
+  }
+
+  Future<void> setSignalingServerUrl(String v) async {
+    signalingServerUrl.value = v;
+    await _prefs.setString('signaling_server_url', v.trim());
+  }
+
+  Future<void> setStunHost(String v) async {
+    stunHost.value = v.trim();
+    await _prefs.setString('stun_host', stunHost.value);
+  }
+
+  Future<void> setStunPort(int v) async {
+    stunPort.value = v.clamp(1, 65535);
+    await _prefs.setInt('stun_port', stunPort.value);
+  }
+
+  Future<void> setWanManualPublicIp(String v) async {
+    wanManualPublicIp.value = v.trim();
+    await _prefs.setString('wan_manual_public_ip', wanManualPublicIp.value);
+  }
+
+  /// 0 means use [ConnectionService.tcpPort].
+  Future<void> setWanAdvertisedChatTcpPort(int v) async {
+    wanAdvertisedChatTcpPort.value = v.clamp(0, 65535);
+    await _prefs.setInt('wan_adv_chat_tcp', wanAdvertisedChatTcpPort.value);
+  }
+
+  /// 0 means use [kFileTransferPort].
+  Future<void> setWanAdvertisedFileTcpPort(int v) async {
+    wanAdvertisedFileTcpPort.value = v.clamp(0, 65535);
+    await _prefs.setInt('wan_adv_file_tcp', wanAdvertisedFileTcpPort.value);
+  }
+
+  Future<void> setUpnpPortMappingEnabled(bool v) async {
+    upnpPortMappingEnabled.value = v;
+    await _prefs.setBool('upnp_port_mapping_enabled', v);
   }
 
   Future<void> setThemeMode(ThemeMode mode) async {

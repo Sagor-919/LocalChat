@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 
+import 'file_transfer_service.dart';
 import 'services/device_identity_service.dart';
 
 class DeviceInfo {
@@ -110,6 +111,15 @@ class PeerDevice {
   /// From discovery payload; null if legacy peer or wire omitted.
   final String? lanStableTag;
 
+  /// Last UDP LAN broadcast from this peer (global mode: prefer TCP to [ip] while fresh).
+  DateTime? lastSeenOnLan;
+
+  /// Server-reflexive / signaling TCP target (WAN). Requires port-forward on peer for 4041/4042.
+  final String? wanIp;
+  final int? wanTcpPort;
+  /// WAN file TCP port from signaling (`tfp`); null means use [kFileTransferPort].
+  final int? wanFileTcpPort;
+
   PeerDevice({
     required this.userId,
     required this.name,
@@ -117,7 +127,36 @@ class PeerDevice {
     required this.port,
     required this.lastSeen,
     this.lanStableTag,
+    this.lastSeenOnLan,
+    this.wanIp,
+    this.wanTcpPort,
+    this.wanFileTcpPort,
   });
+
+  /// TCP chat + file transfer target: LAN while recently seen on UDP, else [wanIp].
+  String get effectiveTcpHost {
+    final lanFresh = lastSeenOnLan != null &&
+        DateTime.now().difference(lastSeenOnLan!) <= const Duration(seconds: 45);
+    if (lanFresh && ip.trim().isNotEmpty) return ip.trim();
+    final w = wanIp?.trim();
+    if (w != null && w.isNotEmpty) return w;
+    return ip.trim();
+  }
+
+  int get effectiveTcpPort {
+    final lanFresh = lastSeenOnLan != null &&
+        DateTime.now().difference(lastSeenOnLan!) <= const Duration(seconds: 45);
+    if (lanFresh) return port;
+    return wanTcpPort ?? port;
+  }
+
+  /// Outbound file TCP port: LAN always [kFileTransferPort]; WAN uses [wanFileTcpPort] if set.
+  int get effectiveFileTcpPort {
+    final lanFresh = lastSeenOnLan != null &&
+        DateTime.now().difference(lastSeenOnLan!) <= const Duration(seconds: 45);
+    if (lanFresh) return kFileTransferPort;
+    return wanFileTcpPort ?? kFileTransferPort;
+  }
 
   Color get avatarColor {
     const palette = [

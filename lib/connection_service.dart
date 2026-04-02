@@ -132,7 +132,10 @@ class ConnectionService {
     if (existing != null) return existing;
 
     try {
-      final socket = await _connectChatSocket(peer.ip, peer.port);
+      final socket = await _connectChatSocket(
+        peer.effectiveTcpHost,
+        peer.effectiveTcpPort,
+      );
 
       _attachSocket(socket, peer.userId);
 

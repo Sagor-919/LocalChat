@@ -60,11 +60,12 @@ class FileSender {
     required File file,
     required void Function(int sent, int total) onProgress,
     int startOffset = 0,
+    int tcpPort = kFileTransferPort,
   }) async {
     if (startOffset < 0 || startOffset > fileSize) {
       throw ArgumentError('Invalid startOffset');
     }
-    final socket = await connectFileClient(host, kFileTransferPort);
+    final socket = await connectFileClient(host, tcpPort);
     _socket = socket;
     socket.setOption(SocketOption.tcpNoDelay, true);
 

@@ -21,6 +21,8 @@ class DiscoveryService {
 
   final DeviceInfo me;
   final Map<String, PeerDevice> _peers = {};
+  /// Merged into [peers] — WAN targets from signaling (same userId as LAN merges).
+  final Map<String, PeerDevice> _wanOverlay = {};
   RawDatagramSocket? _socket;
   Timer? _broadcastTimer;
   Timer? _cleanupTimer;
@@ -37,7 +39,50 @@ class DiscoveryService {
 
   DiscoveryService({required this.me});
 
-  List<PeerDevice> get peers => _peers.values.toList();
+  List<PeerDevice> get peers {
+    final out = <String, PeerDevice>{};
+    for (final e in _peers.entries) {
+      final u = e.key;
+      final lan = e.value;
+      final wan = _wanOverlay[u];
+      if (wan != null) {
+        out[u] = PeerDevice(
+          userId: u,
+          name: lan.name,
+          ip: lan.ip,
+          port: lan.port,
+          lastSeen: lan.lastSeen.isAfter(wan.lastSeen) ? lan.lastSeen : wan.lastSeen,
+          lanStableTag: lan.lanStableTag ?? wan.lanStableTag,
+          lastSeenOnLan: lan.lastSeenOnLan,
+          wanIp: wan.wanIp,
+          wanTcpPort: wan.wanTcpPort,
+          wanFileTcpPort: wan.wanFileTcpPort,
+        );
+      } else {
+        out[u] = lan;
+      }
+    }
+    for (final e in _wanOverlay.entries) {
+      if (!out.containsKey(e.key)) {
+        out[e.key] = e.value;
+      }
+    }
+    return out.values.toList();
+  }
+
+  /// Replaces WAN overlay from global signaling (omit entries to clear).
+  void setWanOverlay(Map<String, PeerDevice> map) {
+    _wanOverlay
+      ..clear()
+      ..addAll(map);
+    onPeersChanged?.call();
+  }
+
+  void clearWanOverlay() {
+    if (_wanOverlay.isEmpty) return;
+    _wanOverlay.clear();
+    onPeersChanged?.call();
+  }
 
   /// UDP bound and discovery loop running — best-effort signal that we can advertise.
   bool get isAdvertisingActive => _started && _socket != null;
@@ -228,8 +273,10 @@ class DiscoveryService {
 
     final existing = _peers[userId];
     final effectiveTag = wireTag ?? existing?.lanStableTag;
+    final now = DateTime.now();
     if (existing != null) {
-      existing.lastSeen = DateTime.now();
+      existing.lastSeen = now;
+      existing.lastSeenOnLan = now;
       if (existing.name != name ||
           existing.ip != senderIp ||
           existing.port != port ||
@@ -239,8 +286,9 @@ class DiscoveryService {
           name: name,
           ip: senderIp,
           port: port,
-          lastSeen: DateTime.now(),
+          lastSeen: now,
           lanStableTag: effectiveTag,
+          lastSeenOnLan: now,
         );
       }
     } else {
@@ -249,8 +297,9 @@ class DiscoveryService {
         name: name,
         ip: senderIp,
         port: port,
-        lastSeen: DateTime.now(),
+        lastSeen: now,
         lanStableTag: effectiveTag,
+        lastSeenOnLan: now,
       );
     }
     onPeersChanged?.call();

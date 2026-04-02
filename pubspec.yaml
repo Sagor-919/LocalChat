@@ -32,6 +32,7 @@ dependencies:
   synchronized: ^3.4.0
   device_info_plus: ^11.5.0
   package_info_plus: ^8.1.2
+  port_forwarder: ^1.0.0
 
 dev_dependencies:
   flutter_test:

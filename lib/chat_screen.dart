@@ -320,9 +320,10 @@ class _ChatScreenState extends State<ChatScreen> {
     final wasConnected = _connected;
     final live = _resolveLivePeer();
     final inDiscovery = widget.discovery.peers.any((p) => p.userId == _peerId);
-    final hasLanAddress = live.ip.trim().isNotEmpty;
+    final hasAddr = live.ip.trim().isNotEmpty ||
+        (live.wanIp != null && live.wanIp!.trim().isNotEmpty);
     // UDP may have pruned the peer after Wi‑Fi flap; we still have IP from route/store.
-    final canTryReconnect = inDiscovery || hasLanAddress;
+    final canTryReconnect = inDiscovery || hasAddr;
     if (socketConnected != _connected) {
       setState(() => _connected = socketConnected);
     }
@@ -471,11 +472,13 @@ class _ChatScreenState extends State<ChatScreen> {
   /// this peer is offline.
   Future<void> _rememberPeerRecord() async {
     final live = _resolveLivePeer();
+    final ipSave =
+        live.ip.trim().isNotEmpty ? live.ip : live.effectiveTcpHost;
     await widget.store.savePeerInfo(
       _peerId,
       live.name,
-      live.ip,
-      live.port,
+      ipSave,
+      live.effectiveTcpPort,
       lanStableTag: live.lanStableTag,
     );
   }
@@ -901,8 +904,8 @@ class _ChatScreenState extends State<ChatScreen> {
         _peerId,
         msg,
         peerDisplayName: live.name,
-        peerIp: live.ip,
-        peerTcpPort: live.port,
+        peerIp: live.effectiveTcpHost,
+        peerTcpPort: live.effectiveTcpPort,
       );
       if (inserted) _totalInDb++;
       _input.clear();
@@ -963,20 +966,21 @@ class _ChatScreenState extends State<ChatScreen> {
       _peerId,
       msg,
       peerDisplayName: live.name,
-      peerIp: live.ip,
-      peerTcpPort: live.port,
+      peerIp: live.effectiveTcpHost,
+      peerTcpPort: live.effectiveTcpPort,
     );
     if (inserted) _totalInDb++;
     if (!mounted) return;
     await _tm.prepareAndSendOutbound(
       initialMessage: msg,
       peerId: _peerId,
-      peerIp: live.ip,
+      peerIp: live.effectiveTcpHost,
       peerDisplayName: live.name,
       sourcePath: df.sourcePath ?? '',
       androidContentUri: df.androidContentUri,
       kind: df.kind,
       duplicatePathInBatch: duplicatePathInBatch,
+      peerFileTcpPort: live.effectiveFileTcpPort,
     );
   }
 

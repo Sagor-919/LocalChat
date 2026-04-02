@@ -46,3 +46,4 @@ app.*.map.json
 
 # Local reference / third-party clones (not part of this repo)
 _ref_lanmessenger/
+_ref_p2p/
