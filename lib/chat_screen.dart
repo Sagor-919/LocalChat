@@ -7,6 +7,7 @@ import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
@@ -31,6 +32,19 @@ import 'deferred_staged_file.dart';
 import 'desktop_drop_queue.dart';
 import 'staged_from_drop.dart';
 import 'transfer_manager.dart';
+
+/// Lets mouse / trackpad drag the horizontal staged-files strip (desktop).
+class _StagedStripScrollBehavior extends MaterialScrollBehavior {
+  const _StagedStripScrollBehavior();
+
+  @override
+  Set<PointerDeviceKind> get dragDevices => {
+        PointerDeviceKind.touch,
+        PointerDeviceKind.stylus,
+        PointerDeviceKind.mouse,
+        PointerDeviceKind.trackpad,
+      };
+}
 
 class ChatScreen extends StatefulWidget {
   final DeviceInfo me;
@@ -80,6 +94,7 @@ class _ChatScreenState extends State<ChatScreen> {
   final TextEditingController _input = TextEditingController();
   final FocusNode _focus = FocusNode();
   final ScrollController _scroll = ScrollController();
+  final ScrollController _stagedStripScroll = ScrollController();
 
   void Function(String, Map<String, dynamic>)? _prevOnMessage;
   void Function(String)? _prevOnDisconnected;
@@ -513,6 +528,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _input.dispose();
     _focus.dispose();
     _scroll.dispose();
+    _stagedStripScroll.dispose();
     super.dispose();
   }
 
@@ -1515,76 +1531,87 @@ class _ChatScreenState extends State<ChatScreen> {
           const SizedBox(height: 10),
           SizedBox(
             height: 76,
-            child: ListView.builder(
-              scrollDirection: Axis.horizontal,
-              itemCount: _staged.length,
-              itemBuilder: (ctx, i) {
-                final df = _staged[i];
-                final isFolder = df.kind == StagedSourceKind.folderToZip;
-                final previewPath = df.localPathForPreview;
-                final isImg =
-                    previewPath != null &&
-                    _isImage(df.displayName) &&
-                    !isFolder;
-                return Padding(
-                  padding: const EdgeInsets.only(right: 8),
-                  child: Stack(
-                    clipBehavior: Clip.none,
-                    children: [
-                      Container(
-                        width: 64,
-                        height: 64,
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(10),
-                          color: cs.surfaceContainerHighest,
-                        ),
-                        clipBehavior: Clip.antiAlias,
-                        child: _StagedThumbTile(
-                          path: previewPath,
-                          name: df.displayName,
-                          isImage: isImg,
-                          isFolder: isFolder,
-                          knownSizeBytes: df.knownSizeBytes,
-                          cs: cs,
-                          imageWrapper: (image) => _wrapImageWithContextMenu(
-                            path: previewPath!,
-                            fileName: df.displayName,
-                            image: image,
-                          ),
-                        ),
-                      ),
-                      Positioned(
-                        bottom: 2,
-                        right: 2,
-                        child: Material(
-                          elevation: 2,
-                          shadowColor: Colors.black38,
-                          shape: const CircleBorder(),
-                          color: cs.surface,
-                          child: InkWell(
-                            customBorder: const CircleBorder(),
-                            onTap: () => setState(() {
-                              final r = _staged.removeAt(i);
-                              final h = r.clipboardPasteHash;
-                              if (h != null && h.isNotEmpty) {
-                                _stagedClipboardHashes.remove(h);
-                              }
-                            }),
-                            child: Padding(
-                              padding: const EdgeInsets.all(3),
-                              child: Icon(
-                                Icons.close_rounded,
-                                size: 16,
-                                color: cs.onSurface,
+            child: ScrollConfiguration(
+              behavior: _isDesktop
+                  ? const _StagedStripScrollBehavior()
+                  : ScrollConfiguration.of(context),
+              child: Scrollbar(
+                controller: _stagedStripScroll,
+                thumbVisibility: _isDesktop,
+                trackVisibility: _isDesktop,
+                child: ListView.builder(
+                  controller: _stagedStripScroll,
+                  scrollDirection: Axis.horizontal,
+                  itemCount: _staged.length,
+                  itemBuilder: (ctx, i) {
+                    final df = _staged[i];
+                    final isFolder = df.kind == StagedSourceKind.folderToZip;
+                    final previewPath = df.localPathForPreview;
+                    final isImg =
+                        previewPath != null &&
+                        _isImage(df.displayName) &&
+                        !isFolder;
+                    return Padding(
+                      padding: const EdgeInsets.only(right: 8),
+                      child: Stack(
+                        clipBehavior: Clip.none,
+                        children: [
+                          Container(
+                            width: 64,
+                            height: 64,
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(10),
+                              color: cs.surfaceContainerHighest,
+                            ),
+                            clipBehavior: Clip.antiAlias,
+                            child: _StagedThumbTile(
+                              path: previewPath,
+                              name: df.displayName,
+                              isImage: isImg,
+                              isFolder: isFolder,
+                              knownSizeBytes: df.knownSizeBytes,
+                              cs: cs,
+                              imageWrapper: (image) => _wrapImageWithContextMenu(
+                                path: previewPath!,
+                                fileName: df.displayName,
+                                image: image,
                               ),
                             ),
                           ),
-                        ),
+                          Positioned(
+                            bottom: 2,
+                            right: 2,
+                            child: Material(
+                              elevation: 2,
+                              shadowColor: Colors.black38,
+                              shape: const CircleBorder(),
+                              color: cs.surface,
+                              child: InkWell(
+                                customBorder: const CircleBorder(),
+                                onTap: () => setState(() {
+                                  final r = _staged.removeAt(i);
+                                  final h = r.clipboardPasteHash;
+                                  if (h != null && h.isNotEmpty) {
+                                    _stagedClipboardHashes.remove(h);
+                                  }
+                                }),
+                                child: Padding(
+                                  padding: const EdgeInsets.all(3),
+                                  child: Icon(
+                                    Icons.close_rounded,
+                                    size: 16,
+                                    color: cs.onSurface,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
                       ),
-                    ],
-                  ),
-                );
-              },
+                    );
+                  },
+                ),
+              ),
             ),
           ),
         ],

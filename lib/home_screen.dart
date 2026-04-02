@@ -71,6 +71,10 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _onHomeFilesDropped(DropDoneDetails details) {
     if (details.files.isEmpty) return;
+    // desktop_drop notifies every registered DropTarget; home stays mounted under chat.
+    // Only queue when this route is visible (see DropTarget.enable below).
+    final route = ModalRoute.of(context);
+    if (route == null || !route.isCurrent) return;
     DesktopDropQueue.enqueue(details.files.map((x) => x.path));
     if (mounted) setState(() {});
   }
@@ -511,6 +515,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
     if (_supportsHomeFileDrop) {
       body = DropTarget(
+        enable: ModalRoute.of(context)?.isCurrent ?? true,
         onDragDone: _onHomeFilesDropped,
         child: body,
       );

@@ -1,5 +1,6 @@
 ﻿import 'dart:async';
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:archive/archive_io.dart';
 import 'package:path/path.dart' as p;
@@ -60,15 +61,12 @@ Future<void> copyFileChunked(
   if (isCancelled()) throw const AttachmentPrepareCancelled();
 }
 
-/// Zips a folder with pure Dart ([archive]) so folder send works on Android
-/// and Windows without a `tar` binary.
-Future<void> createFolderZip({
-  required String directoryPath,
-  required String folderName,
-  required String zipOutPath,
-  required bool Function() isCancelled,
-  void Function(Process process)? onProcessStarted,
-}) async {
+/// Runs in a worker isolate — keep logic self-contained (no captured main-isolate state).
+Future<void> _createFolderZipInIsolate(
+  String directoryPath,
+  String folderName,
+  String zipOutPath,
+) async {
   final dir = Directory(directoryPath);
   if (!await dir.exists()) {
     throw AttachmentPrepareException('Folder not found: $folderName');
@@ -80,30 +78,48 @@ Future<void> createFolderZip({
     } catch (_) {}
   }
   try {
+    // Store (no deflate) keeps CPU low and matches typical LAN “bundle folder” use.
     await ZipFileEncoder().zipDirectory(
       dir,
       filename: zipOutPath,
+      level: ZipFileEncoder.store,
       filter: (entity, _) {
-        if (isCancelled()) return ZipFileOperation.cancel;
         if (entity is File || entity is Directory) {
           return ZipFileOperation.include;
         }
         return ZipFileOperation.skip;
       },
     );
-    if (isCancelled()) throw const AttachmentPrepareCancelled();
     if (!await zipFile.exists()) {
       throw AttachmentPrepareException('Archive was not created');
     }
-  } on AttachmentPrepareCancelled {
-    rethrow;
   } catch (e) {
     try {
       if (await zipFile.exists()) await zipFile.delete();
     } catch (_) {}
     if (e is AttachmentPrepareException) rethrow;
+    if (e is AttachmentPrepareCancelled) rethrow;
     throw AttachmentPrepareException(e.toString());
   }
+}
+
+/// Zips a folder with pure Dart ([archive]) on a **background isolate** so the UI thread
+/// stays responsive. Uses ZIP store mode (no compression) for speed on large trees.
+///
+/// [isCancelled] is checked **after** the worker finishes; mid-zip cancel is not supported.
+Future<void> createFolderZip({
+  required String directoryPath,
+  required String folderName,
+  required String zipOutPath,
+  required bool Function() isCancelled,
+  void Function(Process process)? onProcessStarted,
+}) async {
+  // onProcessStarted is unused for Dart zip (kept for API compatibility with callers).
+  final dp = directoryPath;
+  final fn = folderName;
+  final zp = zipOutPath;
+  await Isolate.run(() => _createFolderZipInIsolate(dp, fn, zp));
+  if (isCancelled()) throw const AttachmentPrepareCancelled();
 }
 
 String uniqueTempPath(String tempDir, String fileId, String displayName) {
