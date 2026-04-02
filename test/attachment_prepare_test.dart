@@ -4,15 +4,6 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:local_chat/attachment_prepare.dart';
 import 'package:path/path.dart' as path_lib;
 
-bool _tarAvailable() {
-  try {
-    final r = Process.runSync('tar', ['--version'], runInShell: true);
-    return r.exitCode == 0;
-  } catch (_) {
-    return false;
-  }
-}
-
 void main() {
   group('uniqueTempPath', () {
     test('sanitizes path segments in display name', () {
@@ -112,26 +103,22 @@ void main() {
       }
     });
 
-    test(
-      'writes a zip when tar is available',
-      () async {
-        final folder = Directory('${work.path}${Platform.pathSeparator}pack');
-        await folder.create();
-        await File('${folder.path}${Platform.pathSeparator}a.txt')
-            .writeAsString('hello');
-        final zipPath = '${work.path}${Platform.pathSeparator}out.zip';
-        var cancelled = false;
-        await createFolderZip(
-          directoryPath: folder.path,
-          folderName: 'pack',
-          zipOutPath: zipPath,
-          isCancelled: () => cancelled,
-        );
-        final z = File(zipPath);
-        expect(await z.exists(), isTrue);
-        expect(await z.length(), greaterThan(0));
-      },
-      skip: _tarAvailable() ? false : 'Requires tar in PATH (folder send prep)',
-    );
+    test('writes a zip from folder (pure Dart archive)', () async {
+      final folder = Directory('${work.path}${Platform.pathSeparator}pack');
+      await folder.create();
+      await File('${folder.path}${Platform.pathSeparator}a.txt')
+          .writeAsString('hello');
+      final zipPath = '${work.path}${Platform.pathSeparator}out.zip';
+      var cancelled = false;
+      await createFolderZip(
+        directoryPath: folder.path,
+        folderName: 'pack',
+        zipOutPath: zipPath,
+        isCancelled: () => cancelled,
+      );
+      final z = File(zipPath);
+      expect(await z.exists(), isTrue);
+      expect(await z.length(), greaterThan(0));
+    });
   });
 }

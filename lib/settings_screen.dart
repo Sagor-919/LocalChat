@@ -332,17 +332,25 @@ class _SettingsScreenState extends State<SettingsScreen>
                   builder: (context, snap) {
                     final p = snap.data;
                     final ver = p?.version ?? '—';
-                    final build = p?.buildNumber;
-                    final line = (build != null && build.isNotEmpty)
-                        ? 'v$ver ($build) · ${AppMetadata.releaseLabel}'
-                        : 'v$ver · ${AppMetadata.releaseLabel}';
-                    return Text(
-                      line,
-                      style: TextStyle(
-                        color: cs.outline,
-                        fontSize: 13,
-                        fontWeight: FontWeight.w500,
-                      ),
+                    return Column(
+                      children: [
+                        Text(
+                          'Version $ver',
+                          style: TextStyle(
+                            color: cs.outline,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        Text(
+                          AppMetadata.releaseLabel,
+                          style: TextStyle(
+                            color: cs.outline.withValues(alpha: 0.85),
+                            fontSize: 12,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ],
                     );
                   },
                 ),

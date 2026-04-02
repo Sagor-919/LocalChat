@@ -32,6 +32,9 @@ dependencies:
   synchronized: ^3.4.0
   device_info_plus: ^11.5.0
   package_info_plus: ^8.1.2
+  archive: ^4.0.9
+  wakelock_plus: ^1.3.3
+  ffi: ^2.2.0
 
 dev_dependencies:
   flutter_test:

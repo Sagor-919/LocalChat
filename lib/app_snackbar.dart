@@ -6,10 +6,11 @@ const double kAppSnackBarApproxHeight = 56.0;
 /// Floating snackbar margin so it sits just under the status bar + app bar on all routes.
 EdgeInsets appSnackBarMargin(BuildContext context) {
   final mq = MediaQuery.of(context);
-  final h = mq.size.height;
+  // Use viewport above the keyboard so the bar stays visible on Android.
+  final viewH = mq.size.height - mq.viewInsets.bottom;
   final top = mq.padding.top + kToolbarHeight + 8;
   final bottomMargin =
-      (h - top - kAppSnackBarApproxHeight).clamp(8.0, double.infinity);
+      (viewH - top - kAppSnackBarApproxHeight).clamp(8.0, double.infinity);
   return EdgeInsets.fromLTRB(16, 0, 16, bottomMargin);
 }
 

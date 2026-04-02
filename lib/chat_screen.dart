@@ -27,6 +27,7 @@ import 'discovery_service.dart';
 import 'message_model.dart';
 import 'message_store.dart';
 import 'deferred_staged_file.dart';
+import 'desktop_drop_queue.dart';
 import 'transfer_manager.dart';
 
 class ChatScreen extends StatefulWidget {
@@ -257,6 +258,23 @@ class _ChatScreenState extends State<ChatScreen> {
       AndroidShareInbound.attachChat(_consumeAndroidShare);
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) unawaited(AndroidShareInbound.syncFromNative());
+      });
+    }
+    if (_supportsFileDrop) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        final dropped = DesktopDropQueue.takeAll();
+        if (dropped.isEmpty) return;
+        _stageFiles(
+          dropped
+              .map(
+                (path) => DeferredStagedFile(
+                  sourcePath: path,
+                  displayName: p.basename(path),
+                ),
+              )
+              .toList(),
+        );
       });
     }
   }
@@ -1247,6 +1265,13 @@ class _ChatScreenState extends State<ChatScreen> {
   bool get _isDesktop =>
       !kIsWeb && (Platform.isWindows || Platform.isLinux || Platform.isMacOS);
 
+  bool get _supportsFileDrop =>
+      !kIsWeb &&
+      (Platform.isWindows ||
+          Platform.isLinux ||
+          Platform.isMacOS ||
+          Platform.isAndroid);
+
   static TextStyle _messageBodyStyle(Color color) =>
       TextStyle(color: color, fontSize: 15, height: 1.35);
 
@@ -1365,73 +1390,79 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
         ],
       ),
-      body: SafeArea(
-        child: Column(
-          children: [
-            Expanded(
-              child: _loading
-                  ? const Center(child: CircularProgressIndicator())
-                  : _messages.isEmpty
-                  ? Center(
-                      child: Text(
-                        'No messages yet',
-                        style: TextStyle(color: cs.outline),
-                      ),
-                    )
-                  : ListView.builder(
-                      controller: _scroll,
-                      cacheExtent: 400,
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 14,
-                        vertical: 8,
-                      ),
-                      itemCount: _messages.length,
-                      itemBuilder: (ctx, i) {
-                        final widgets = <Widget>[];
-                        if (_needsDateSeparator(i)) {
-                          widgets.add(
-                            _buildDateSeparator(
-                              ctx,
-                              DateTime.fromMillisecondsSinceEpoch(
-                                _messages[i].timestamp,
+      body: _wrapChatDropTarget(
+        context,
+        SafeArea(
+          child: Column(
+            children: [
+              Expanded(
+                child: _loading
+                    ? const Center(child: CircularProgressIndicator())
+                    : _messages.isEmpty
+                    ? Center(
+                        child: Text(
+                          'No messages yet',
+                          style: TextStyle(color: cs.outline),
+                        ),
+                      )
+                    : ListView.builder(
+                        controller: _scroll,
+                        cacheExtent: 400,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 8,
+                        ),
+                        itemCount: _messages.length,
+                        itemBuilder: (ctx, i) {
+                          final widgets = <Widget>[];
+                          if (_needsDateSeparator(i)) {
+                            widgets.add(
+                              _buildDateSeparator(
+                                ctx,
+                                DateTime.fromMillisecondsSinceEpoch(
+                                  _messages[i].timestamp,
+                                ),
                               ),
+                            );
+                          }
+                          widgets.add(_buildBubble(ctx, _messages[i]));
+                          return RepaintBoundary(
+                            key: ValueKey<String>(_messages[i].id),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: widgets,
                             ),
                           );
-                        }
-                        widgets.add(_buildBubble(ctx, _messages[i]));
-                        return RepaintBoundary(
-                          key: ValueKey<String>(_messages[i].id),
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: widgets,
-                          ),
-                        );
-                      },
-                    ),
-            ),
-            _buildComposerStrip(context),
-          ],
+                        },
+                      ),
+              ),
+              _buildComposerStrip(context),
+            ],
+          ),
         ),
       ),
     );
   }
 
+  Widget _wrapChatDropTarget(BuildContext context, Widget child) {
+    if (!_supportsFileDrop) return child;
+    return DropTarget(
+      enable: ModalRoute.of(context)?.isCurrent ?? true,
+      onDragDone: _onDropDone,
+      child: child,
+    );
+  }
+
   // -----------------------------------------------------------------------
-  // Composer + staged strip (desktop: file drop only on this strip, not the message list)
+  // Composer + staged strip
   // -----------------------------------------------------------------------
   Widget _buildComposerStrip(BuildContext context) {
-    final bottom = Column(
+    return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
         if (_staged.isNotEmpty) _buildStagedPreview(context),
         _buildComposer(context),
       ],
-    );
-    if (!_isDesktop) return bottom;
-    return DropTarget(
-      enable: ModalRoute.of(context)?.isCurrent ?? true,
-      onDragDone: _onDropDone,
-      child: bottom,
     );
   }
 
@@ -1453,17 +1484,26 @@ class _ChatScreenState extends State<ChatScreen> {
         children: [
           Row(
             children: [
-              Text(
-                '${_staged.length} file${_staged.length > 1 ? 's' : ''} ready to send',
-                style: TextStyle(
-                  fontSize: 12,
-                  fontWeight: FontWeight.w600,
-                  color: cs.onSurfaceVariant,
+              Expanded(
+                child: Text(
+                  '${_staged.length} file${_staged.length > 1 ? 's' : ''} ready to send',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: cs.onSurfaceVariant,
+                  ),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
                 ),
               ),
-              const Spacer(),
-              GestureDetector(
-                onTap: () => setState(() {
+              const SizedBox(width: 8),
+              TextButton(
+                style: TextButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                  minimumSize: Size.zero,
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                onPressed: () => setState(() {
                   _staged.clear();
                   _stagedClipboardHashes.clear();
                 }),
@@ -1478,9 +1518,9 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
             ],
           ),
-          const SizedBox(height: 6),
+          const SizedBox(height: 10),
           SizedBox(
-            height: 72,
+            height: 76,
             child: ListView.builder(
               scrollDirection: Axis.horizontal,
               itemCount: _staged.length,
@@ -1520,11 +1560,11 @@ class _ChatScreenState extends State<ChatScreen> {
                         ),
                       ),
                       Positioned(
-                        top: -4,
-                        right: -4,
+                        bottom: 2,
+                        right: 2,
                         child: Material(
-                          elevation: 4,
-                          shadowColor: Colors.black54,
+                          elevation: 2,
+                          shadowColor: Colors.black38,
                           shape: const CircleBorder(),
                           color: cs.surface,
                           child: InkWell(
@@ -1537,10 +1577,10 @@ class _ChatScreenState extends State<ChatScreen> {
                               }
                             }),
                             child: Padding(
-                              padding: const EdgeInsets.all(4),
+                              padding: const EdgeInsets.all(3),
                               child: Icon(
                                 Icons.close_rounded,
-                                size: 18,
+                                size: 16,
                                 color: cs.onSurface,
                               ),
                             ),
@@ -2252,7 +2292,7 @@ class _ChatScreenState extends State<ChatScreen> {
         ...state.contextMenuButtonItems,
         if (_isDesktop || isAndroid)
           ContextMenuButtonItem(
-            label: isAndroid ? 'Paste image' : 'Paste image from clipboard',
+            label: 'Paste image',
             onPressed: () {
               state.hideToolbar();
               unawaited(_pasteClipboardImageToStaging());
@@ -2261,14 +2301,23 @@ class _ChatScreenState extends State<ChatScreen> {
       ],
     );
     if (isAndroid) {
-      return Material(
-        elevation: 4,
-        surfaceTintColor: cs.surfaceTint,
-        shadowColor: Colors.black.withValues(alpha: 0.28),
-        borderRadius: BorderRadius.circular(14),
-        color: cs.surfaceContainerHigh,
-        clipBehavior: Clip.antiAlias,
-        child: toolbar,
+      return DecoratedBox(
+        decoration: BoxDecoration(
+          color: cs.surface,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: cs.outlineVariant, width: 1),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.12),
+              blurRadius: 8,
+              offset: const Offset(0, 2),
+            ),
+          ],
+        ),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(8),
+          child: toolbar,
+        ),
       );
     }
     return toolbar;
@@ -2279,13 +2328,7 @@ class _ChatScreenState extends State<ChatScreen> {
   // -----------------------------------------------------------------------
   Widget _buildComposer(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    final hint = _staged.isNotEmpty
-        ? 'Add a message (optional)...'
-        : (_isDesktop
-              ? 'Message — Enter send · Shift+Enter new line · Ctrl+Shift+V paste image'
-              : (!kIsWeb && Platform.isAndroid
-                    ? 'Message — long-press field for paste text / paste image'
-                    : 'Message'));
+    final hint = _staged.isNotEmpty ? 'Optional caption…' : 'Message';
 
     // Rebuild only the composer row on typing — not the whole chat (avoids jank).
     return Padding(
@@ -2335,9 +2378,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   onPressed: _nativePickerOpen
                       ? null
                       : () => unawaited(_pasteClipboardImageToStaging()),
-                  tooltip: _isDesktop
-                      ? 'Paste image from clipboard (Ctrl+Shift+V or Cmd+Shift+V)'
-                      : 'Paste image from clipboard',
+                  tooltip: _isDesktop ? 'Paste image (Ctrl+Shift+V)' : 'Paste image',
                   style: IconButton.styleFrom(
                     backgroundColor: cs.secondaryContainer,
                     foregroundColor: cs.onSecondaryContainer,

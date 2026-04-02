@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:desktop_drop/desktop_drop.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
@@ -10,6 +11,7 @@ import 'android_share_inbound.dart';
 import 'app_branding.dart';
 import 'chat_screen.dart';
 import 'connection_service.dart';
+import 'desktop_drop_queue.dart';
 import 'device.dart';
 import 'discovery_service.dart';
 import 'message_model.dart';
@@ -59,6 +61,19 @@ class _HomeScreenState extends State<HomeScreen> {
       _connectivityResults != null &&
       _connectivityResults!.length == 1 &&
       _connectivityResults!.first == ConnectivityResult.none;
+
+  bool get _supportsHomeFileDrop =>
+      !kIsWeb &&
+      (Platform.isWindows ||
+          Platform.isLinux ||
+          Platform.isMacOS ||
+          Platform.isAndroid);
+
+  void _onHomeFilesDropped(DropDoneDetails details) {
+    if (details.files.isEmpty) return;
+    DesktopDropQueue.enqueue(details.files.map((x) => x.path));
+    if (mounted) setState(() {});
+  }
 
   void _onMessageHistoryRevision() {
     final sig = widget.store.consumePendingHistoryClear();
@@ -369,9 +384,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final cs = Theme.of(context).colorScheme;
     final isDark = Theme.of(context).brightness == Brightness.dark;
 
-    final home = Scaffold(
-      backgroundColor: isDark ? cs.surface : const Color(0xFFF5F5FA),
-      body: SafeArea(
+    Widget body = SafeArea(
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -420,6 +433,54 @@ class _HomeScreenState extends State<HomeScreen> {
                   );
                 },
               ),
+            if (_supportsHomeFileDrop)
+              ValueListenableBuilder<int>(
+                valueListenable: DesktopDropQueue.revision,
+                builder: (context, rev, child) {
+                  final n = DesktopDropQueue.count;
+                  if (n <= 0) return const SizedBox.shrink();
+                  final cs2 = Theme.of(context).colorScheme;
+                  return Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                    child: Material(
+                      color: cs2.secondaryContainer,
+                      borderRadius: BorderRadius.circular(12),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 12, vertical: 10),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Icon(Icons.upload_file_rounded,
+                                size: 22, color: cs2.onSecondaryContainer),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                n == 1
+                                    ? '1 file to send — open a chat'
+                                    : '$n files to send — open a chat',
+                                style: TextStyle(
+                                  color: cs2.onSecondaryContainer,
+                                  fontSize: 13,
+                                  height: 1.35,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                            TextButton(
+                              onPressed: () {
+                                DesktopDropQueue.clear();
+                                if (mounted) setState(() {});
+                              },
+                              child: const Text('Dismiss'),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  );
+                },
+              ),
             Padding(
               padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
               child: _buildProfileCard(context),
@@ -446,7 +507,18 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ],
         ),
-      ),
+    );
+
+    if (_supportsHomeFileDrop) {
+      body = DropTarget(
+        onDragDone: _onHomeFilesDropped,
+        child: body,
+      );
+    }
+
+    final home = Scaffold(
+      backgroundColor: isDark ? cs.surface : const Color(0xFFF5F5FA),
+      body: body,
     );
 
     final useAndroidBackToBg =

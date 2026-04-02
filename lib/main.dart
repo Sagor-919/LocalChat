@@ -7,15 +7,16 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:tray_manager/tray_manager.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'app_branding.dart';
-import 'app_metadata.dart';
 import 'app_settings.dart';
 import 'android_share_inbound.dart';
 import 'chat_crypto.dart';
 import 'chat_screen.dart';
 import 'connection_service.dart';
+import 'desktop_drop_queue.dart';
 import 'device.dart';
 import 'first_launch_prompt.dart';
 import 'discovery_service.dart';
@@ -24,6 +25,7 @@ import 'message_model.dart';
 import 'message_store.dart';
 import 'settings_screen.dart';
 import 'transfer_manager.dart';
+import 'windows_taskbar_flash.dart';
 
 final GlobalKey<NavigatorState> appNavigatorKey = GlobalKey<NavigatorState>();
 
@@ -205,6 +207,7 @@ Future<void> _handleIncomingTextMessage(String peerId, ChatMessage msg) async {
       payload: _notificationPayloadForPeer(peerId),
     );
     unawaited(_pulseWindowsTaskbarForAttention());
+    flashWindowsTaskbarIcon();
   }
 }
 
@@ -390,6 +393,18 @@ Future<void> main(List<String> args) async {
     _windowsAutostartLaunch = args.contains('--autostart');
   }
 
+  if (!kIsWeb &&
+      (Platform.isWindows || Platform.isLinux || Platform.isMacOS)) {
+    for (var i = 0; i < args.length; i++) {
+      if (args[i] == '--share-file' && i + 1 < args.length) {
+        final p = args[++i];
+        if (p.isNotEmpty && File(p).existsSync()) {
+          DesktopDropQueue.enqueue([p]);
+        }
+      }
+    }
+  }
+
   await AppSettings.instance.init();
   if (Platform.isWindows && _windowsAutostartLaunch) {
     _deferOnboardingUntilWindowShown =
@@ -405,7 +420,7 @@ Future<void> main(List<String> args) async {
     await windowManager.setSize(const Size(windowWidth, windowHeight));
     await windowManager.setMinimumSize(const Size(360, 500));
     await windowManager.center();
-    await windowManager.setTitle('Local Chat · ${AppMetadata.releaseLabel}');
+    await windowManager.setTitle('Local Chat');
     await windowManager.setPreventClose(true);
     if (Platform.isWindows && _windowsAutostartLaunch) {
       await windowManager.hide();
@@ -542,6 +557,7 @@ Future<void> main(List<String> args) async {
         payload: _notificationPayloadForPeer(event.peerId),
       );
       unawaited(_pulseWindowsTaskbarForAttention());
+      flashWindowsTaskbarIcon();
     }
   });
 
@@ -733,6 +749,15 @@ class _LocalChatAppState extends State<LocalChatApp>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     _appInForeground = state == AppLifecycleState.resumed ||
         state == AppLifecycleState.inactive;
+    if (Platform.isAndroid) {
+      if (state == AppLifecycleState.paused) {
+        if (_connections.hasActiveTcpPeers) {
+          unawaited(WakelockPlus.enable());
+        }
+      } else if (state == AppLifecycleState.resumed) {
+        unawaited(WakelockPlus.disable());
+      }
+    }
     if (state == AppLifecycleState.resumed) {
       unawaited(_discovery.recoverAfterNetworkOrResume());
       if (Platform.isAndroid) {
@@ -748,7 +773,7 @@ class _LocalChatAppState extends State<LocalChatApp>
       builder: (_, mode, child) {
         return MaterialApp(
           navigatorKey: appNavigatorKey,
-          title: 'Local Chat · ${AppMetadata.releaseLabel}',
+          title: 'Local Chat',
           debugShowCheckedModeBanner: false,
           themeMode: mode,
           theme: ThemeData(

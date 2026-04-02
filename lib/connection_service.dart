@@ -253,6 +253,9 @@ class ConnectionService {
   Socket? getSocket(String peerId) => _sockets[peerId];
   bool isConnected(String peerId) => _sockets.containsKey(peerId);
 
+  /// At least one active chat TCP session (used for Android background wake hint).
+  bool get hasActiveTcpPeers => _sockets.isNotEmpty;
+
   Future<void> disconnect(String peerId) async {
     _clearPingState(peerId);
     final s = _sockets.remove(peerId);

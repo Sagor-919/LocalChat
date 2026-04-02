@@ -1,7 +1,7 @@
 ﻿import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 
+import 'package:archive/archive_io.dart';
 import 'package:path/path.dart' as p;
 
 class AttachmentPrepareException implements Exception {
@@ -60,8 +60,8 @@ Future<void> copyFileChunked(
   if (isCancelled()) throw const AttachmentPrepareCancelled();
 }
 
-/// Runs `tar -a -cf` like the previous in-picker flow; kills the process when
-/// [isCancelled] becomes true.
+/// Zips a folder with pure Dart ([archive]) so folder send works on Android
+/// and Windows without a `tar` binary.
 Future<void> createFolderZip({
   required String directoryPath,
   required String folderName,
@@ -71,7 +71,7 @@ Future<void> createFolderZip({
 }) async {
   final dir = Directory(directoryPath);
   if (!await dir.exists()) {
-    throw AttachmentPrepareException('Folder not found: $directoryPath');
+    throw AttachmentPrepareException('Folder not found: $folderName');
   }
   final zipFile = File(zipOutPath);
   if (await zipFile.exists()) {
@@ -79,37 +79,30 @@ Future<void> createFolderZip({
       await zipFile.delete();
     } catch (_) {}
   }
-  final parentDir = dir.parent.path;
-  final proc = await Process.start(
-    'tar',
-    ['-a', '-cf', zipOutPath, '-C', parentDir, folderName],
-    mode: ProcessStartMode.normal,
-  );
-  onProcessStarted?.call(proc);
-
-  StreamSubscription<void>? tick;
-  tick = Stream.periodic(const Duration(milliseconds: 120)).listen((_) {
-    if (isCancelled()) {
-      try {
-        proc.kill(ProcessSignal.sigkill);
-      } catch (_) {}
-    }
-  });
-
   try {
-    final code = await proc.exitCode;
+    await ZipFileEncoder().zipDirectory(
+      dir,
+      filename: zipOutPath,
+      filter: (entity, _) {
+        if (isCancelled()) return ZipFileOperation.cancel;
+        if (entity is File || entity is Directory) {
+          return ZipFileOperation.include;
+        }
+        return ZipFileOperation.skip;
+      },
+    );
     if (isCancelled()) throw const AttachmentPrepareCancelled();
-    if (code != 0) {
-      final err = await proc.stderr.transform(utf8.decoder).join();
-      throw AttachmentPrepareException(
-        err.trim().isEmpty ? 'Archive failed (exit $code)' : err.trim(),
-      );
-    }
     if (!await zipFile.exists()) {
       throw AttachmentPrepareException('Archive was not created');
     }
-  } finally {
-    await tick.cancel();
+  } on AttachmentPrepareCancelled {
+    rethrow;
+  } catch (e) {
+    try {
+      if (await zipFile.exists()) await zipFile.delete();
+    } catch (_) {}
+    if (e is AttachmentPrepareException) rethrow;
+    throw AttachmentPrepareException(e.toString());
   }
 }
 

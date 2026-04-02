@@ -2,8 +2,8 @@
 class AppMetadata {
   AppMetadata._();
 
-  /// Shown in Settings and docs (e.g. "Alpha 1.7.0").
-  static const String releaseLabel = 'Alpha 1.7.0';
+  /// Short release channel label (version number comes from package_info).
+  static const String releaseLabel = 'Alpha';
 
   static const String publisher = 'RecklessGalaxy.com';
   static const String developer = 'Sagor Hossen';

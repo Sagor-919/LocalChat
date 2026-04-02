@@ -19,6 +19,7 @@ This app discovers nearby devices on **Wi‑Fi / Ethernet**, opens **TCP chat** 
 |----------|----------|
 | [**docs/FEATURES.md**](docs/FEATURES.md) | Feature-by-feature reference (what exists and where in code). |
 | [**docs/RELEASE_ALPHA.md**](docs/RELEASE_ALPHA.md) | Signing, builds, release checklist. |
+| [**docs/windows_share_from_explorer.md**](docs/windows_share_from_explorer.md) | Optional Explorer context menu → `--share-file` (Windows). |
 | [**CHANGELOG.md**](CHANGELOG.md) | Alpha 1.7.0 notes. |
 | [**docs/phases_archive.md**](docs/phases_archive.md) | Original phased implementation plan (historical). |
 
