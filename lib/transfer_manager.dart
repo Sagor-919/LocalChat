@@ -37,6 +37,8 @@ class TransferState {
   final List<String> tempPathsForCleanup = [];
   OutgoingTransferPhase outgoingPhase;
   final Stopwatch stopwatch = Stopwatch()..start();
+  /// Shown in chat while [outgoingPhase] is [OutgoingTransferPhase.preparing].
+  String preparingStatus = '';
 
   TransferState({
     required this.fileId,
@@ -234,6 +236,7 @@ class TransferManager {
         t.totalBytes = 0;
         t.transferredBytes = 0;
         t.progress = 0;
+        t.preparingStatus = 'Zipping folder in background…';
         _notify();
 
         final normalized = sourcePath.replaceAll(RegExp(r'[/\\]+$'), '');
@@ -265,6 +268,7 @@ class TransferManager {
           t.totalBytes = 0;
           t.transferredBytes = 0;
           t.progress = 0;
+          t.preparingStatus = 'Reading shared file…';
           _notify();
           final mat = uniqueTempPath(
             Directory.systemTemp.path,
@@ -291,6 +295,9 @@ class TransferManager {
           t.totalBytes = len;
           t.transferredBytes = 0;
           t.progress = 0;
+          t.preparingStatus = 'Copying for send…';
+          t.stopwatch.reset();
+          t.stopwatch.start();
           _notify();
 
           final dest = uniqueTempPath(
@@ -327,6 +334,8 @@ class TransferManager {
       // reference a permanent copy so thumbnails and open keep working.
       var outboundPath = sendPath;
       if (t.tempPathsForCleanup.contains(sendPath)) {
+        t.preparingStatus = 'Saving to device…';
+        _notify();
         outboundPath = await _persistOutboundFileToDocuments(
           sendPath,
           initialMessage.id,
@@ -352,6 +361,7 @@ class TransferManager {
       t.transferredBytes = 0;
       t.progress = 0;
       t.outgoingPhase = OutgoingTransferPhase.transferring;
+      t.preparingStatus = '';
       t.stopwatch.reset();
       t.stopwatch.start();
       _notify();
@@ -376,6 +386,7 @@ class TransferManager {
     } catch (e) {
       final t2 = transfers[initialMessage.id];
       if (t2 == null) return;
+      t2.preparingStatus = '';
       if (e is AttachmentPrepareCancelled || t2.cancelRequested) {
         t2.error = 'Cancelled';
         t2.cancelled = true;

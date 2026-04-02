@@ -240,7 +240,11 @@ class _ChatScreenState extends State<ChatScreen> {
 
     _transferSub = _tm.transferUpdates.listen((_) {
       if (_transferThrottle?.isActive ?? false) return;
-      _transferThrottle = Timer(const Duration(milliseconds: 200), () {
+      // Slightly slower coalesce on Android — full chat rebuilds are expensive on mid-range GPUs.
+      final delay = (!kIsWeb && Platform.isAndroid)
+          ? const Duration(milliseconds: 380)
+          : const Duration(milliseconds: 220);
+      _transferThrottle = Timer(delay, () {
         if (mounted) setState(() {});
       });
     });
@@ -1482,12 +1486,14 @@ class _ChatScreenState extends State<ChatScreen> {
   Widget _buildStagedPreview(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
 
+    final stripHeight = _isDesktop ? 100.0 : 76.0;
+
     return Container(
       decoration: BoxDecoration(
         color: cs.surfaceContainerHigh,
         border: Border(top: BorderSide(color: cs.outlineVariant, width: 0.5)),
       ),
-      padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+      padding: EdgeInsets.fromLTRB(12, 8, 12, _isDesktop ? 14 : 8),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
@@ -1530,7 +1536,7 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
           const SizedBox(height: 10),
           SizedBox(
-            height: 76,
+            height: stripHeight,
             child: ScrollConfiguration(
               behavior: _isDesktop
                   ? const _StagedStripScrollBehavior()
@@ -1870,39 +1876,65 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
             ] else if (t.isSending &&
                 t.outgoingPhase == OutgoingTransferPhase.preparing) ...[
+              Text(
+                m.attachmentName ?? t.fileName,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                  color: subtleColor,
+                ),
+              ),
+              const SizedBox(height: 8),
               LinearProgressIndicator(
                 value: t.totalBytes > 0
                     ? t.progress.clamp(0, 1).toDouble()
                     : null,
-                minHeight: 5,
+                minHeight: 6,
                 borderRadius: BorderRadius.circular(99),
                 backgroundColor: mine ? Colors.white24 : cs.outlineVariant,
                 color: mine ? Colors.white : _iMessageBlue,
               ),
-              const SizedBox(height: 6),
-              Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      t.totalBytes > 0
-                          ? 'Preparing\u2026 ${(t.progress * 100).toStringAsFixed(0)}%'
-                                ' \u2022 ${_fmtBytes(t.transferredBytes)}/${_fmtBytes(t.totalBytes)}'
-                          : 'Preparing\u2026',
-                      style: TextStyle(
-                        fontSize: 11,
-                        fontWeight: FontWeight.w600,
-                        color: subtleColor,
-                      ),
-                    ),
+              const SizedBox(height: 8),
+              Text(
+                t.totalBytes > 0
+                    ? '${(t.progress * 100).toStringAsFixed(0)}%'
+                          ' \u2022 ${_fmtBytes(t.transferredBytes)} / ${_fmtBytes(t.totalBytes)}'
+                          ' \u2022 ${_fmtSpeed(t.currentSpeed)}'
+                    : (t.preparingStatus.isNotEmpty
+                          ? t.preparingStatus
+                          : 'Preparing\u2026'),
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: subtleColor,
+                  height: 1.25,
+                ),
+              ),
+              if (t.totalBytes > 0 && t.preparingStatus.isNotEmpty) ...[
+                const SizedBox(height: 4),
+                Text(
+                  t.preparingStatus,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.w500,
+                    color: subtleColor.withValues(alpha: 0.85),
+                    height: 1.2,
                   ),
-                  const SizedBox(width: 8),
-                  _actionButton(
-                    label: 'Cancel',
-                    icon: Icons.stop_circle_outlined,
-                    color: _failedRed,
-                    onTap: () => _cancelTransfer(m.id),
-                  ),
-                ],
+                ),
+              ],
+              const SizedBox(height: 8),
+              Align(
+                alignment: AlignmentDirectional.centerEnd,
+                child: _actionButton(
+                  label: 'Cancel',
+                  icon: Icons.stop_circle_outlined,
+                  color: _failedRed,
+                  onTap: () => _cancelTransfer(m.id),
+                ),
               ),
             ] else ...[
               LinearProgressIndicator(
