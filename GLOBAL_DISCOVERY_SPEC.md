@@ -24,11 +24,14 @@ integrate with those systems instead of replacing or bypassing them.
    - UI refresh must continue to flow through `messageHistoryRevision`.
 
 2. V4's application message envelope stays authoritative.
-   - Global transport sends the same JSON message types as LAN TCP:
-     `message`, `message_ack`, `message_ack_confirm`, `file_notify`,
-     `file_control`, `ping`, and `pong`.
-   - Global Discovery may add transport metadata internally, but stored chat
-     rows and UI code must not need a second message model.
+- Global transport sends the same JSON message types as LAN TCP:
+  `message`, `message_ack`, `message_ack_confirm`, `file_notify`,
+  `file_control`, `ping`, and `pong`.
+- Global Discovery may add transport metadata internally, but stored chat
+  rows and UI code must not need a second message model.
+- V4 `ChatCrypto` is LAN-TCP-only because it derives keys from LAN peer IDs.
+  Global text rides inside the Noise-encrypted WebRTC channel as the normal
+  `message` JSON envelope.
 
 3. LAN remains first choice.
    - `DiscoveryService` and `ConnectionService` keep the current LAN behavior.

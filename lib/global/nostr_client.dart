@@ -30,25 +30,27 @@ class NostrClient {
 
   Future<void> connect(List<String> relayUrls) async {
     await close();
-    for (final relayUrl in relayUrls) {
-      final uri = Uri.tryParse(relayUrl);
-      if (uri == null || (uri.scheme != 'wss' && uri.scheme != 'ws')) {
-        continue;
-      }
-      try {
-        final channel = WebSocketChannel.connect(uri);
-        await channel.ready.timeout(_connectTimeout);
-        late final StreamSubscription<dynamic> streamSub;
-        streamSub = channel.stream.listen(
-          _handleRelayMessage,
-          onError: (_) {},
-          onDone: () => _relays.removeWhere((relay) => relay.uri == uri),
-          cancelOnError: false,
-        );
-        _relays.add(_RelayConnection(uri, channel, streamSub));
-      } catch (_) {
-        // Public relays are best-effort. Later phases surface aggregate errors.
-      }
+    await Future.wait<void>(relayUrls.map(_connectRelay));
+  }
+
+  Future<void> _connectRelay(String relayUrl) async {
+    final uri = Uri.tryParse(relayUrl);
+    if (uri == null || (uri.scheme != 'wss' && uri.scheme != 'ws')) {
+      return;
+    }
+    try {
+      final channel = WebSocketChannel.connect(uri);
+      await channel.ready.timeout(_connectTimeout);
+      late final StreamSubscription<dynamic> streamSub;
+      streamSub = channel.stream.listen(
+        _handleRelayMessage,
+        onError: (_) {},
+        onDone: () => _relays.removeWhere((relay) => relay.uri == uri),
+        cancelOnError: false,
+      );
+      _relays.add(_RelayConnection(uri, channel, streamSub));
+    } catch (_) {
+      // Public relays are best-effort. Later phases surface aggregate errors.
     }
   }
 

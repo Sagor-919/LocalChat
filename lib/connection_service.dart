@@ -6,6 +6,10 @@ import 'package:uuid/uuid.dart';
 
 import 'device.dart';
 
+typedef GlobalJsonSender =
+    bool Function(String peerId, Map<String, dynamic> json);
+typedef GlobalJsonConnector = Future<bool> Function(String peerId);
+
 /// Chat TCP stream — behavior matches [MsgStream] in `netstreamer.cpp`:
 /// - The socket closing or failing is the single source of truth for “connection
 ///   lost” (no separate “internet” probe; LAN reachability is implicit in TCP).
@@ -33,6 +37,9 @@ class ConnectionService {
   void Function(String peerId, Map<String, dynamic> json)? onMessage;
   void Function(String peerId)? onDisconnected;
   void Function(Socket socket, String peerId)? onIncomingConnection;
+  bool Function(String peerId)? hasGlobalJsonTransport;
+  GlobalJsonSender? sendGlobalJson;
+  GlobalJsonConnector? connectGlobalJson;
 
   /// Additional observers (e.g. [HomeScreen]) without replacing [onDisconnected].
   final StreamController<String> _disconnectEvents =
@@ -55,11 +62,9 @@ class ConnectionService {
     }
     final addr = InternetAddress.tryParse(trimmed);
     if (addr != null) {
-      return Socket.connect(addr, port,
-          timeout: const Duration(seconds: 8));
+      return Socket.connect(addr, port, timeout: const Duration(seconds: 8));
     }
-    return Socket.connect(trimmed, port,
-        timeout: const Duration(seconds: 8));
+    return Socket.connect(trimmed, port, timeout: const Duration(seconds: 8));
   }
 
   Future<void> startServer() async {
@@ -83,8 +88,10 @@ class ConnectionService {
 
   void _startHeartbeat() {
     _heartbeatTimer?.cancel();
-    _heartbeatTimer =
-        Timer.periodic(heartbeatInterval, (_) => _heartbeatTick());
+    _heartbeatTimer = Timer.periodic(
+      heartbeatInterval,
+      (_) => _heartbeatTick(),
+    );
   }
 
   void _heartbeatTick() {
@@ -124,6 +131,11 @@ class ConnectionService {
   }
 
   Future<Socket?> connectTo(PeerDevice peer, {bool forceNew = false}) async {
+    if (peer.ip.trim().isEmpty) {
+      unawaited(connectGlobalJson?.call(peer.userId));
+      return null;
+    }
+
     if (forceNew && _sockets.containsKey(peer.userId)) {
       await disconnect(peer.userId);
     }
@@ -136,10 +148,14 @@ class ConnectionService {
 
       _attachSocket(socket, peer.userId);
 
-      sendJson(peer.userId,
-          {'type': 'hello', 'id': me.userId, 'name': me.displayName});
+      sendJson(peer.userId, {
+        'type': 'hello',
+        'id': me.userId,
+        'name': me.displayName,
+      });
       return socket;
     } catch (_) {
+      unawaited(connectGlobalJson?.call(peer.userId));
       return null;
     }
   }
@@ -234,7 +250,7 @@ class ConnectionService {
 
   bool sendJson(String peerId, Map<String, dynamic> json) {
     final socket = _sockets[peerId];
-    if (socket == null) return false;
+    if (socket == null) return _sendGlobal(peerId, json);
     try {
       socket.write('${jsonEncode(json)}\n');
       return true;
@@ -246,12 +262,20 @@ class ConnectionService {
         socket.destroy();
       } catch (_) {}
       _notifyDisconnected(peerId);
-      return false;
+      return _sendGlobal(peerId, json);
     }
   }
 
+  bool _sendGlobal(String peerId, Map<String, dynamic> json) {
+    if (hasGlobalJsonTransport?.call(peerId) != true) return false;
+    return sendGlobalJson?.call(peerId, json) == true;
+  }
+
   Socket? getSocket(String peerId) => _sockets[peerId];
-  bool isConnected(String peerId) => _sockets.containsKey(peerId);
+  bool isLanConnected(String peerId) => _sockets.containsKey(peerId);
+  bool isConnected(String peerId) =>
+      isLanConnected(peerId) || hasGlobalJsonTransport?.call(peerId) == true;
+  bool isFileTransferAvailable(String peerId) => isLanConnected(peerId);
 
   /// At least one active chat TCP session (used for Android background wake hint).
   bool get hasActiveTcpPeers => _sockets.isNotEmpty;

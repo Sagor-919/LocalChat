@@ -14,6 +14,7 @@ import 'connection_service.dart';
 import 'desktop_drop_queue.dart';
 import 'device.dart';
 import 'discovery_service.dart';
+import 'global/global_discovery_v2.dart';
 import 'message_model.dart';
 import 'message_store.dart';
 import 'settings_screen.dart';
@@ -24,6 +25,8 @@ class HomeScreen extends StatefulWidget {
   final DiscoveryService discovery;
   final ConnectionService connections;
   final MessageStore store;
+  final GlobalDiscoveryV2? globalDiscovery;
+  final Future<void> Function(bool enabled)? onGlobalDiscoveryEnabledChanged;
 
   const HomeScreen({
     super.key,
@@ -31,6 +34,8 @@ class HomeScreen extends StatefulWidget {
     required this.discovery,
     required this.connections,
     required this.store,
+    this.globalDiscovery,
+    this.onGlobalDiscoveryEnabledChanged,
   });
 
   @override
@@ -45,6 +50,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   List<_PeerEntry> _peerList = [];
   StreamSubscription<FileMessageEvent>? _fileMsgSub;
+
   /// Serializes overlapping [_refreshPeerList] runs so a slower, older refresh
   /// cannot overwrite the UI after a newer discovery snapshot.
   int _peerRefreshGeneration = 0;
@@ -54,6 +60,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
   StreamSubscription<String>? _tcpDisconnectSub;
+
   /// Null until the first [Connectivity.checkConnectivity] completes.
   List<ConnectivityResult>? _connectivityResults;
 
@@ -110,8 +117,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
     widget.discovery.onPeersChanged = _onDiscoveryPeersChanged;
 
-    _tcpDisconnectSub =
-        widget.connections.disconnectedPeerEvents.listen((_) {
+    _tcpDisconnectSub = widget.connections.disconnectedPeerEvents.listen((_) {
       if (!mounted) return;
       unawaited(_refreshPeerList());
     });
@@ -128,12 +134,14 @@ class _HomeScreenState extends State<HomeScreen> {
             _unread[peerId] = (_unread[peerId] ?? 0) + 1;
             if (type == 'message') {
               if (json['enc'] == true) {
-                _lastMsgTime[peerId] = (json['time'] as num?)?.toInt() ??
+                _lastMsgTime[peerId] =
+                    (json['time'] as num?)?.toInt() ??
                     DateTime.now().millisecondsSinceEpoch;
                 unawaited(_syncPreviewFromStore(peerId));
               } else {
                 _lastMsg[peerId] = json['text'] as String? ?? '';
-                _lastMsgTime[peerId] = (json['time'] as num?)?.toInt() ??
+                _lastMsgTime[peerId] =
+                    (json['time'] as num?)?.toInt() ??
                     DateTime.now().millisecondsSinceEpoch;
               }
             } else {
@@ -175,8 +183,10 @@ class _HomeScreenState extends State<HomeScreen> {
     for (final p in widget.discovery.peers) {
       final tag = p.lanStableTag?.trim() ?? '';
       if (tag.isNotEmpty) {
-        final conflicts =
-            await widget.store.peerIdsMatchingLanTag(tag, p.userId);
+        final conflicts = await widget.store.peerIdsMatchingLanTag(
+          tag,
+          p.userId,
+        );
         for (final oldId in conflicts) {
           await widget.store.mergePeerLanIdentity(
             fromPeerId: oldId,
@@ -212,8 +222,8 @@ class _HomeScreenState extends State<HomeScreen> {
     final storedInfos = await widget.store.loadAllPeerInfos();
     if (!mounted || gen != _peerRefreshGeneration) return;
 
-    final conversationPeerIds =
-        await widget.store.listPeerIdsWithConversation();
+    final conversationPeerIds = await widget.store
+        .listPeerIdsWithConversation();
     if (!mounted || gen != _peerRefreshGeneration) return;
 
     final offlineIds = conversationPeerIds
@@ -224,39 +234,45 @@ class _HomeScreenState extends State<HomeScreen> {
 
     if (!networkDown) {
       for (final p in discoveryPeers) {
-        list.add(_PeerEntry(
-          userId: p.userId,
-          name: p.name,
-          ip: p.ip,
-          port: p.port,
-          online: true,
-          peer: p,
-        ));
+        list.add(
+          _PeerEntry(
+            userId: p.userId,
+            name: p.name,
+            ip: p.ip,
+            port: p.port,
+            online: true,
+            peer: p,
+          ),
+        );
       }
     }
 
     for (final id in offlineIds) {
       final info = storedInfos[id];
-      list.add(_PeerEntry(
-        userId: id,
-        name: info?['name'] as String? ?? 'Unknown',
-        ip: info?['ip'] as String? ?? '',
-        port: (info?['port'] as num?)?.toInt() ?? 4041,
-        online: false,
-      ));
+      list.add(
+        _PeerEntry(
+          userId: id,
+          name: info?['name'] as String? ?? 'Unknown',
+          ip: info?['ip'] as String? ?? '',
+          port: (info?['port'] as num?)?.toInt() ?? 4041,
+          online: false,
+        ),
+      );
     }
 
     if (networkDown) {
       for (final p in discoveryPeers) {
         if (conversationPeerIds.contains(p.userId)) continue;
-        list.add(_PeerEntry(
-          userId: p.userId,
-          name: p.name,
-          ip: p.ip,
-          port: p.port,
-          online: false,
-          peer: p,
-        ));
+        list.add(
+          _PeerEntry(
+            userId: p.userId,
+            name: p.name,
+            ip: p.ip,
+            port: p.port,
+            online: false,
+            peer: p,
+          ),
+        );
       }
     }
 
@@ -286,7 +302,9 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _hydratePreviewsFromStore(
-      List<_PeerEntry> entries, int gen) async {
+    List<_PeerEntry> entries,
+    int gen,
+  ) async {
     for (final e in entries) {
       final list = await widget.store.load(e.userId);
       if (!mounted || gen != _peerRefreshGeneration) return;
@@ -305,7 +323,9 @@ class _HomeScreenState extends State<HomeScreen> {
     _connectivitySub?.cancel();
     _tcpDisconnectSub?.cancel();
     _discoveryDebounce?.cancel();
-    widget.store.messageHistoryRevision.removeListener(_onMessageHistoryRevision);
+    widget.store.messageHistoryRevision.removeListener(
+      _onMessageHistoryRevision,
+    );
     _fileMsgSub?.cancel();
     widget.discovery.onPeersChanged = null;
     widget.connections.onMessage = _prevOnMessage;
@@ -318,56 +338,63 @@ class _HomeScreenState extends State<HomeScreen> {
     showDialog(
       context: context,
       builder: (ctx) {
-        return StatefulBuilder(builder: (ctx, setDialogState) {
-          final preview = controller.text.trim();
-          final initial =
-              preview.isNotEmpty ? preview[0].toUpperCase() : '?';
+        return StatefulBuilder(
+          builder: (ctx, setDialogState) {
+            final preview = controller.text.trim();
+            final initial = preview.isNotEmpty ? preview[0].toUpperCase() : '?';
 
-          return AlertDialog(
-            shape:
-                RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-            title: const Text('Edit Profile'),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                _RingAvatar(letter: initial, radius: 40, fontSize: 32, online: true),
-                const SizedBox(height: 20),
-                TextField(
-                  controller: controller,
-                  autofocus: true,
-                  textCapitalization: TextCapitalization.words,
-                  onChanged: (_) => setDialogState(() {}),
-                  decoration: InputDecoration(
-                    labelText: 'Display Name',
-                    prefixIcon: const Icon(Icons.person),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
+            return AlertDialog(
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(20),
+              ),
+              title: const Text('Edit Profile'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _RingAvatar(
+                    letter: initial,
+                    radius: 40,
+                    fontSize: 32,
+                    online: true,
+                  ),
+                  const SizedBox(height: 20),
+                  TextField(
+                    controller: controller,
+                    autofocus: true,
+                    textCapitalization: TextCapitalization.words,
+                    onChanged: (_) => setDialogState(() {}),
+                    decoration: InputDecoration(
+                      labelText: 'Display Name',
+                      prefixIcon: const Icon(Icons.person),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
                     ),
                   ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton.icon(
+                  onPressed: () async {
+                    final name = controller.text.trim();
+                    if (name.isNotEmpty && name != widget.me.displayName) {
+                      await DeviceInfo.setName(name);
+                      widget.me.displayName = name;
+                      setState(() {});
+                    }
+                    if (ctx.mounted) Navigator.pop(ctx);
+                  },
+                  icon: const Icon(Icons.check, size: 18),
+                  label: const Text('Save'),
                 ),
               ],
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(ctx),
-                child: const Text('Cancel'),
-              ),
-              FilledButton.icon(
-                onPressed: () async {
-                  final name = controller.text.trim();
-                  if (name.isNotEmpty && name != widget.me.displayName) {
-                    await DeviceInfo.setName(name);
-                    widget.me.displayName = name;
-                    setState(() {});
-                  }
-                  if (ctx.mounted) Navigator.pop(ctx);
-                },
-                icon: const Icon(Icons.check, size: 18),
-                label: const Text('Save'),
-              ),
-            ],
-          );
-        });
+            );
+          },
+        );
       },
     );
   }
@@ -389,128 +416,136 @@ class _HomeScreenState extends State<HomeScreen> {
     final isDark = Theme.of(context).brightness == Brightness.dark;
 
     Widget body = SafeArea(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            if (!kIsWeb && Platform.isAndroid)
-              ValueListenableBuilder<int>(
-                valueListenable: AndroidShareInbound.pendingRevision,
-                builder: (context, rev, child) {
-                  final n = AndroidShareInbound.queuedCount;
-                  if (n <= 0) return const SizedBox.shrink();
-                  final cs = Theme.of(context).colorScheme;
-                  return Padding(
-                    padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-                    child: Material(
-                      color: cs.primaryContainer,
-                      borderRadius: BorderRadius.circular(12),
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 12, vertical: 10),
-                        child: Row(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Icon(Icons.share_rounded,
-                                size: 22, color: cs.onPrimaryContainer),
-                            const SizedBox(width: 10),
-                            Expanded(
-                              child: Text(
-                                n == 1
-                                    ? '1 file shared — open a chat to attach it'
-                                    : '$n files shared — open a chat to attach them',
-                                style: TextStyle(
-                                  color: cs.onPrimaryContainer,
-                                  fontSize: 13,
-                                  height: 1.35,
-                                  fontWeight: FontWeight.w600,
-                                ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (!kIsWeb && Platform.isAndroid)
+            ValueListenableBuilder<int>(
+              valueListenable: AndroidShareInbound.pendingRevision,
+              builder: (context, rev, child) {
+                final n = AndroidShareInbound.queuedCount;
+                if (n <= 0) return const SizedBox.shrink();
+                final cs = Theme.of(context).colorScheme;
+                return Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                  child: Material(
+                    color: cs.primaryContainer,
+                    borderRadius: BorderRadius.circular(12),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 10,
+                      ),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Icon(
+                            Icons.share_rounded,
+                            size: 22,
+                            color: cs.onPrimaryContainer,
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Text(
+                              n == 1
+                                  ? '1 file shared — open a chat to attach it'
+                                  : '$n files shared — open a chat to attach them',
+                              style: TextStyle(
+                                color: cs.onPrimaryContainer,
+                                fontSize: 13,
+                                height: 1.35,
+                                fontWeight: FontWeight.w600,
                               ),
                             ),
-                            TextButton(
-                              onPressed: AndroidShareInbound.clearQueued,
-                              child: const Text('Dismiss'),
-                            ),
-                          ],
-                        ),
+                          ),
+                          TextButton(
+                            onPressed: AndroidShareInbound.clearQueued,
+                            child: const Text('Dismiss'),
+                          ),
+                        ],
                       ),
-                    ),
-                  );
-                },
-              ),
-            if (_supportsHomeFileDrop)
-              ValueListenableBuilder<int>(
-                valueListenable: DesktopDropQueue.revision,
-                builder: (context, rev, child) {
-                  final n = DesktopDropQueue.count;
-                  if (n <= 0) return const SizedBox.shrink();
-                  final cs2 = Theme.of(context).colorScheme;
-                  return Padding(
-                    padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-                    child: Material(
-                      color: cs2.secondaryContainer,
-                      borderRadius: BorderRadius.circular(12),
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 12, vertical: 10),
-                        child: Row(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Icon(Icons.upload_file_rounded,
-                                size: 22, color: cs2.onSecondaryContainer),
-                            const SizedBox(width: 10),
-                            Expanded(
-                              child: Text(
-                                n == 1
-                                    ? '1 file to send — open a chat'
-                                    : '$n files to send — open a chat',
-                                style: TextStyle(
-                                  color: cs2.onSecondaryContainer,
-                                  fontSize: 13,
-                                  height: 1.35,
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
-                            ),
-                            TextButton(
-                              onPressed: () {
-                                DesktopDropQueue.clear();
-                                if (mounted) setState(() {});
-                              },
-                              child: const Text('Dismiss'),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  );
-                },
-              ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
-              child: _buildProfileCard(context),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(24, 24, 24, 8),
-              child: Row(
-                children: [
-                  const AppIconTile(size: 30),
-                  const SizedBox(width: 12),
-                  Text(
-                    'Chats',
-                    style: TextStyle(
-                      fontSize: 22,
-                      fontWeight: FontWeight.w800,
-                      color: cs.onSurface,
                     ),
                   ),
-                ],
-              ),
+                );
+              },
             ),
-            Expanded(
-              child: _buildChatsBody(context, cs),
+          if (_supportsHomeFileDrop)
+            ValueListenableBuilder<int>(
+              valueListenable: DesktopDropQueue.revision,
+              builder: (context, rev, child) {
+                final n = DesktopDropQueue.count;
+                if (n <= 0) return const SizedBox.shrink();
+                final cs2 = Theme.of(context).colorScheme;
+                return Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                  child: Material(
+                    color: cs2.secondaryContainer,
+                    borderRadius: BorderRadius.circular(12),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 10,
+                      ),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Icon(
+                            Icons.upload_file_rounded,
+                            size: 22,
+                            color: cs2.onSecondaryContainer,
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Text(
+                              n == 1
+                                  ? '1 file to send — open a chat'
+                                  : '$n files to send — open a chat',
+                              style: TextStyle(
+                                color: cs2.onSecondaryContainer,
+                                fontSize: 13,
+                                height: 1.35,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ),
+                          TextButton(
+                            onPressed: () {
+                              DesktopDropQueue.clear();
+                              if (mounted) setState(() {});
+                            },
+                            child: const Text('Dismiss'),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                );
+              },
             ),
-          ],
-        ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
+            child: _buildProfileCard(context),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(24, 24, 24, 8),
+            child: Row(
+              children: [
+                const AppIconTile(size: 30),
+                const SizedBox(width: 12),
+                Text(
+                  'Chats',
+                  style: TextStyle(
+                    fontSize: 22,
+                    fontWeight: FontWeight.w800,
+                    color: cs.onSurface,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Expanded(child: _buildChatsBody(context, cs)),
+        ],
+      ),
     );
 
     if (_supportsHomeFileDrop) {
@@ -546,8 +581,11 @@ class _HomeScreenState extends State<HomeScreen> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(Icons.wifi_find,
-                size: 56, color: cs.outline.withValues(alpha: 0.4)),
+            Icon(
+              Icons.wifi_find,
+              size: 56,
+              color: cs.outline.withValues(alpha: 0.4),
+            ),
             const SizedBox(height: 12),
             Text(
               'Searching for devices\u2026',
@@ -579,8 +617,8 @@ class _HomeScreenState extends State<HomeScreen> {
     }
 
     final online = _peerList.where((e) => e.online).toList()..sort(activityCmp);
-    final offline =
-        _peerList.where((e) => !e.online).toList()..sort(activityCmp);
+    final offline = _peerList.where((e) => !e.online).toList()
+      ..sort(activityCmp);
 
     final isDark = Theme.of(context).brightness == Brightness.dark;
     final children = <Widget>[];
@@ -588,9 +626,7 @@ class _HomeScreenState extends State<HomeScreen> {
     if (online.isNotEmpty) {
       children.add(_buildChatsSectionHeader(context, 'Online', cs, isDark));
       for (final e in online) {
-        children.add(
-          _buildChatTile(context, e, showPresenceDot: true),
-        );
+        children.add(_buildChatTile(context, e, showPresenceDot: true));
       }
     }
 
@@ -599,18 +635,10 @@ class _HomeScreenState extends State<HomeScreen> {
         children.add(_buildChatsSectionDivider(cs));
       }
       children.add(
-        _buildChatsSectionHeader(
-          context,
-          'Offline',
-          cs,
-          isDark,
-          muted: true,
-        ),
+        _buildChatsSectionHeader(context, 'Offline', cs, isDark, muted: true),
       );
       for (final e in offline) {
-        children.add(
-          _buildChatTile(context, e, showPresenceDot: false),
-        );
+        children.add(_buildChatTile(context, e, showPresenceDot: false));
       }
     }
 
@@ -630,8 +658,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final onlineStyle = isDark
         ? cs.primaryContainer.withValues(alpha: 0.45)
         : const Color(0xFF2E7D32).withValues(alpha: 0.14);
-    final onlineFg =
-        isDark ? cs.onPrimaryContainer : const Color(0xFF1B5E20);
+    final onlineFg = isDark ? cs.onPrimaryContainer : const Color(0xFF1B5E20);
 
     return Padding(
       padding: const EdgeInsets.fromLTRB(4, 4, 4, 8),
@@ -648,8 +675,8 @@ class _HomeScreenState extends State<HomeScreen> {
                 color: muted
                     ? cs.outlineVariant.withValues(alpha: 0.35)
                     : (isDark
-                        ? cs.primary.withValues(alpha: 0.35)
-                        : const Color(0xFF2E7D32).withValues(alpha: 0.25)),
+                          ? cs.primary.withValues(alpha: 0.35)
+                          : const Color(0xFF2E7D32).withValues(alpha: 0.25)),
               ),
             ),
             child: Text(
@@ -684,14 +711,10 @@ class _HomeScreenState extends State<HomeScreen> {
     final offline = _connectivityOffline;
     final advertising = widget.discovery.isAdvertisingActive;
     final known = _connectivityResults != null;
-    final showOnline = !known
-        ? advertising
-        : (!offline && advertising);
+    final showOnline = !known ? advertising : (!offline && advertising);
     final statusLabel = !known
         ? 'Checking network\u2026'
-        : (offline
-            ? 'Offline'
-            : (advertising ? 'Online' : 'Limited'));
+        : (offline ? 'Offline' : (advertising ? 'Online' : 'Limited'));
 
     return Material(
       color: isDark ? cs.surfaceContainerHigh : Colors.white,
@@ -738,12 +761,12 @@ class _HomeScreenState extends State<HomeScreen> {
                             color: !known
                                 ? cs.outlineVariant
                                 : (showOnline
-                                    ? _RingAvatar._onlineGreen
-                                    : (offline
-                                        ? (isDark
-                                            ? const Color(0xFF757575)
-                                            : const Color(0xFFBDBDBD))
-                                        : Colors.amber.shade700)),
+                                      ? _RingAvatar._onlineGreen
+                                      : (offline
+                                            ? (isDark
+                                                  ? const Color(0xFF757575)
+                                                  : const Color(0xFFBDBDBD))
+                                            : Colors.amber.shade700)),
                           ),
                         ),
                         const SizedBox(width: 5),
@@ -766,7 +789,13 @@ class _HomeScreenState extends State<HomeScreen> {
                 onPressed: () {
                   Navigator.of(context).push(
                     MaterialPageRoute(
-                      builder: (_) => SettingsScreen(store: widget.store),
+                      builder: (_) => SettingsScreen(
+                        store: widget.store,
+                        globalDiscovery: widget.globalDiscovery,
+                        onGlobalDiscoveryEnabledChanged:
+                            widget.onGlobalDiscoveryEnabledChanged,
+                        displayName: widget.me.displayName,
+                      ),
                     ),
                   );
                 },
@@ -824,10 +853,12 @@ class _HomeScreenState extends State<HomeScreen> {
                         entry.name,
                         style: TextStyle(
                           fontSize: 15,
-                          fontWeight:
-                              unread > 0 ? FontWeight.w800 : FontWeight.w600,
-                          color:
-                              entry.online ? cs.onSurface : cs.onSurfaceVariant,
+                          fontWeight: unread > 0
+                              ? FontWeight.w800
+                              : FontWeight.w600,
+                          color: entry.online
+                              ? cs.onSurface
+                              : cs.onSurfaceVariant,
                         ),
                       ),
                       if (lastMsg != null) ...[
@@ -884,7 +915,9 @@ class _HomeScreenState extends State<HomeScreen> {
                       const SizedBox(height: 4),
                       Container(
                         padding: const EdgeInsets.symmetric(
-                            horizontal: 7, vertical: 3),
+                          horizontal: 7,
+                          vertical: 3,
+                        ),
                         decoration: BoxDecoration(
                           color: cs.primary,
                           borderRadius: BorderRadius.circular(10),
@@ -902,8 +935,11 @@ class _HomeScreenState extends State<HomeScreen> {
                   ],
                 ),
                 const SizedBox(width: 4),
-                Icon(Icons.chevron_right,
-                    size: 20, color: cs.outline.withValues(alpha: 0.5)),
+                Icon(
+                  Icons.chevron_right,
+                  size: 20,
+                  color: cs.outline.withValues(alpha: 0.5),
+                ),
               ],
             ),
           ),
@@ -915,7 +951,8 @@ class _HomeScreenState extends State<HomeScreen> {
   void _openChat(_PeerEntry entry) {
     setState(() => _unread.remove(entry.userId));
 
-    final peer = entry.peer ??
+    final peer =
+        entry.peer ??
         PeerDevice(
           userId: entry.userId,
           name: entry.name,
@@ -964,8 +1001,9 @@ class _RingAvatar extends StatelessWidget {
     final cs = Theme.of(context).colorScheme;
     final dark = isDark || Theme.of(context).brightness == Brightness.dark;
     final fill = dark ? cs.surfaceContainerHighest : const Color(0xFFE8E8EF);
-    final ring =
-        online ? _onlineGreen : (dark ? _offlineGreyDark : _offlineGreyLight);
+    final ring = online
+        ? _onlineGreen
+        : (dark ? _offlineGreyDark : _offlineGreyLight);
 
     final circle = Container(
       width: radius * 2,

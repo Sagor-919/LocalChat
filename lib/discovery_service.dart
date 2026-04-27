@@ -13,14 +13,17 @@ class DiscoveryService {
   static const int tcpPort = 4041;
   static const Duration broadcastInterval = Duration(seconds: 2);
   static const Duration staleTimeout = Duration(seconds: 6);
+
   /// Link-local admin multicast; works on many networks when 255.255.255.255 is filtered.
   static const String _multicastGroup = '239.255.76.76';
 
-  static const MethodChannel _androidDiscovery =
-      MethodChannel('local_chat/discovery');
+  static const MethodChannel _androidDiscovery = MethodChannel(
+    'local_chat/discovery',
+  );
 
   final DeviceInfo me;
   final Map<String, PeerDevice> _peers = {};
+  final Map<String, PeerDevice> _globalPeers = {};
   RawDatagramSocket? _socket;
   Timer? _broadcastTimer;
   Timer? _cleanupTimer;
@@ -37,7 +40,21 @@ class DiscoveryService {
 
   DiscoveryService({required this.me});
 
-  List<PeerDevice> get peers => _peers.values.toList();
+  List<PeerDevice> get peers {
+    final merged = <String, PeerDevice>{..._globalPeers, ..._peers};
+    return merged.values.toList();
+  }
+
+  void replaceGlobalPeers(Iterable<PeerDevice> peers) {
+    final next = <String, PeerDevice>{
+      for (final peer in peers) peer.userId: peer,
+    };
+    if (_samePeerSet(_globalPeers, next)) return;
+    _globalPeers
+      ..clear()
+      ..addAll(next);
+    onPeersChanged?.call();
+  }
 
   /// UDP bound and discovery loop running — best-effort signal that we can advertise.
   bool get isAdvertisingActive => _started && _socket != null;
@@ -53,14 +70,15 @@ class DiscoveryService {
     _attachDatagramListener();
 
     unawaited(_refreshBroadcastTargets());
-    _broadcastTargetsTimer =
-        Timer.periodic(const Duration(seconds: 15), (_) {
+    _broadcastTargetsTimer = Timer.periodic(const Duration(seconds: 15), (_) {
       unawaited(_refreshBroadcastTargets());
     });
 
     _broadcastTimer = Timer.periodic(broadcastInterval, (_) => _broadcast());
     _cleanupTimer = Timer.periodic(
-        const Duration(seconds: 2), (_) => _removeStale());
+      const Duration(seconds: 2),
+      (_) => _removeStale(),
+    );
     _broadcast();
     _started = true;
   }
@@ -171,7 +189,9 @@ class DiscoveryService {
     }
 
     try {
-      for (final iface in await NetworkInterface.list(includeLinkLocal: false)) {
+      for (final iface in await NetworkInterface.list(
+        includeLinkLocal: false,
+      )) {
         for (final addr in iface.addresses) {
           if (addr.type != InternetAddressType.IPv4) continue;
           if (addr.isLoopback) continue;
@@ -266,6 +286,24 @@ class DiscoveryService {
     if (_peers.length != before) {
       onPeersChanged?.call();
     }
+  }
+
+  static bool _samePeerSet(
+    Map<String, PeerDevice> a,
+    Map<String, PeerDevice> b,
+  ) {
+    if (a.length != b.length) return false;
+    for (final entry in a.entries) {
+      final other = b[entry.key];
+      final peer = entry.value;
+      if (other == null ||
+          other.name != peer.name ||
+          other.ip != peer.ip ||
+          other.port != peer.port) {
+        return false;
+      }
+    }
+    return true;
   }
 
   void stop() {

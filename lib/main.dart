@@ -21,7 +21,10 @@ import 'device.dart';
 import 'staged_from_drop.dart';
 import 'first_launch_prompt.dart';
 import 'discovery_service.dart';
+import 'global/global_discovery_v2.dart';
+import 'global/global_peer_store.dart';
 import 'global/identity.dart';
+import 'global/nostr_client.dart';
 import 'home_screen.dart';
 import 'message_model.dart';
 import 'message_store.dart';
@@ -32,9 +35,13 @@ import 'windows_taskbar_flash.dart';
 final GlobalKey<NavigatorState> appNavigatorKey = GlobalKey<NavigatorState>();
 
 late DeviceInfo _me;
+late LocalIdentity _globalIdentity;
 late DiscoveryService _discovery;
 late ConnectionService _connections;
 late MessageStore _store;
+GlobalDiscoveryV2? _globalDiscovery;
+StreamSubscription<GlobalJsonMessage>? _globalMessageSub;
+StreamSubscription<String>? _globalDisconnectSub;
 final FlutterLocalNotificationsPlugin _notifications =
     FlutterLocalNotificationsPlugin();
 bool _appInForeground = true;
@@ -60,9 +67,68 @@ Future<void> _restoreLanAfterLinkRecovery() async {
   await _discovery.rebindUdpSocket();
 }
 
+Future<GlobalDiscoveryV2> _ensureGlobalDiscovery() async {
+  final existing = _globalDiscovery;
+  if (existing != null) return existing;
+
+  final global = GlobalDiscoveryV2(
+    identity: _globalIdentity,
+    peerStore: const GlobalPeerStore(),
+    nostr: NostrClient(),
+    relayUrls: AppSettings.instance.globalDiscoveryRelays.value,
+  );
+  global.peers.addListener(_syncGlobalDiscoveryPeers);
+  _globalMessageSub = global.messages.listen((message) {
+    _connections.onMessage?.call(message.peerId, message.json);
+  });
+  _globalDisconnectSub = global.disconnectedPeerEvents.listen((peerId) {
+    _connections.onDisconnected?.call(peerId);
+  });
+  _connections.hasGlobalJsonTransport = global.isConnected;
+  _connections.sendGlobalJson = global.sendJson;
+  _connections.connectGlobalJson = global.connectToPeerId;
+  _globalDiscovery = global;
+  await global.reloadPeers();
+  return global;
+}
+
+Future<void> _setGlobalDiscoveryEnabled(bool enabled) async {
+  await AppSettings.instance.setGlobalDiscoveryEnabled(enabled);
+  final global = await _ensureGlobalDiscovery();
+  if (enabled) {
+    await global.start();
+  } else {
+    await global.stop();
+    _discovery.replaceGlobalPeers(const <PeerDevice>[]);
+  }
+  _syncGlobalDiscoveryPeers();
+}
+
+Future<void> _configureGlobalDiscoveryFromSettings() async {
+  final global = await _ensureGlobalDiscovery();
+  if (AppSettings.instance.globalDiscoveryEnabled.value) {
+    await global.start();
+  }
+  _syncGlobalDiscoveryPeers();
+}
+
+void _syncGlobalDiscoveryPeers() {
+  final global = _globalDiscovery;
+  if (global == null || !AppSettings.instance.globalDiscoveryEnabled.value) {
+    _discovery.replaceGlobalPeers(const <PeerDevice>[]);
+    return;
+  }
+  final peers = global.peerDevices();
+  _discovery.replaceGlobalPeers(peers);
+  for (final peer in peers) {
+    unawaited(_store.savePeerInfo(peer.userId, peer.name, peer.ip, peer.port));
+  }
+}
+
 void _onConnectivityChanged(List<ConnectivityResult> results) {
   final offline = _connectivityIsOffline(results);
-  final wasOffline = _lastConnectivityResults != null &&
+  final wasOffline =
+      _lastConnectivityResults != null &&
       _connectivityIsOffline(_lastConnectivityResults!);
   _lastConnectivityResults = List<ConnectivityResult>.from(results);
 
@@ -169,7 +235,9 @@ bool _isOpenChatNotificationTap(NotificationResponse r) {
 }
 
 Future<void> _handleIncomingEncryptedMessage(
-    String peerId, Map<String, dynamic> json) async {
+  String peerId,
+  Map<String, dynamic> json,
+) async {
   final ct = json['ct'] as String?;
   if (ct == null || ct.isEmpty) return;
   final (text, _) = await ChatCrypto.decryptMessage(_me.userId, peerId, ct);
@@ -178,7 +246,8 @@ Future<void> _handleIncomingEncryptedMessage(
     id: json['id'] as String? ?? '',
     senderId: json['from'] as String? ?? '',
     text: text,
-    timestamp: (json['time'] as num?)?.toInt() ??
+    timestamp:
+        (json['time'] as num?)?.toInt() ??
         DateTime.now().millisecondsSinceEpoch,
     isMine: (json['from'] as String?) == _me.userId,
   );
@@ -222,10 +291,16 @@ Future<void> _completeDeliveryHandshake(String peerId, String messageId) async {
   });
   if (ok) {
     await _store.updateDeliveryState(
-        peerId, messageId, MessageDelivery.delivered);
+      peerId,
+      messageId,
+      MessageDelivery.delivered,
+    );
   } else {
     await _store.updateDeliveryState(
-        peerId, messageId, MessageDelivery.awaitingConfirm);
+      peerId,
+      messageId,
+      MessageDelivery.awaitingConfirm,
+    );
   }
 }
 
@@ -395,8 +470,7 @@ Future<void> main(List<String> args) async {
     _windowsAutostartLaunch = args.contains('--autostart');
   }
 
-  if (!kIsWeb &&
-      (Platform.isWindows || Platform.isLinux || Platform.isMacOS)) {
+  if (!kIsWeb && (Platform.isWindows || Platform.isLinux || Platform.isMacOS)) {
     for (var i = 0; i < args.length; i++) {
       if (args[i] == '--share-file' && i + 1 < args.length) {
         final p = args[++i];
@@ -431,8 +505,8 @@ Future<void> main(List<String> args) async {
     }
   }
 
-  final globalIdentity = await LocalIdentity.loadOrCreate();
-  debugPrint('LocalChat global identity ed25519=${globalIdentity.edPubHex}');
+  _globalIdentity = await LocalIdentity.loadOrCreate();
+  debugPrint('LocalChat global identity ed25519=${_globalIdentity.edPubHex}');
   _me = await DeviceInfo.load();
   _store = await MessageStore.init();
   _discovery = DiscoveryService(me: _me);
@@ -453,9 +527,10 @@ Future<void> main(List<String> args) async {
       const InitializationSettings(
         android: AndroidInitializationSettings('@mipmap/ic_launcher'),
         windows: WindowsInitializationSettings(
-            appName: 'Local Chat',
-            appUserModelId: 'com.localchat.app',
-            guid: 'd3c1f8a0-1234-5678-9abc-def012345678'),
+          appName: 'Local Chat',
+          appUserModelId: 'com.localchat.app',
+          guid: 'd3c1f8a0-1234-5678-9abc-def012345678',
+        ),
       ),
       onDidReceiveNotificationResponse: _onNotificationTapped,
     );
@@ -486,13 +561,15 @@ Future<void> main(List<String> args) async {
       final displayName = name.isNotEmpty
           ? name
           : ((peer?.name ?? '').trim().isNotEmpty ? peer!.name : 'Peer');
-      unawaited(_store.savePeerInfo(
-        peerId,
-        displayName,
-        ip,
-        port,
-        lanStableTag: peer?.lanStableTag,
-      ));
+      unawaited(
+        _store.savePeerInfo(
+          peerId,
+          displayName,
+          ip,
+          port,
+          lanStableTag: peer?.lanStableTag,
+        ),
+      );
       return;
     }
 
@@ -566,6 +643,8 @@ Future<void> main(List<String> args) async {
     }
   });
 
+  await _configureGlobalDiscoveryFromSettings();
+
   runApp(const LocalChatApp());
 }
 
@@ -591,8 +670,9 @@ class _LocalChatAppState extends State<LocalChatApp>
   @override
   void initState() {
     super.initState();
-    _connectivitySub =
-        Connectivity().onConnectivityChanged.listen(_onConnectivityChanged);
+    _connectivitySub = Connectivity().onConnectivityChanged.listen(
+      _onConnectivityChanged,
+    );
     unawaited(Connectivity().checkConnectivity().then(_onConnectivityChanged));
     WidgetsBinding.instance.addObserver(this);
     if (_isDesktop) {
@@ -631,6 +711,12 @@ class _LocalChatAppState extends State<LocalChatApp>
       windowManager.removeListener(this);
       trayManager.removeListener(this);
     }
+    final globalMessageSub = _globalMessageSub;
+    if (globalMessageSub != null) unawaited(globalMessageSub.cancel());
+    final globalDisconnectSub = _globalDisconnectSub;
+    if (globalDisconnectSub != null) unawaited(globalDisconnectSub.cancel());
+    final globalDiscovery = _globalDiscovery;
+    if (globalDiscovery != null) unawaited(globalDiscovery.close());
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -640,14 +726,16 @@ class _LocalChatAppState extends State<LocalChatApp>
     try {
       await trayManager.setIcon(_trayAssetPath());
       await trayManager.setToolTip('Local Chat');
-      await trayManager.setContextMenu(Menu(
-        items: [
-          MenuItem(key: 'show', label: 'Show Local Chat'),
-          MenuItem(key: 'settings', label: 'Open Settings'),
-          MenuItem.separator(),
-          MenuItem(key: 'exit', label: 'Close app'),
-        ],
-      ));
+      await trayManager.setContextMenu(
+        Menu(
+          items: [
+            MenuItem(key: 'show', label: 'Show Local Chat'),
+            MenuItem(key: 'settings', label: 'Open Settings'),
+            MenuItem.separator(),
+            MenuItem(key: 'exit', label: 'Close app'),
+          ],
+        ),
+      );
     } catch (_) {}
   }
 
@@ -662,7 +750,12 @@ class _LocalChatAppState extends State<LocalChatApp>
     if (ctx == null) return;
     Navigator.of(ctx).push(
       MaterialPageRoute<void>(
-        builder: (_) => SettingsScreen(store: _store),
+        builder: (_) => SettingsScreen(
+          store: _store,
+          globalDiscovery: _globalDiscovery,
+          onGlobalDiscoveryEnabledChanged: _setGlobalDiscoveryEnabled,
+          displayName: _me.displayName,
+        ),
       ),
     );
     unawaited(() async {
@@ -752,7 +845,8 @@ class _LocalChatAppState extends State<LocalChatApp>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    _appInForeground = state == AppLifecycleState.resumed ||
+    _appInForeground =
+        state == AppLifecycleState.resumed ||
         state == AppLifecycleState.inactive;
     if (Platform.isAndroid) {
       if (state == AppLifecycleState.paused) {
@@ -796,6 +890,8 @@ class _LocalChatAppState extends State<LocalChatApp>
             discovery: _discovery,
             connections: _connections,
             store: _store,
+            globalDiscovery: _globalDiscovery,
+            onGlobalDiscoveryEnabledChanged: _setGlobalDiscoveryEnabled,
           ),
         );
       },

@@ -39,11 +39,11 @@ class _StagedStripScrollBehavior extends MaterialScrollBehavior {
 
   @override
   Set<PointerDeviceKind> get dragDevices => {
-        PointerDeviceKind.touch,
-        PointerDeviceKind.stylus,
-        PointerDeviceKind.mouse,
-        PointerDeviceKind.trackpad,
-      };
+    PointerDeviceKind.touch,
+    PointerDeviceKind.stylus,
+    PointerDeviceKind.mouse,
+    PointerDeviceKind.trackpad,
+  };
 }
 
 class ChatScreen extends StatefulWidget {
@@ -68,8 +68,9 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> {
   static const _uuid = Uuid();
-  static const MethodChannel _appControlChannel =
-      MethodChannel('local_chat/app_control');
+  static const MethodChannel _appControlChannel = MethodChannel(
+    'local_chat/app_control',
+  );
 
   static const _pageSize = 50;
 
@@ -126,6 +127,10 @@ class _ChatScreenState extends State<ChatScreen> {
 
   String get _peerId => widget.peer.userId;
   TransferManager get _tm => TransferManager.instance;
+  bool get _lanConnected => widget.connections.isLanConnected(_peerId);
+  bool get _fileTransferAvailable =>
+      widget.connections.isFileTransferAvailable(_peerId);
+  bool get _fileActionsEnabled => !_connected || _fileTransferAvailable;
 
   /// Same as [compareChatMessagesChronological] — must match [MessageStore] SQL order.
   static int _compareMessages(ChatMessage a, ChatMessage b) =>
@@ -287,7 +292,10 @@ class _ChatScreenState extends State<ChatScreen> {
         final dropped = DesktopDropQueue.takeAll();
         if (dropped.isEmpty) return;
         _stageFiles(
-          dropped.map(deferredStagedFileFromLocalPath).whereType<DeferredStagedFile>().toList(),
+          dropped
+              .map(deferredStagedFileFromLocalPath)
+              .whereType<DeferredStagedFile>()
+              .toList(),
         );
       });
     }
@@ -320,6 +328,7 @@ class _ChatScreenState extends State<ChatScreen> {
         (HardwareKeyboard.instance.isControlPressed ||
             HardwareKeyboard.instance.isMetaPressed) &&
         HardwareKeyboard.instance.isShiftPressed) {
+      if (!_fileActionsEnabled) return false;
       unawaited(_pasteClipboardImageToStaging());
       return true;
     }
@@ -329,7 +338,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (HardwareKeyboard.instance.isShiftPressed) return false;
     if (!mounted) return false;
     final textReady = normalizeOutgoingMessageText(_input.text).isNotEmpty;
-    final canSend = textReady || (_connected && _staged.isNotEmpty);
+    final canSend = textReady || (_fileTransferAvailable && _staged.isNotEmpty);
     if (!canSend) return false;
     unawaited(_sendAll());
     return true;
@@ -373,8 +382,10 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _loadHistory() async {
-    final window =
-        await widget.store.loadRecentWindow(_peerId, _initialHistoryWindow);
+    final window = await widget.store.loadRecentWindow(
+      _peerId,
+      _initialHistoryWindow,
+    );
     if (!mounted) return;
     _totalInDb = window.total;
     _allMessages
@@ -413,8 +424,10 @@ class _ChatScreenState extends State<ChatScreen> {
     if (_displayCount < _allMessages.length) {
       final prevMax = _scroll.position.maxScrollExtent;
       setState(() {
-        _displayCount =
-            (_displayCount + _pageSize).clamp(0, _allMessages.length);
+        _displayCount = (_displayCount + _pageSize).clamp(
+          0,
+          _allMessages.length,
+        );
         _rebuildVisible();
       });
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -580,6 +593,20 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _transmitEncryptedText(ChatMessage msg) async {
+    if (!_lanConnected) {
+      final ok = widget.connections.sendJson(_peerId, {
+        'type': 'message',
+        'id': msg.id,
+        'from': widget.me.userId,
+        'text': msg.text,
+        'time': msg.timestamp,
+      });
+      if (!ok) {
+        await _setMessageDelivery(msg.id, MessageDelivery.undelivered);
+      }
+      return;
+    }
+
     final b64 = await ChatCrypto.encryptMessage(
       widget.me.userId,
       _peerId,
@@ -912,7 +939,10 @@ class _ChatScreenState extends State<ChatScreen> {
     final hasFiles = _staged.isNotEmpty;
 
     if (!hasText && !hasFiles) return;
-    if (hasFiles && !_connected) return;
+    if (hasFiles && !_fileTransferAvailable) {
+      _showCopyFeedback('File transfer needs a LAN connection');
+      return;
+    }
 
     if (hasText) {
       final live = _resolveLivePeer();
@@ -967,6 +997,10 @@ class _ChatScreenState extends State<ChatScreen> {
     required bool duplicatePathInBatch,
   }) async {
     final live = _resolveLivePeer();
+    if (!_fileTransferAvailable) {
+      _showCopyFeedback('File transfer needs a LAN connection');
+      return;
+    }
     if (!widget.connections.isConnected(_peerId)) {
       await widget.connections.connectTo(live, forceNew: false);
     }
@@ -1114,7 +1148,9 @@ class _ChatScreenState extends State<ChatScreen> {
       });
     } catch (_) {
       try {
-        await _appControlChannel.invokeMethod<void>('openApplicationDetailsSettings');
+        await _appControlChannel.invokeMethod<void>(
+          'openApplicationDetailsSettings',
+        );
       } catch (_) {
         if (mounted) _showCopyFeedback('Could not open folder');
       }
@@ -1461,7 +1497,8 @@ class _ChatScreenState extends State<ChatScreen> {
   Widget _wrapChatDropTarget(BuildContext context, Widget child) {
     if (!_supportsFileDrop) return child;
     return DropTarget(
-      enable: ModalRoute.of(context)?.isCurrent ?? true,
+      enable:
+          (ModalRoute.of(context)?.isCurrent ?? true) && _fileActionsEnabled,
       onDragDone: _onDropDone,
       child: child,
     );
@@ -1515,7 +1552,10 @@ class _ChatScreenState extends State<ChatScreen> {
               const SizedBox(width: 8),
               TextButton(
                 style: TextButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 4,
+                  ),
                   minimumSize: Size.zero,
                   tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                 ),
@@ -1577,11 +1617,12 @@ class _ChatScreenState extends State<ChatScreen> {
                               isFolder: isFolder,
                               knownSizeBytes: df.knownSizeBytes,
                               cs: cs,
-                              imageWrapper: (image) => _wrapImageWithContextMenu(
-                                path: previewPath!,
-                                fileName: df.displayName,
-                                image: image,
-                              ),
+                              imageWrapper: (image) =>
+                                  _wrapImageWithContextMenu(
+                                    path: previewPath!,
+                                    fileName: df.displayName,
+                                    image: image,
+                                  ),
                             ),
                           ),
                           Positioned(
@@ -2359,7 +2400,8 @@ class _ChatScreenState extends State<ChatScreen> {
       if (withHandlers.isEmpty) return const SizedBox.shrink();
       return CupertinoTextSelectionToolbar(
         anchorAbove: state.contextMenuAnchors.primaryAnchor,
-        anchorBelow: state.contextMenuAnchors.secondaryAnchor ??
+        anchorBelow:
+            state.contextMenuAnchors.secondaryAnchor ??
             state.contextMenuAnchors.primaryAnchor,
         children: [
           for (final item in withHandlers)
@@ -2390,19 +2432,24 @@ class _ChatScreenState extends State<ChatScreen> {
           final textReady = normalizeOutgoingMessageText(
             _input.text,
           ).isNotEmpty;
-          final canSend = textReady || (_connected && _staged.isNotEmpty);
+          final canSend =
+              textReady || (_fileTransferAvailable && _staged.isNotEmpty);
           return Row(
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [
               IconButton.filled(
-                onPressed: _nativePickerOpen ? null : _pickFiles,
+                onPressed: _nativePickerOpen || !_fileActionsEnabled
+                    ? null
+                    : _pickFiles,
                 tooltip: 'Attach Files',
                 icon: const Icon(Icons.attach_file),
               ),
               if (_isDesktop) ...[
                 const SizedBox(width: 4),
                 IconButton.filled(
-                  onPressed: _nativePickerOpen ? null : _pickFolder,
+                  onPressed: _nativePickerOpen || !_fileActionsEnabled
+                      ? null
+                      : _pickFolder,
                   tooltip: 'Attach Folder',
                   style: IconButton.styleFrom(
                     backgroundColor: cs.secondaryContainer,
@@ -2414,7 +2461,9 @@ class _ChatScreenState extends State<ChatScreen> {
               if (!kIsWeb && Platform.isAndroid) ...[
                 const SizedBox(width: 4),
                 IconButton.filled(
-                  onPressed: _nativePickerOpen ? null : _pickGallery,
+                  onPressed: _nativePickerOpen || !_fileActionsEnabled
+                      ? null
+                      : _pickGallery,
                   tooltip: 'Gallery',
                   style: IconButton.styleFrom(
                     backgroundColor: cs.secondaryContainer,
@@ -2426,10 +2475,12 @@ class _ChatScreenState extends State<ChatScreen> {
               if (!kIsWeb && !Platform.isAndroid) ...[
                 const SizedBox(width: 4),
                 IconButton.filled(
-                  onPressed: _nativePickerOpen
+                  onPressed: _nativePickerOpen || !_fileActionsEnabled
                       ? null
                       : () => unawaited(_pasteClipboardImageToStaging()),
-                  tooltip: _isDesktop ? 'Paste image (Ctrl+Shift+V)' : 'Paste image',
+                  tooltip: _isDesktop
+                      ? 'Paste image (Ctrl+Shift+V)'
+                      : 'Paste image',
                   style: IconButton.styleFrom(
                     backgroundColor: cs.secondaryContainer,
                     foregroundColor: cs.onSecondaryContainer,
