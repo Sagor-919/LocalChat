@@ -9,6 +9,8 @@
 
 This app discovers nearby devices on **Wi‑Fi / Ethernet**, opens **TCP chat** without a central server, and transfers **files** over a separate streaming channel. **Chat messages are encrypted** end-to-end for the session.
 
+V5 adds optional **Global Discovery** for paired text chat across networks using public Nostr rendezvous, WebRTC data channels, and a Noise-encrypted session.
+
 > **Alpha:** Expect bugs, unfinished polish, and breaking changes. Not for production security without your own review.
 
 ---
@@ -18,6 +20,7 @@ This app discovers nearby devices on **Wi‑Fi / Ethernet**, opens **TCP chat** 
 | Document | Contents |
 |----------|----------|
 | [**docs/FEATURES.md**](docs/FEATURES.md) | Feature-by-feature reference (what exists and where in code). |
+| [**GLOBAL_DISCOVERY_SPEC.md**](GLOBAL_DISCOVERY_SPEC.md) | V5 Global Discovery integration contract and guardrails. |
 | [**docs/RELEASE_ALPHA.md**](docs/RELEASE_ALPHA.md) | Signing, builds, release checklist. |
 | [**docs/windows_share_from_explorer.md**](docs/windows_share_from_explorer.md) | Optional Explorer context menu → `--share-file` (Windows). |
 | [**CHANGELOG.md**](CHANGELOG.md) | Alpha 1.7.0 notes. |
@@ -50,11 +53,23 @@ flutter test
 
 ## Architecture (short)
 
+- **Global Discovery V5** - optional paired text transport using Nostr rendezvous, WebRTC, and Noise; [`lib/global/`](lib/global/).
+
 - **UDP** — discovery (`broadcast_port` / handshake in [`lib/discovery_service.dart`](lib/discovery_service.dart)).
 - **TCP** — JSON chat + control; [`lib/connection_service.dart`](lib/connection_service.dart).
 - **File transfer** — dedicated socket protocol; [`lib/file_transfer_service.dart`](lib/file_transfer_service.dart), [`lib/transfer_manager.dart`](lib/transfer_manager.dart).
 - **Persistence** — SQLite `sqflite` ([`lib/message_store.dart`](lib/message_store.dart)); attachments on disk per app settings.
 - **Crypto** — [`lib/chat_crypto.dart`](lib/chat_crypto.dart).
+
+---
+
+## Global Discovery V5
+
+- **LAN-first:** same-network peers still use UDP discovery and TCP chat.
+- **Pairing:** global peers are added with a 9-digit pairing code and SAS emoji verification.
+- **Rendezvous:** public Nostr relays exchange encrypted WebRTC signaling. No LocalChat server is required.
+- **Transport:** text messages use WebRTC data channels with a Noise overlay pinned to paired identity keys.
+- **Limits:** no TURN server is bundled, so some NAT combinations cannot connect. Global file transfer is intentionally disabled until the V4 `TransferManager` has a data-channel adapter.
 
 ---
 

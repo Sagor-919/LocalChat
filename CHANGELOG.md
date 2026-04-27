@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased - Dev-LocalChatV5-GlobalDiscovery
+
+- Added optional Global Discovery V5: pairing, Nostr rendezvous, WebRTC data channel setup, and Noise-framed global text transport.
+- Kept V4 LAN discovery, TCP chat, SQLite message history, notifications, and file transfer as the authoritative systems.
+- Global file transfer remains disabled until a `TransferManager` data-channel adapter is implemented.
+
+---
+
 ## Alpha 1.7.0 (2026-03-31)
 
 **Publisher:** RecklessGalaxy.com · **Developer:** Sagor Hossen
