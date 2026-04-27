@@ -21,6 +21,7 @@ import 'device.dart';
 import 'staged_from_drop.dart';
 import 'first_launch_prompt.dart';
 import 'discovery_service.dart';
+import 'global/identity.dart';
 import 'home_screen.dart';
 import 'message_model.dart';
 import 'message_store.dart';
@@ -429,6 +430,9 @@ Future<void> main(List<String> args) async {
       await windowManager.show();
     }
   }
+
+  final globalIdentity = await LocalIdentity.loadOrCreate();
+  debugPrint('LocalChat global identity ed25519=${globalIdentity.edPubHex}');
   _me = await DeviceInfo.load();
   _store = await MessageStore.init();
   _discovery = DiscoveryService(me: _me);
