@@ -25,6 +25,8 @@ dependencies:
   network_info_plus: ^7.0.0
   super_clipboard: ^0.9.1
   connectivity_plus: ^7.0.0
+  flutter_webrtc: ^1.4.1
+  web_socket_channel: ^3.0.1
   crypto: ^3.0.7
   cryptography: ^2.9.0
   sqflite: ^2.4.2
