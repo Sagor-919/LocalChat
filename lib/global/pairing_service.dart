@@ -19,14 +19,21 @@ class PairingService {
     required this.displayName,
     required this.nostr,
     GlobalPeerStore peerStore = const GlobalPeerStore(),
+    List<Duration> acceptBurstDelays = const <Duration>[
+      Duration(seconds: 2),
+      Duration(seconds: 5),
+      Duration(seconds: 9),
+    ],
     DateTime Function()? now,
   }) : _peerStore = peerStore,
+       _acceptBurstDelays = acceptBurstDelays,
        _now = now ?? DateTime.now;
 
   final LocalIdentity identity;
   final String displayName;
   final NostrClient nostr;
   final GlobalPeerStore _peerStore;
+  final List<Duration> _acceptBurstDelays;
   final DateTime Function() _now;
 
   Future<PairingSession> startAsInitiator({
@@ -163,11 +170,7 @@ class PairingService {
     }
 
     await publishAccept();
-    for (final delay in const <Duration>[
-      Duration(seconds: 2),
-      Duration(seconds: 5),
-      Duration(seconds: 9),
-    ]) {
+    for (final delay in _acceptBurstDelays) {
       unawaited(Future<void>.delayed(delay, publishAccept));
     }
   }

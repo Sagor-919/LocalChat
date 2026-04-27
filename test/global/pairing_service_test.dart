@@ -110,6 +110,42 @@ void main() {
 
     expect(nostr.publishCount, greaterThan(1));
   });
+
+  test('initiator and responder complete pairing over shared relay', () async {
+    final bus = _LoopbackRelayBus();
+    final initiator = PairingService(
+      identity: await _identity(21, 22),
+      displayName: 'Alice',
+      nostr: _LoopbackNostrClient(bus),
+      acceptBurstDelays: const <Duration>[],
+    );
+    final responder = PairingService(
+      identity: await _identity(31, 32),
+      displayName: 'Bob',
+      nostr: _LoopbackNostrClient(bus),
+      acceptBurstDelays: const <Duration>[],
+    );
+
+    final initiatorFuture = initiator.startAsInitiator(
+      code: '123-456-789',
+      timeout: const Duration(seconds: 2),
+      retryInterval: const Duration(milliseconds: 20),
+    );
+    await Future<void>.delayed(const Duration(milliseconds: 30));
+    final responderFuture = responder.joinAsResponder(
+      '123456789',
+      timeout: const Duration(seconds: 2),
+    );
+
+    final initiatorSession = await initiatorFuture;
+    final responderSession = await responderFuture;
+
+    expect(initiatorSession.peer.name, 'Bob');
+    expect(responderSession.peer.name, 'Alice');
+    expect(initiatorSession.sas, responderSession.sas);
+    expect(initiatorSession.remoteSas, initiatorSession.sas);
+    expect(responderSession.remoteSas, isNull);
+  });
 }
 
 class _CountingNostrClient extends NostrClient {
@@ -119,6 +155,68 @@ class _CountingNostrClient extends NostrClient {
   void publish(NostrEvent event) {
     publishCount++;
   }
+}
+
+class _LoopbackNostrClient extends NostrClient {
+  _LoopbackNostrClient(this.bus);
+
+  final _LoopbackRelayBus bus;
+
+  @override
+  void publish(NostrEvent event) {
+    bus.publish(event);
+  }
+
+  @override
+  NostrSubscription subscribe(
+    NostrFilter filter,
+    NostrEventCallback callback, {
+    String? id,
+  }) {
+    bus.subscribe(filter, callback);
+    return super.subscribe(filter, callback, id: id);
+  }
+}
+
+class _LoopbackRelayBus {
+  final List<_LoopbackSubscription> _subscriptions = <_LoopbackSubscription>[];
+
+  void subscribe(NostrFilter filter, NostrEventCallback callback) {
+    _subscriptions.add(_LoopbackSubscription(filter, callback));
+  }
+
+  void publish(NostrEvent event) {
+    for (final subscription in List<_LoopbackSubscription>.from(
+      _subscriptions,
+    )) {
+      if (_matches(subscription.filter, event)) {
+        scheduleMicrotask(() => subscription.callback(event));
+      }
+    }
+  }
+
+  bool _matches(NostrFilter filter, NostrEvent event) {
+    final kinds = filter['kinds'];
+    if (kinds is List && !kinds.contains(event.kind)) return false;
+
+    final dTags = filter['#d'];
+    if (dTags is List) {
+      final eventD = event.tags
+          .where((tag) => tag.length >= 2 && tag.first == 'd')
+          .map((tag) => tag[1])
+          .toSet();
+      if (!dTags.any(eventD.contains)) return false;
+    }
+
+    return true;
+  }
+}
+
+class _LoopbackSubscription {
+  _LoopbackSubscription(this.filter, this.callback);
+
+  final NostrFilter filter;
+  final NostrEventCallback callback;
 }
 
 Future<LocalIdentity> _identity(int edSeedByte, int xSeedByte) async {
