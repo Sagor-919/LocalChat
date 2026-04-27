@@ -124,7 +124,8 @@ class _PairingScreenState extends State<PairingScreen> {
             label: const Text('Generate Code'),
           ),
         const SizedBox(height: 18),
-        if (_busy && _session == null) const LinearProgressIndicator(),
+        if (_busy && _session == null)
+          _waitingText(cs, 'Waiting for the other device to enter this code.'),
         if (_session != null) _buildSasCard(cs),
         if (_error != null) _errorText(cs),
       ],
@@ -159,7 +160,8 @@ class _PairingScreenState extends State<PairingScreen> {
           label: const Text('Join'),
         ),
         const SizedBox(height: 18),
-        if (_busy && _session == null) const LinearProgressIndicator(),
+        if (_busy && _session == null)
+          _waitingText(cs, 'Looking for the device that generated this code.'),
         if (_session != null) _buildSasCard(cs),
         if (_error != null) _errorText(cs),
       ],
@@ -168,6 +170,25 @@ class _PairingScreenState extends State<PairingScreen> {
 
   Widget _pairingBody({required List<Widget> children}) {
     return ListView(padding: const EdgeInsets.all(20), children: children);
+  }
+
+  Widget _waitingText(ColorScheme cs, String text) {
+    return Row(
+      children: [
+        SizedBox(
+          width: 18,
+          height: 18,
+          child: CircularProgressIndicator(strokeWidth: 2, color: cs.primary),
+        ),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Text(
+            text,
+            style: TextStyle(color: cs.outline, fontWeight: FontWeight.w600),
+          ),
+        ),
+      ],
+    );
   }
 
   Widget _buildSasCard(ColorScheme cs) {

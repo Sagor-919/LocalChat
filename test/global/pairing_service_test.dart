@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:local_chat/global/global_peer_store.dart';
@@ -88,4 +90,48 @@ void main() {
     expect(peers, hasLength(1));
     expect(peers.single.edPubHex, peer.edPubHex);
   });
+
+  test('initiator republishes offer while waiting for responder', () async {
+    final nostr = _CountingNostrClient();
+    final service = PairingService(
+      identity: await _identity(11, 12),
+      displayName: 'Alice',
+      nostr: nostr,
+    );
+
+    await expectLater(
+      service.startAsInitiator(
+        code: '123-456-789',
+        timeout: const Duration(milliseconds: 90),
+        retryInterval: const Duration(milliseconds: 20),
+      ),
+      throwsA(isA<TimeoutException>()),
+    );
+
+    expect(nostr.publishCount, greaterThan(1));
+  });
+}
+
+class _CountingNostrClient extends NostrClient {
+  var publishCount = 0;
+
+  @override
+  void publish(NostrEvent event) {
+    publishCount++;
+  }
+}
+
+Future<LocalIdentity> _identity(int edSeedByte, int xSeedByte) async {
+  final edPair = await Ed25519().newKeyPairFromSeed(
+    List<int>.filled(32, edSeedByte),
+  );
+  final xPair = await X25519().newKeyPairFromSeed(
+    List<int>.filled(32, xSeedByte),
+  );
+  return LocalIdentity(
+    edPriv: await edPair.extractPrivateKeyBytes(),
+    edPub: (await edPair.extractPublicKey()).bytes,
+    xPriv: await xPair.extractPrivateKeyBytes(),
+    xPub: (await xPair.extractPublicKey()).bytes,
+  );
 }

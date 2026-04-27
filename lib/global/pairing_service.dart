@@ -11,6 +11,7 @@ import 'nostr_client.dart';
 import 'sas_emoji_table.dart';
 
 const localChatPairingKind = 22240;
+const pairingRetryInterval = Duration(seconds: 3);
 
 class PairingService {
   PairingService({
@@ -31,6 +32,7 @@ class PairingService {
   Future<PairingSession> startAsInitiator({
     String? code,
     Duration timeout = const Duration(seconds: 90),
+    Duration retryInterval = pairingRetryInterval,
   }) async {
     final pairingCode = code == null
         ? generatePairingCode()
@@ -38,45 +40,57 @@ class PairingService {
     final topic = pairingTopic(pairingCode);
     final completer = Completer<PairingSession>();
     late final NostrSubscription subscription;
+    Timer? offerTimer;
 
-    subscription = nostr.subscribe(_topicFilter(topic), (event) {
-      if (completer.isCompleted) return;
-      final message = PairingMessage.tryParse(event.content);
-      if (message == null ||
-          message.kind != PairingMessageKind.accept ||
-          !_messageIsFresh(message)) {
-        return;
-      }
-      final peer = message.toPeer();
-      _deriveSas(peer.xPub).then((sas) {
-        if (!completer.isCompleted) {
-          completer.complete(
-            PairingSession(
-              code: pairingCode,
-              topic: topic,
-              role: PairingRole.initiator,
-              peer: peer,
-              sas: sas,
-              remoteSas: message.sas,
-            ),
-          );
+    subscription = nostr.subscribe(
+      _topicFilter(topic, since: _secondsNow() - 60),
+      (event) {
+        if (completer.isCompleted) return;
+        final message = PairingMessage.tryParse(event.content);
+        if (message == null ||
+            message.kind != PairingMessageKind.accept ||
+            !_messageIsFresh(message)) {
+          return;
         }
-      }, onError: completer.completeError);
-    });
-
-    await _publishPairingMessage(
-      topic: topic,
-      message: PairingMessage.offer(
-        edPub: identity.edPub,
-        xPub: identity.xPub,
-        name: displayName,
-        ts: _secondsNow(),
-      ),
+        final peer = message.toPeer();
+        _deriveSas(peer.xPub).then((sas) {
+          if (!completer.isCompleted) {
+            completer.complete(
+              PairingSession(
+                code: pairingCode,
+                topic: topic,
+                role: PairingRole.initiator,
+                peer: peer,
+                sas: sas,
+                remoteSas: message.sas,
+              ),
+            );
+          }
+        }, onError: completer.completeError);
+      },
     );
+
+    Future<void> publishOffer() {
+      return _publishPairingMessage(
+        topic: topic,
+        message: PairingMessage.offer(
+          edPub: identity.edPub,
+          xPub: identity.xPub,
+          name: displayName,
+          ts: _secondsNow(),
+        ),
+      );
+    }
+
+    await publishOffer();
+    offerTimer = Timer.periodic(retryInterval, (_) {
+      if (!completer.isCompleted) unawaited(publishOffer());
+    });
 
     try {
       return await completer.future.timeout(timeout);
     } finally {
+      offerTimer.cancel();
       subscription.cancel();
     }
   }
@@ -92,46 +106,69 @@ class PairingService {
     final topic = pairingTopic(normalized);
     final completer = Completer<PairingSession>();
     late final NostrSubscription subscription;
+    var acceptedOffer = false;
 
-    subscription = nostr.subscribe(_topicFilter(topic), (event) {
-      if (completer.isCompleted) return;
-      final message = PairingMessage.tryParse(event.content);
-      if (message == null ||
-          message.kind != PairingMessageKind.offer ||
-          !_messageIsFresh(message)) {
-        return;
-      }
-      final peer = message.toPeer();
-      _deriveSas(peer.xPub).then((sas) async {
-        await _publishPairingMessage(
-          topic: topic,
-          message: PairingMessage.accept(
-            edPub: identity.edPub,
-            xPub: identity.xPub,
-            name: displayName,
-            sas: sas,
-            ts: _secondsNow(),
-          ),
-        );
-        if (!completer.isCompleted) {
-          completer.complete(
-            PairingSession(
-              code: formatPairingCode(normalized),
-              topic: topic,
-              role: PairingRole.responder,
-              peer: peer,
-              sas: sas,
-              remoteSas: null,
-            ),
-          );
+    subscription = nostr.subscribe(
+      _topicFilter(topic, since: _secondsNow() - 60),
+      (event) {
+        if (completer.isCompleted || acceptedOffer) return;
+        final message = PairingMessage.tryParse(event.content);
+        if (message == null ||
+            message.kind != PairingMessageKind.offer ||
+            !_messageIsFresh(message)) {
+          return;
         }
-      }, onError: completer.completeError);
-    });
+        acceptedOffer = true;
+        final peer = message.toPeer();
+        _deriveSas(peer.xPub).then((sas) async {
+          await _publishAcceptBurst(topic: topic, sas: sas);
+          if (!completer.isCompleted) {
+            completer.complete(
+              PairingSession(
+                code: formatPairingCode(normalized),
+                topic: topic,
+                role: PairingRole.responder,
+                peer: peer,
+                sas: sas,
+                remoteSas: null,
+              ),
+            );
+          }
+        }, onError: completer.completeError);
+      },
+    );
 
     try {
       return await completer.future.timeout(timeout);
     } finally {
       subscription.cancel();
+    }
+  }
+
+  Future<void> _publishAcceptBurst({
+    required String topic,
+    required String sas,
+  }) async {
+    Future<void> publishAccept() {
+      return _publishPairingMessage(
+        topic: topic,
+        message: PairingMessage.accept(
+          edPub: identity.edPub,
+          xPub: identity.xPub,
+          name: displayName,
+          sas: sas,
+          ts: _secondsNow(),
+        ),
+      );
+    }
+
+    await publishAccept();
+    for (final delay in const <Duration>[
+      Duration(seconds: 2),
+      Duration(seconds: 5),
+      Duration(seconds: 9),
+    ]) {
+      unawaited(Future<void>.delayed(delay, publishAccept));
     }
   }
 
@@ -169,10 +206,14 @@ class PairingService {
 
   int _secondsNow() => _now().millisecondsSinceEpoch ~/ 1000;
 
-  static NostrFilter _topicFilter(String topic) => <String, Object?>{
-    'kinds': <int>[localChatPairingKind],
-    '#d': <String>[topic],
-  };
+  static NostrFilter _topicFilter(String topic, {int? since}) {
+    final filter = <String, Object?>{
+      'kinds': <int>[localChatPairingKind],
+      '#d': <String>[topic],
+    };
+    if (since != null) filter['since'] = since;
+    return filter;
+  }
 
   static String normalizePairingCode(String raw) =>
       raw.replaceAll(RegExp(r'\D'), '');
