@@ -5,6 +5,7 @@ import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart' as crypto;
 import 'package:cryptography/cryptography.dart';
+import 'package:flutter/foundation.dart' show ValueNotifier;
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 const defaultNostrRelays = <String>[
@@ -18,26 +19,67 @@ const defaultNostrRelays = <String>[
 typedef NostrFilter = Map<String, Object?>;
 typedef NostrEventCallback = void Function(NostrEvent event);
 
+/// Multi-relay Nostr client with subscription replay and exponential
+/// reconnect backoff. Public state ([connectedRelayCount], [targetRelayCount],
+/// [connecting]) drives Settings + Pairing UI status.
 class NostrClient {
-  NostrClient({Duration connectTimeout = const Duration(seconds: 5)})
-    : _connectTimeout = connectTimeout;
+  NostrClient({
+    Duration connectTimeout = const Duration(seconds: 5),
+    Duration reconnectInitialDelay = const Duration(seconds: 3),
+    Duration reconnectMaxDelay = const Duration(seconds: 30),
+    bool autoReconnect = true,
+  }) : _connectTimeout = connectTimeout,
+       _reconnectInitialDelay = reconnectInitialDelay,
+       _reconnectMaxDelay = reconnectMaxDelay,
+       _autoReconnect = autoReconnect;
 
   final Duration _connectTimeout;
+  final Duration _reconnectInitialDelay;
+  final Duration _reconnectMaxDelay;
+  final bool _autoReconnect;
+
   final List<_RelayConnection> _relays = [];
   final Map<String, NostrEventCallback> _subscriptions = {};
+  final Map<String, _SubscriptionRecord> _subscriptionRecords = {};
   final Set<String> _seenEventIds = <String>{};
+  final List<String> _targetRelayUrls = <String>[];
+  final Map<String, _ReconnectState> _reconnectState = {};
+  bool _closed = false;
   int _subscriptionCounter = 0;
 
+  /// Number of relays currently holding an open WebSocket.
+  final ValueNotifier<int> connectedRelayCount = ValueNotifier<int>(0);
+
+  /// Number of relays the caller asked us to connect to (target set size).
+  final ValueNotifier<int> targetRelayCount = ValueNotifier<int>(0);
+
+  /// True while [connect] is awaiting initial relay handshakes. UI uses this
+  /// to render a progress indicator without waiting for the future.
+  final ValueNotifier<bool> connecting = ValueNotifier<bool>(false);
+
   Future<void> connect(List<String> relayUrls) async {
-    await close();
-    await Future.wait<void>(relayUrls.map(_connectRelay));
+    await close(retainTargets: false);
+    _closed = false;
+    _targetRelayUrls
+      ..clear()
+      ..addAll(relayUrls);
+    targetRelayCount.value = relayUrls.length;
+    connecting.value = true;
+    try {
+      await Future.wait<void>(relayUrls.map(_connectRelay));
+    } finally {
+      connecting.value = false;
+    }
   }
 
   Future<void> _connectRelay(String relayUrl) async {
+    if (_closed) return;
     final uri = Uri.tryParse(relayUrl);
     if (uri == null || (uri.scheme != 'wss' && uri.scheme != 'ws')) {
       return;
     }
+    if (_relays.any((relay) => relay.uri == uri)) return;
+
     try {
       final channel = WebSocketChannel.connect(uri);
       await channel.ready.timeout(_connectTimeout);
@@ -45,20 +87,64 @@ class NostrClient {
       streamSub = channel.stream.listen(
         _handleRelayMessage,
         onError: (_) {},
-        onDone: () => _relays.removeWhere((relay) => relay.uri == uri),
+        onDone: () {
+          _relays.removeWhere((relay) => relay.uri == uri);
+          connectedRelayCount.value = _relays.length;
+          if (_autoReconnect) _scheduleReconnect(relayUrl);
+        },
         cancelOnError: false,
       );
       _relays.add(_RelayConnection(uri, channel, streamSub));
+      _reconnectState.remove(relayUrl);
+      connectedRelayCount.value = _relays.length;
+      // Replay every active subscription on this fresh connection so REQs
+      // sent before the relay was up still match server-side filters.
+      for (final record in _subscriptionRecords.values) {
+        if (!record.active) continue;
+        try {
+          channel.sink.add(
+            jsonEncode(<Object?>['REQ', record.id, record.filter]),
+          );
+        } catch (_) {}
+      }
     } catch (_) {
-      // Public relays are best-effort. Later phases surface aggregate errors.
+      if (_autoReconnect) _scheduleReconnect(relayUrl);
     }
   }
 
-  void publish(NostrEvent event) {
+  void _scheduleReconnect(String relayUrl) {
+    if (_closed) return;
+    if (!_targetRelayUrls.contains(relayUrl)) return;
+    final state = _reconnectState.putIfAbsent(
+      relayUrl,
+      () => _ReconnectState(_reconnectInitialDelay),
+    );
+    state.timer?.cancel();
+    final delay = state.delay;
+    final nextMs = min(
+      delay.inMilliseconds * 2,
+      _reconnectMaxDelay.inMilliseconds,
+    );
+    state.delay = Duration(milliseconds: nextMs);
+    state.timer = Timer(delay, () {
+      if (_closed) return;
+      if (!_targetRelayUrls.contains(relayUrl)) return;
+      unawaited(_connectRelay(relayUrl));
+    });
+  }
+
+  /// Returns the number of relays that accepted the wire. Zero means the
+  /// event was dropped on the floor — caller may retry once relays recover.
+  int publish(NostrEvent event) {
     final wire = jsonEncode(<Object?>['EVENT', event.toJson()]);
+    var delivered = 0;
     for (final relay in _relays) {
-      relay.channel.sink.add(wire);
+      try {
+        relay.channel.sink.add(wire);
+        delivered += 1;
+      } catch (_) {}
     }
+    return delivered;
   }
 
   NostrSubscription subscribe(
@@ -68,27 +154,55 @@ class NostrClient {
   }) {
     final subscriptionId = id ?? _nextSubscriptionId();
     _subscriptions[subscriptionId] = callback;
+    _subscriptionRecords[subscriptionId] = _SubscriptionRecord(
+      subscriptionId,
+      filter,
+    );
     final wire = jsonEncode(<Object?>['REQ', subscriptionId, filter]);
     for (final relay in _relays) {
-      relay.channel.sink.add(wire);
+      try {
+        relay.channel.sink.add(wire);
+      } catch (_) {}
     }
     return NostrSubscription._(subscriptionId, () {
+      final record = _subscriptionRecords.remove(subscriptionId);
+      record?.active = false;
       _subscriptions.remove(subscriptionId);
       final closeWire = jsonEncode(<Object?>['CLOSE', subscriptionId]);
       for (final relay in _relays) {
-        relay.channel.sink.add(closeWire);
+        try {
+          relay.channel.sink.add(closeWire);
+        } catch (_) {}
       }
     });
   }
 
-  Future<void> close() async {
+  Future<void> close({bool retainTargets = false}) async {
+    _closed = true;
     _subscriptions.clear();
+    for (final record in _subscriptionRecords.values) {
+      record.active = false;
+    }
+    _subscriptionRecords.clear();
     _seenEventIds.clear();
+    for (final state in _reconnectState.values) {
+      state.timer?.cancel();
+    }
+    _reconnectState.clear();
+    if (!retainTargets) {
+      _targetRelayUrls.clear();
+      targetRelayCount.value = 0;
+    }
     final relays = List<_RelayConnection>.from(_relays);
     _relays.clear();
+    connectedRelayCount.value = 0;
     for (final relay in relays) {
-      await relay.subscription.cancel();
-      await relay.channel.sink.close();
+      try {
+        await relay.subscription.cancel();
+      } catch (_) {}
+      try {
+        await relay.channel.sink.close();
+      } catch (_) {}
     }
   }
 
@@ -544,6 +658,21 @@ class _RelayConnection {
   final Uri uri;
   final WebSocketChannel channel;
   final StreamSubscription<dynamic> subscription;
+}
+
+class _SubscriptionRecord {
+  _SubscriptionRecord(this.id, this.filter);
+
+  final String id;
+  final NostrFilter filter;
+  bool active = true;
+}
+
+class _ReconnectState {
+  _ReconnectState(this.delay);
+
+  Duration delay;
+  Timer? timer;
 }
 
 class _Nip44MessageKeys {

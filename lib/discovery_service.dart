@@ -40,8 +40,16 @@ class DiscoveryService {
 
   DiscoveryService({required this.me});
 
-  List<PeerDevice> get peers {
-    final merged = <String, PeerDevice>{..._globalPeers, ..._peers};
+  List<PeerDevice> get peers => mergePeerMaps(_globalPeers, _peers);
+
+  /// LAN-wins merge: when the same `userId` exists in both maps, the LAN
+  /// entry overrides the global paired entry. Spec §"LAN remains first
+  /// choice" — used by [peers] and exposed for unit tests.
+  static List<PeerDevice> mergePeerMaps(
+    Map<String, PeerDevice> globalPeers,
+    Map<String, PeerDevice> lanPeers,
+  ) {
+    final merged = <String, PeerDevice>{...globalPeers, ...lanPeers};
     return merged.values.toList();
   }
 

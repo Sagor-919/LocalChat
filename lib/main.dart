@@ -67,7 +67,10 @@ Future<void> _restoreLanAfterLinkRecovery() async {
   await _discovery.rebindUdpSocket();
 }
 
-Future<GlobalDiscoveryV2> _ensureGlobalDiscovery() async {
+/// Sync init: construct [GlobalDiscoveryV2], wire listeners, register
+/// [ConnectionService] global hooks. Safe to call repeatedly. Returns the
+/// existing instance on subsequent calls.
+GlobalDiscoveryV2 _setupGlobalDiscoveryInstance() {
   final existing = _globalDiscovery;
   if (existing != null) return existing;
 
@@ -82,12 +85,17 @@ Future<GlobalDiscoveryV2> _ensureGlobalDiscovery() async {
     _connections.onMessage?.call(message.peerId, message.json);
   });
   _globalDisconnectSub = global.disconnectedPeerEvents.listen((peerId) {
-    _connections.onDisconnected?.call(peerId);
+    _connections.notifyGlobalDisconnect(peerId);
   });
   _connections.hasGlobalJsonTransport = global.isConnected;
   _connections.sendGlobalJson = global.sendJson;
   _connections.connectGlobalJson = global.connectToPeerId;
   _globalDiscovery = global;
+  return global;
+}
+
+Future<GlobalDiscoveryV2> _ensureGlobalDiscovery() async {
+  final global = _setupGlobalDiscoveryInstance();
   await global.reloadPeers();
   return global;
 }
@@ -643,9 +651,14 @@ Future<void> main(List<String> args) async {
     }
   });
 
-  await _configureGlobalDiscoveryFromSettings();
+  // Construct + wire the Global Discovery instance synchronously so the
+  // first HomeScreen build sees a non-null reference. Relay handshake and
+  // paired-peer load run after [runApp] to avoid blocking cold start.
+  _setupGlobalDiscoveryInstance();
 
   runApp(const LocalChatApp());
+
+  unawaited(_configureGlobalDiscoveryFromSettings());
 }
 
 /// Path relative to `data/flutter_assets/` — [tray_manager] builds the real path.

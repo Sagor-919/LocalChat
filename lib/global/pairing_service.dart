@@ -125,10 +125,18 @@ class PairingService {
             !_messageIsFresh(message)) {
           return;
         }
+        // Claim atomically so concurrent matching offers do not double-publish.
         acceptedOffer = true;
         final peer = message.toPeer();
         _deriveSas(peer.xPub).then((sas) async {
-          await _publishAcceptBurst(topic: topic, sas: sas);
+          final delivered = await _publishAcceptBurst(topic: topic, sas: sas);
+          if (delivered == 0) {
+            // No relay accepted our accept — initiator will never see it.
+            // Release the claim so the next offer attempt (initiator retries
+            // every ~3s) can publish once relays recover.
+            acceptedOffer = false;
+            return;
+          }
           if (!completer.isCompleted) {
             completer.complete(
               PairingSession(
@@ -152,11 +160,14 @@ class PairingService {
     }
   }
 
-  Future<void> _publishAcceptBurst({
+  /// Publishes the first accept inline so the caller can confirm at least
+  /// one relay accepted the event. Subsequent retries fire on the burst
+  /// delays without blocking. Returns the relay count of the *first* publish.
+  Future<int> _publishAcceptBurst({
     required String topic,
     required String sas,
   }) async {
-    Future<void> publishAccept() {
+    Future<int> publishAccept() {
       return _publishPairingMessage(
         topic: topic,
         message: PairingMessage.accept(
@@ -169,10 +180,11 @@ class PairingService {
       );
     }
 
-    await publishAccept();
+    final firstDelivered = await publishAccept();
     for (final delay in _acceptBurstDelays) {
       unawaited(Future<void>.delayed(delay, publishAccept));
     }
+    return firstDelivered;
   }
 
   Future<void> confirm(PairingSession session) async {
@@ -182,7 +194,7 @@ class PairingService {
     await _peerStore.savePeer(session.peer);
   }
 
-  Future<void> _publishPairingMessage({
+  Future<int> _publishPairingMessage({
     required String topic,
     required PairingMessage message,
   }) async {
@@ -195,7 +207,7 @@ class PairingService {
       content: jsonEncode(message.toJson()),
       createdAt: _secondsNow(),
     );
-    nostr.publish(event);
+    return nostr.publish(event);
   }
 
   Future<String> _deriveSas(List<int> peerXPub) {

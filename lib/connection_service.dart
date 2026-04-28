@@ -277,6 +277,15 @@ class ConnectionService {
       isLanConnected(peerId) || hasGlobalJsonTransport?.call(peerId) == true;
   bool isFileTransferAvailable(String peerId) => isLanConnected(peerId);
 
+  /// Surface a global-transport disconnect through the shared
+  /// [disconnectedPeerEvents] stream so home / chat refresh exactly like a
+  /// LAN TCP loss. No-op while LAN TCP is still up — LAN remains the source
+  /// of truth for that peer.
+  void notifyGlobalDisconnect(String peerId) {
+    if (_sockets.containsKey(peerId)) return;
+    _notifyDisconnected(peerId);
+  }
+
   /// At least one active chat TCP session (used for Android background wake hint).
   bool get hasActiveTcpPeers => _sockets.isNotEmpty;
 

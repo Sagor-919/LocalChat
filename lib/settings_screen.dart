@@ -532,13 +532,17 @@ class _SettingsScreenState extends State<SettingsScreen>
                     ),
                     secondary: Icon(Icons.public, color: cs.primary),
                     title: const Text('Global Discovery'),
-                    subtitle: Text(enabled ? 'Enabled' : 'Disabled'),
+                    subtitle: _buildGlobalDiscoverySubtitle(enabled, global),
                     value: enabled,
                     onChanged: _globalBusy || global == null
                         ? null
                         : (v) => unawaited(_setGlobalDiscovery(v)),
                   ),
+                  if (_globalBusy)
+                    const LinearProgressIndicator(minHeight: 2),
                   if (global != null) ...[
+                    const Divider(height: 1),
+                    _buildRelayStatusTile(global, cs),
                     const Divider(height: 1),
                     ListTile(
                       leading: Icon(Icons.fingerprint, color: cs.primary),
@@ -615,6 +619,90 @@ class _SettingsScreenState extends State<SettingsScreen>
           ),
         ),
       ],
+    );
+  }
+
+  Widget _buildGlobalDiscoverySubtitle(
+    bool enabled,
+    GlobalDiscoveryV2? global,
+  ) {
+    if (!enabled) return const Text('Disabled');
+    if (global == null) return const Text('Initializing…');
+    return ValueListenableBuilder<bool>(
+      valueListenable: global.nostr.connecting,
+      builder: (_, connecting, _) {
+        if (connecting) return const Text('Connecting to relays…');
+        return ValueListenableBuilder<int>(
+          valueListenable: global.nostr.connectedRelayCount,
+          builder: (_, count, _) {
+            return ValueListenableBuilder<int>(
+              valueListenable: global.nostr.targetRelayCount,
+              builder: (_, total, _) {
+                if (total == 0) return const Text('Enabled');
+                return Text(
+                  count > 0
+                      ? 'Enabled · $count / $total relays online'
+                      : 'Enabled · no relays reachable',
+                );
+              },
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _buildRelayStatusTile(GlobalDiscoveryV2 global, ColorScheme cs) {
+    return ValueListenableBuilder<int>(
+      valueListenable: global.nostr.connectedRelayCount,
+      builder: (_, count, _) {
+        return ValueListenableBuilder<int>(
+          valueListenable: global.nostr.targetRelayCount,
+          builder: (_, total, _) {
+            return ValueListenableBuilder<bool>(
+              valueListenable: global.nostr.connecting,
+              builder: (_, connecting, _) {
+                final IconData icon;
+                final Color iconColor;
+                final String status;
+                if (total == 0) {
+                  icon = Icons.cloud_off_outlined;
+                  iconColor = cs.outline;
+                  status = 'Off';
+                } else if (connecting && count == 0) {
+                  icon = Icons.cloud_sync_outlined;
+                  iconColor = cs.primary;
+                  status = 'Connecting…';
+                } else if (count == 0) {
+                  icon = Icons.cloud_off_outlined;
+                  iconColor = cs.error;
+                  status = 'No relays reachable';
+                } else if (count < total) {
+                  icon = Icons.cloud_queue_outlined;
+                  iconColor = cs.primary;
+                  status = '$count of $total relays online';
+                } else {
+                  icon = Icons.cloud_done_outlined;
+                  iconColor = cs.primary;
+                  status = '$count of $total relays online';
+                }
+                return ListTile(
+                  leading: Icon(icon, color: iconColor),
+                  title: const Text('Relay status'),
+                  subtitle: Text(status),
+                  trailing: connecting
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : null,
+                );
+              },
+            );
+          },
+        );
+      },
     );
   }
 

@@ -10,6 +10,66 @@ import 'package:local_chat/global/nostr_client.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
+  test('LAN online peer wins over global paired peer with same userId', () {
+    final shared = 'shared-user-id';
+    final global = PeerDevice(
+      userId: shared,
+      name: 'Global Name',
+      ip: '',
+      port: 0,
+      lastSeen: DateTime.fromMillisecondsSinceEpoch(0),
+    );
+    final lan = PeerDevice(
+      userId: shared,
+      name: 'LAN Name',
+      ip: '192.168.1.42',
+      port: 4041,
+      lastSeen: DateTime.fromMillisecondsSinceEpoch(1),
+    );
+
+    final merged = DiscoveryService.mergePeerMaps(
+      <String, PeerDevice>{shared: global},
+      <String, PeerDevice>{shared: lan},
+    );
+
+    expect(merged, hasLength(1));
+    expect(merged.single.ip, '192.168.1.42');
+    expect(merged.single.name, 'LAN Name');
+    expect(merged.single.port, 4041);
+  });
+
+  test('Global-only peer survives merge when no LAN entry exists', () {
+    final globalOnly = PeerDevice(
+      userId: 'only-global',
+      name: 'Remote',
+      ip: '',
+      port: 0,
+      lastSeen: DateTime.fromMillisecondsSinceEpoch(0),
+    );
+    final merged = DiscoveryService.mergePeerMaps(
+      <String, PeerDevice>{'only-global': globalOnly},
+      <String, PeerDevice>{},
+    );
+    expect(merged.single.userId, 'only-global');
+    expect(merged.single.ip, isEmpty);
+  });
+
+  test('ConnectionService.notifyGlobalDisconnect surfaces on stream', () async {
+    final service = ConnectionService(me: _device('me'));
+    final received = <String>[];
+    final sub = service.disconnectedPeerEvents.listen(received.add);
+
+    var cb = 0;
+    service.onDisconnected = (_) => cb++;
+    service.notifyGlobalDisconnect('peer-x');
+    await Future<void>.delayed(Duration.zero);
+
+    expect(received, ['peer-x']);
+    expect(cb, 1);
+    await sub.cancel();
+    await service.stop();
+  });
+
   test('DiscoveryService merges global peers without replacing LAN peers', () {
     final service = DiscoveryService(me: _device('me'));
     final global = PeerDevice(

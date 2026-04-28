@@ -152,8 +152,9 @@ class _CountingNostrClient extends NostrClient {
   var publishCount = 0;
 
   @override
-  void publish(NostrEvent event) {
+  int publish(NostrEvent event) {
     publishCount++;
+    return 0;
   }
 }
 
@@ -163,8 +164,9 @@ class _LoopbackNostrClient extends NostrClient {
   final _LoopbackRelayBus bus;
 
   @override
-  void publish(NostrEvent event) {
+  int publish(NostrEvent event) {
     bus.publish(event);
+    return 1;
   }
 
   @override

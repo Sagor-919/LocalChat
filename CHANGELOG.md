@@ -5,6 +5,12 @@
 - Added optional Global Discovery V5: pairing, Nostr rendezvous, WebRTC data channel setup, and Noise-framed global text transport.
 - Kept V4 LAN discovery, TCP chat, SQLite message history, notifications, and file transfer as the authoritative systems.
 - Global file transfer remains disabled until a `TransferManager` data-channel adapter is implemented.
+- Settings now show live relay status (count, connecting / no-relay state) and a progress bar while toggling Global Discovery.
+- `NostrClient` keeps a target relay set and reconnects with exponential backoff after WebSocket drops; active subscriptions replay automatically on each fresh relay connection.
+- Pairing screen blocks publish/join when no relays are reachable and surfaces a relay-health banner so "shows nothing" failures explain themselves.
+- Pairing responder no longer commits a session when its accept event was dropped on the floor (zero relays); it releases the claim so the next initiator offer can retry.
+- Global-only peer disconnect events now flow through `ConnectionService.disconnectedPeerEvents`, refreshing Home / Chat lists like a LAN TCP loss.
+- Cold start no longer awaits Nostr relay handshakes before `runApp`; the Global Discovery instance is wired synchronously and connect runs in the background.
 
 ---
 

@@ -26,7 +26,19 @@ class _PairingScreenState extends State<PairingScreen> {
     super.dispose();
   }
 
+  bool _relaysReachable() {
+    final nostr = widget.service.nostr;
+    return nostr.connectedRelayCount.value > 0 || nostr.connecting.value;
+  }
+
   Future<void> _startInitiator() async {
+    if (!_relaysReachable()) {
+      setState(
+        () => _error =
+            'No relays connected. Check internet, then enable Global Discovery again.',
+      );
+      return;
+    }
     setState(() {
       _busy = true;
       _error = null;
@@ -48,6 +60,13 @@ class _PairingScreenState extends State<PairingScreen> {
 
   Future<void> _joinResponder() async {
     final code = _codeController.text.trim();
+    if (!_relaysReachable()) {
+      setState(
+        () => _error =
+            'No relays connected. Check internet, then enable Global Discovery again.',
+      );
+      return;
+    }
     setState(() {
       _busy = true;
       _error = null;
@@ -111,6 +130,7 @@ class _PairingScreenState extends State<PairingScreen> {
   Widget _buildShowCode(ColorScheme cs) {
     return _pairingBody(
       children: [
+        _buildRelayHealth(cs),
         if (_visibleCode != null)
           SelectableText(
             _visibleCode!,
@@ -135,6 +155,7 @@ class _PairingScreenState extends State<PairingScreen> {
   Widget _buildEnterCode(ColorScheme cs) {
     return _pairingBody(
       children: [
+        _buildRelayHealth(cs),
         TextField(
           controller: _codeController,
           keyboardType: TextInputType.number,
@@ -170,6 +191,64 @@ class _PairingScreenState extends State<PairingScreen> {
 
   Widget _pairingBody({required List<Widget> children}) {
     return ListView(padding: const EdgeInsets.all(20), children: children);
+  }
+
+  Widget _buildRelayHealth(ColorScheme cs) {
+    final nostr = widget.service.nostr;
+    return ValueListenableBuilder<int>(
+      valueListenable: nostr.connectedRelayCount,
+      builder: (_, count, _) {
+        return ValueListenableBuilder<int>(
+          valueListenable: nostr.targetRelayCount,
+          builder: (_, total, _) {
+            return ValueListenableBuilder<bool>(
+              valueListenable: nostr.connecting,
+              builder: (_, connecting, _) {
+                final healthy = count > 0;
+                final waiting = !healthy && (connecting || total == 0);
+                final Color color;
+                final IconData icon;
+                final String text;
+                if (healthy) {
+                  color = cs.primary;
+                  icon = Icons.cloud_done_outlined;
+                  text = total > 0
+                      ? '$count of $total relays online'
+                      : '$count relays online';
+                } else if (waiting) {
+                  color = cs.outline;
+                  icon = Icons.cloud_sync_outlined;
+                  text = 'Connecting to relays…';
+                } else {
+                  color = cs.error;
+                  icon = Icons.cloud_off_outlined;
+                  text = 'No relays reachable. Pairing will fail.';
+                }
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: Row(
+                    children: [
+                      Icon(icon, size: 18, color: color),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          text,
+                          style: TextStyle(
+                            color: color,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              },
+            );
+          },
+        );
+      },
+    );
   }
 
   Widget _waitingText(ColorScheme cs, String text) {
