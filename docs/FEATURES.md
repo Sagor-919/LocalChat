@@ -52,6 +52,27 @@ This document maps **user-visible behavior** to **code** so testers and contribu
 | Text messages | Uses the same `MessageStore` and ACK flow as LAN. LAN TCP keeps `ChatCrypto`; global text rides inside Noise. | [`lib/main.dart`](../lib/main.dart), [`lib/chat_screen.dart`](../lib/chat_screen.dart), [`lib/message_store.dart`](../lib/message_store.dart) |
 | Files | Global-only peers cannot send files until `TransferManager` has a data-channel adapter. | [`lib/chat_screen.dart`](../lib/chat_screen.dart), [`lib/transfer_manager.dart`](../lib/transfer_manager.dart) |
 | Limit | No TURN server; some NAT combinations fail. | [`GLOBAL_DISCOVERY_SPEC.md`](../GLOBAL_DISCOVERY_SPEC.md) |
+| Feature gate | Single compile-time + runtime switch. When off, bootstrap skips Nostr / WebRTC, the settings UI hides the Global Discovery section, and `ConnectionService` falls back to LAN-only. Reserved as the integration point for the upcoming Pro entitlement check. | [`lib/global/global_discovery_feature.dart`](../lib/global/global_discovery_feature.dart) |
+
+### Disabling Global Discovery in a build
+
+Global Discovery is wrapped behind `GlobalDiscoveryFeature.isAvailable` so it can be turned off without touching V4 LAN code. Three knobs, in increasing scope:
+
+1. **Per-build kill-switch** — strip from any single build via `--dart-define`:
+
+   ```
+   flutter build apk --dart-define=GLOBAL_DISCOVERY=false
+   flutter build web --dart-define=GLOBAL_DISCOVERY=false
+   flutter build ios --dart-define=GLOBAL_DISCOVERY=false
+   ```
+
+   `isCompiledIn` becomes a `const false`; AOT tree-shaking drops the dead branches and most of `lib/global/*` from the binary.
+
+2. **Default-off for every build** — flip `defaultValue: true` to `false` in `lib/global/global_discovery_feature.dart`. Devs / CI re-enable per-build with `--dart-define=GLOBAL_DISCOVERY=true`.
+
+3. **Pro entitlement gate** — when the purchase system lands, change `_runtimeUnlocked = true` to `false` and have the entitlement layer call `GlobalDiscoveryFeature.setRuntimeUnlocked(true)` after a successful purchase / restore. No call sites change.
+
+When the gate is off the app behaves exactly like a LAN-only build: settings has no Global Discovery card, `_globalDiscovery` stays `null`, `replaceGlobalPeers([])` is the only thing `DiscoveryService` ever sees from the global side, and the V4 contracts in `GLOBAL_DISCOVERY_SPEC.md` are honored by construction.
 
 ---
 

@@ -73,6 +73,40 @@ Implemented phases on V5:
 - Phase 4: Nostr rendezvous messages for WebRTC signaling.
 - Phase 5: WebRTC session wrapper and STUN configuration.
 - Phase 6: Noise-style identity-pinned overlay over WebRTC data-channel frames.
+- Phase 9: feature gate (`lib/global/global_discovery_feature.dart`) wraps the
+  entire subsystem behind `GlobalDiscoveryFeature.isAvailable`. When off,
+  bootstrap skips the Nostr + WebRTC stack, settings hides the Global
+  Discovery card, and `ConnectionService` global hooks remain unset so the
+  app behaves identically to a LAN-only build. Reserved as the integration
+  point for the future Pro entitlement check.
+
+## Feature Gate (Pro readiness)
+
+Global Discovery must be toggleable at build time and runtime so it can ship
+as a Pro feature and be stripped from cross-platform builds where the Nostr
++ WebRTC stack is undesirable (e.g. locked-down distributions).
+
+Contract:
+
+- `GlobalDiscoveryFeature.isCompiledIn` is a `const bool` populated from
+  `--dart-define=GLOBAL_DISCOVERY=...`. When `false`, AOT tree-shaking
+  removes the dead branches in `main.dart` and the settings UI.
+- `GlobalDiscoveryFeature.isAvailable` is the runtime getter. Today it is
+  `isCompiledIn && _runtimeUnlocked`. The Pro entitlement system plugs into
+  `setRuntimeUnlocked(...)`; no other call site changes.
+- `main.dart` early-returns from `_setupGlobalDiscoveryInstance`,
+  `_ensureGlobalDiscovery`, `_setGlobalDiscoveryEnabled`,
+  `_configureGlobalDiscoveryFromSettings`, and `_syncGlobalDiscoveryPeers`
+  when `!isAvailable`. `_globalDiscovery` stays `null`, the
+  `ConnectionService` global hooks stay unset, and `DiscoveryService`
+  receives `replaceGlobalPeers(const [])` only.
+- `settings_screen.dart` hides its Global Discovery section behind
+  `if (GlobalDiscoveryFeature.isAvailable)`; the rest of the screen is
+  identical to a LAN-only build.
+- LAN systems (`MessageStore`, `ConnectionService`, `DiscoveryService`,
+  `TransferManager`, `ChatCrypto`, `home_screen` peer merge) are not aware
+  of the gate. The non-negotiable V4 contracts hold whether the gate is on
+  or off.
 
 Remaining V5 phases must be adapted to V4:
 

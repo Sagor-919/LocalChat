@@ -14,6 +14,7 @@ import 'app_branding.dart';
 import 'app_metadata.dart';
 import 'app_settings.dart';
 import 'app_snackbar.dart';
+import 'global/global_discovery_feature.dart';
 import 'global/global_discovery_v2.dart';
 import 'global/global_peer_store.dart';
 import 'global/pairing_service.dart';
@@ -168,8 +169,10 @@ class _SettingsScreenState extends State<SettingsScreen>
           ),
           const SizedBox(height: 16),
 
-          _buildGlobalDiscoverySection(context, isDark, cs),
-          const SizedBox(height: 16),
+          if (GlobalDiscoveryFeature.isAvailable) ...[
+            _buildGlobalDiscoverySection(context, isDark, cs),
+            const SizedBox(height: 16),
+          ],
 
           if (_isAndroid) ...[
             _sectionLabel(context, 'BACKGROUND & BATTERY'),

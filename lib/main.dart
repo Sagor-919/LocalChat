@@ -22,6 +22,7 @@ import 'device.dart';
 import 'staged_from_drop.dart';
 import 'first_launch_prompt.dart';
 import 'discovery_service.dart';
+import 'global/global_discovery_feature.dart';
 import 'global/global_discovery_v2.dart';
 import 'global/global_peer_store.dart';
 import 'global/identity.dart';
@@ -70,8 +71,10 @@ Future<void> _restoreLanAfterLinkRecovery() async {
 
 /// Sync init: construct [GlobalDiscoveryV2], wire listeners, register
 /// [ConnectionService] global hooks. Safe to call repeatedly. Returns the
-/// existing instance on subsequent calls.
-GlobalDiscoveryV2 _setupGlobalDiscoveryInstance() {
+/// existing instance on subsequent calls, or `null` when Global Discovery
+/// is disabled at the build level (see [GlobalDiscoveryFeature]).
+GlobalDiscoveryV2? _setupGlobalDiscoveryInstance() {
+  if (!GlobalDiscoveryFeature.isAvailable) return null;
   final existing = _globalDiscovery;
   if (existing != null) return existing;
 
@@ -95,15 +98,18 @@ GlobalDiscoveryV2 _setupGlobalDiscoveryInstance() {
   return global;
 }
 
-Future<GlobalDiscoveryV2> _ensureGlobalDiscovery() async {
+Future<GlobalDiscoveryV2?> _ensureGlobalDiscovery() async {
   final global = _setupGlobalDiscoveryInstance();
+  if (global == null) return null;
   await global.reloadPeers();
   return global;
 }
 
 Future<void> _setGlobalDiscoveryEnabled(bool enabled) async {
+  if (!GlobalDiscoveryFeature.isAvailable) return;
   await AppSettings.instance.setGlobalDiscoveryEnabled(enabled);
   final global = await _ensureGlobalDiscovery();
+  if (global == null) return;
   if (enabled) {
     await global.start();
   } else {
@@ -114,7 +120,9 @@ Future<void> _setGlobalDiscoveryEnabled(bool enabled) async {
 }
 
 Future<void> _configureGlobalDiscoveryFromSettings() async {
+  if (!GlobalDiscoveryFeature.isAvailable) return;
   final global = await _ensureGlobalDiscovery();
+  if (global == null) return;
   if (AppSettings.instance.globalDiscoveryEnabled.value) {
     await global.start();
   }
@@ -123,7 +131,9 @@ Future<void> _configureGlobalDiscoveryFromSettings() async {
 
 void _syncGlobalDiscoveryPeers() {
   final global = _globalDiscovery;
-  if (global == null || !AppSettings.instance.globalDiscoveryEnabled.value) {
+  if (!GlobalDiscoveryFeature.isAvailable ||
+      global == null ||
+      !AppSettings.instance.globalDiscoveryEnabled.value) {
     _discovery.replaceGlobalPeers(const <PeerDevice>[]);
     return;
   }
@@ -698,6 +708,10 @@ Future<void> _bootstrapServices() async {
   // bootstrap sees a non-null reference. Relay handshake + paired-peer
   // load run via [_configureGlobalDiscoveryFromSettings] without blocking
   // the rest of bootstrap completion.
+  //
+  // Both calls early-return when [GlobalDiscoveryFeature.isAvailable] is
+  // false, so LAN-only / cross-platform builds skip the Nostr + WebRTC
+  // stack entirely.
   _setupGlobalDiscoveryInstance();
   unawaited(_configureGlobalDiscoveryFromSettings());
 }

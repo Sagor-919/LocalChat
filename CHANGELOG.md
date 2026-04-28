@@ -2,6 +2,8 @@
 
 ## Unreleased - Dev-LocalChatV5-GlobalDiscovery
 
+- Added a single feature gate (`lib/global/global_discovery_feature.dart`) that wraps Global Discovery behind `GlobalDiscoveryFeature.isAvailable`. Builds can strip the Nostr + WebRTC stack via `--dart-define=GLOBAL_DISCOVERY=false`; default stays `true` so V5 dev builds and tests are unchanged. Reserved as the integration point for the upcoming Pro entitlement check (`setRuntimeUnlocked`).
+- `main.dart` bootstrap, enable/disable callback, and peer-sync helper early-return when the gate is off; `_globalDiscovery` stays `null` and `ConnectionService` falls back to LAN-only. `settings_screen.dart` hides its Global Discovery card when the gate is off. LAN behavior (V4 contracts in `GLOBAL_DISCOVERY_SPEC.md`) is unchanged either way.
 - Added optional Global Discovery V5: pairing, Nostr rendezvous, WebRTC data channel setup, and Noise-framed global text transport.
 - Kept V4 LAN discovery, TCP chat, SQLite message history, notifications, and file transfer as the authoritative systems.
 - Global file transfer remains disabled until a `TransferManager` data-channel adapter is implemented.
