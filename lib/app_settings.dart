@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -55,24 +56,30 @@ class AppSettings {
       _prefs.getStringList(_kGlobalDiscoveryRelays),
     );
 
-    if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
+    if (!kIsWeb && (Platform.isWindows || Platform.isLinux || Platform.isMacOS)) {
       desktopRunInBackground.value =
           _prefs.getBool('desktop_run_in_background') ?? true;
     }
 
-    final savedPath = _prefs.getString('download_path');
-    if (savedPath == null || savedPath.isEmpty) {
-      final path = await ensureLocalChatDownloadDirectory();
-      downloadPath.value = path;
-      await _prefs.setString('download_path', path);
+    if (kIsWeb) {
+      // Web has no filesystem download path; downloads go through the
+      // browser. Skip dart:io directory creation entirely.
+      downloadPath.value = _prefs.getString('download_path') ?? '';
     } else {
-      downloadPath.value = savedPath;
-      try {
-        await Directory(savedPath).create(recursive: true);
-      } catch (_) {}
+      final savedPath = _prefs.getString('download_path');
+      if (savedPath == null || savedPath.isEmpty) {
+        final path = await ensureLocalChatDownloadDirectory();
+        downloadPath.value = path;
+        await _prefs.setString('download_path', path);
+      } else {
+        downloadPath.value = savedPath;
+        try {
+          await Directory(savedPath).create(recursive: true);
+        } catch (_) {}
+      }
     }
 
-    if (Platform.isWindows) {
+    if (!kIsWeb && Platform.isWindows) {
       startWithWindows.value = await _readStartupRegistry();
     }
   }
@@ -104,7 +111,8 @@ class AppSettings {
   }
 
   Future<void> setDesktopRunInBackground(bool enabled) async {
-    if (!(Platform.isWindows || Platform.isLinux || Platform.isMacOS)) {
+    if (kIsWeb ||
+        !(Platform.isWindows || Platform.isLinux || Platform.isMacOS)) {
       return;
     }
     desktopRunInBackground.value = enabled;
@@ -127,7 +135,7 @@ class AppSettings {
   }
 
   Future<void> setStartWithWindows(bool enabled) async {
-    if (!Platform.isWindows) return;
+    if (kIsWeb || !Platform.isWindows) return;
     startWithWindows.value = enabled;
     final exe = Platform.resolvedExecutable;
 
@@ -188,6 +196,7 @@ class AppSettings {
   }
 
   static Future<String> ensureLocalChatDownloadDirectory() async {
+    if (kIsWeb) return '';
     const rootName = 'LocalChat Folder';
     const downloadsName = 'Downloads';
     if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {

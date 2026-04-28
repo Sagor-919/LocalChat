@@ -239,6 +239,13 @@ class MessageStore {
   }
 
   static Future<String> _resolveDataDir() async {
+    if (kIsWeb) {
+      throw UnsupportedError(
+        'MessageStore (sqflite) is not supported on Flutter web. '
+        'Build for desktop / mobile, or wire a web-compatible storage '
+        'backend before init().',
+      );
+    }
     if (Platform.isWindows) {
       final dir = Platform.environment['LOCALAPPDATA'] ??
           Platform.environment['APPDATA'];

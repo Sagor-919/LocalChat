@@ -11,6 +11,10 @@
 - Pairing responder no longer commits a session when its accept event was dropped on the floor (zero relays); it releases the claim so the next initiator offer can retry.
 - Global-only peer disconnect events now flow through `ConnectionService.disconnectedPeerEvents`, refreshing Home / Chat lists like a LAN TCP loss.
 - Cold start no longer awaits Nostr relay handshakes before `runApp`; the Global Discovery instance is wired synchronously and connect runs in the background.
+- Two-phase boot: the splash screen now renders on the very first Flutter frame while identity load, SQLite open, socket binds, file-receiver, notifications, and global discovery setup run behind it. Cold-start UI feel is effectively instant on every platform.
+- Bootstrap I/O is parallelized: identity / device info / message store run together, then TCP + UDP + transfer-receiver + notifications init together. Total wall time drops to roughly the slowest single step instead of the sum.
+- New web pre-splash in `web/index.html` plus a Dart-level `AppBootError` screen so the web build no longer shows a blank white page; sqflite / dart:io failures surface a readable diagnostic instead of crashing silently.
+- Web platform guards in `app_settings.dart` and `device.dart` so SharedPreferences-only paths (theme, identity, paired peers) initialize without dart:io. LAN, file transfer, and SQLite history remain desktop / mobile only and now exit through the bootstrap error path with a clear message.
 
 ---
 

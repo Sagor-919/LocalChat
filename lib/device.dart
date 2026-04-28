@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'dart:math';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
@@ -32,8 +33,13 @@ class DeviceInfo {
     if (saved != null && saved.isNotEmpty && !_isUnsuitableDisplayName(saved)) {
       name = saved;
     } else {
-      final host = Platform.localHostname.trim();
-      if (!_isUnsuitableDisplayName(host)) {
+      String host = '';
+      if (!kIsWeb) {
+        try {
+          host = Platform.localHostname.trim();
+        } catch (_) {}
+      }
+      if (host.isNotEmpty && !_isUnsuitableDisplayName(host)) {
         name = host;
       } else {
         name = _randomGamingName(id);
@@ -41,7 +47,12 @@ class DeviceInfo {
       await prefs.setString('device_name', name);
     }
 
-    final tag = await DeviceIdentityService.computeLanStableTag();
+    String tag = '';
+    if (!kIsWeb) {
+      try {
+        tag = await DeviceIdentityService.computeLanStableTag();
+      } catch (_) {}
+    }
     return DeviceInfo(userId: id, displayName: name, lanStableTag: tag);
   }
 

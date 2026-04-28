@@ -12,6 +12,7 @@ import 'package:window_manager/window_manager.dart';
 
 import 'app_branding.dart';
 import 'app_settings.dart';
+import 'app_splash.dart';
 import 'android_share_inbound.dart';
 import 'chat_crypto.dart';
 import 'chat_screen.dart';
@@ -474,7 +475,13 @@ NotificationDetails _incomingMessageNotificationDetails() {
 Future<void> main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  if (Platform.isWindows) {
+  // ---- Synchronous-ish prelude (~tens of ms) ----
+  // Goal: reach [runApp] as fast as possible so the splash paints first.
+  // Heavy I/O (identity, sqflite, sockets, notifications, paired peers)
+  // moves to [_bootstrapServices], which runs from [_LocalChatAppState]
+  // behind the splash.
+
+  if (!kIsWeb && Platform.isWindows) {
     _windowsAutostartLaunch = args.contains('--autostart');
   }
 
@@ -489,47 +496,34 @@ Future<void> main(List<String> args) async {
     }
   }
 
-  await AppSettings.instance.init();
-  if (Platform.isWindows && _windowsAutostartLaunch) {
-    _deferOnboardingUntilWindowShown =
-        !AppSettings.instance.firstLaunchOnboardingComplete;
-  }
-
   if (_isDesktop) {
-    await windowManager.ensureInitialized();
-    // Initializes ITaskbarList3; required before setProgressBar / taskbar APIs.
-    await windowManager.waitUntilReadyToShow();
-    const windowWidth = 420.0;
-    const windowHeight = 720.0;
-    await windowManager.setSize(const Size(windowWidth, windowHeight));
-    await windowManager.setMinimumSize(const Size(360, 500));
-    await windowManager.center();
-    await windowManager.setTitle('Local Chat');
-    await windowManager.setPreventClose(true);
-    if (Platform.isWindows && _windowsAutostartLaunch) {
-      await windowManager.hide();
-    } else {
-      await windowManager.show();
+    try {
+      await windowManager.ensureInitialized();
+      // Initializes ITaskbarList3; required before setProgressBar / taskbar APIs.
+      await windowManager.waitUntilReadyToShow();
+      const windowWidth = 420.0;
+      const windowHeight = 720.0;
+      await windowManager.setSize(const Size(windowWidth, windowHeight));
+      await windowManager.setMinimumSize(const Size(360, 500));
+      await windowManager.center();
+      await windowManager.setTitle('Local Chat');
+      await windowManager.setPreventClose(true);
+      if (Platform.isWindows && _windowsAutostartLaunch) {
+        await windowManager.hide();
+      } else {
+        await windowManager.show();
+      }
+    } catch (e, st) {
+      debugPrint('Window manager init failed: $e\n$st');
     }
   }
 
-  _globalIdentity = await LocalIdentity.loadOrCreate();
-  debugPrint('LocalChat global identity ed25519=${_globalIdentity.edPubHex}');
-  _me = await DeviceInfo.load();
-  _store = await MessageStore.init();
-  _discovery = DiscoveryService(me: _me);
-  _connections = ConnectionService(me: _me);
-  _discovery.hasActiveChatTcp = (id) => _connections.isConnected(id);
-  await _connections.startServer();
-  await _discovery.start();
+  runApp(const LocalChatApp());
+}
 
-  await TransferManager.instance.init(
-    connections: _connections,
-    store: _store,
-    myId: _me.userId,
-    notificationsPlugin: _notifications,
-  );
-
+/// Notifications plugin init is best-effort: failures should never block
+/// app startup. Wrapped so it can sit inside [Future.wait] in bootstrap.
+Future<void> _initNotificationsSafe() async {
   try {
     await _notifications.initialize(
       const InitializationSettings(
@@ -545,6 +539,55 @@ Future<void> main(List<String> args) async {
   } catch (e, st) {
     debugPrint('Local notifications init failed: $e\n$st');
   }
+}
+
+/// Heavy bootstrap: identity, message store, sockets, notifications, file
+/// transfer, global discovery. Runs from [_LocalChatAppState.initState] so
+/// the splash can paint before any of this work blocks the isolate.
+///
+/// On web most of this throws because the implementations rely on
+/// `dart:io` / `sqflite`; the caller catches and renders [AppBootError].
+Future<void> _bootstrapServices() async {
+  // AppSettings primes SharedPreferences and resolves the download
+  // directory; later steps reuse the same SharedPreferences instance.
+  await AppSettings.instance.init();
+  if (!kIsWeb && Platform.isWindows && _windowsAutostartLaunch) {
+    _deferOnboardingUntilWindowShown =
+        !AppSettings.instance.firstLaunchOnboardingComplete;
+  }
+
+  // Identity, device info, and message store are independent. Run them
+  // in parallel so we pay the max(disk-read, sqlite-open) instead of the
+  // sum. SharedPreferences is cached after the first call inside
+  // [AppSettings.init], so the parallel reads do not contend.
+  final initialResults = await Future.wait<Object>(<Future<Object>>[
+    LocalIdentity.loadOrCreate(),
+    DeviceInfo.load(),
+    MessageStore.init(),
+  ]);
+  _globalIdentity = initialResults[0] as LocalIdentity;
+  _me = initialResults[1] as DeviceInfo;
+  _store = initialResults[2] as MessageStore;
+  debugPrint('LocalChat global identity ed25519=${_globalIdentity.edPubHex}');
+
+  _discovery = DiscoveryService(me: _me);
+  _connections = ConnectionService(me: _me);
+  _discovery.hasActiveChatTcp = (id) => _connections.isConnected(id);
+
+  // TCP server + UDP discovery + transfer-receiver server bind sockets;
+  // independent, parallelize. Notification plugin init is unrelated and
+  // also runs in parallel.
+  await Future.wait<void>(<Future<void>>[
+    _connections.startServer(),
+    _discovery.start(),
+    TransferManager.instance.init(
+      connections: _connections,
+      store: _store,
+      myId: _me.userId,
+      notificationsPlugin: _notifications,
+    ),
+    _initNotificationsSafe(),
+  ]);
 
   _connections.onMessage = (peerId, json) {
     final type = json['type'] as String?;
@@ -651,13 +694,11 @@ Future<void> main(List<String> args) async {
     }
   });
 
-  // Construct + wire the Global Discovery instance synchronously so the
-  // first HomeScreen build sees a non-null reference. Relay handshake and
-  // paired-peer load run after [runApp] to avoid blocking cold start.
+  // Wire the Global Discovery instance so the HomeScreen rebuild after
+  // bootstrap sees a non-null reference. Relay handshake + paired-peer
+  // load run via [_configureGlobalDiscoveryFromSettings] without blocking
+  // the rest of bootstrap completion.
   _setupGlobalDiscoveryInstance();
-
-  runApp(const LocalChatApp());
-
   unawaited(_configureGlobalDiscoveryFromSettings());
 }
 
@@ -680,17 +721,48 @@ class _LocalChatAppState extends State<LocalChatApp>
     with WidgetsBindingObserver, TrayListener, WindowListener {
   StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
 
+  /// True once [_bootstrapServices] resolved; HomeScreen mounts only after
+  /// this flips. Splash renders until then so cold start feels instant.
+  bool _bootDone = false;
+  Object? _bootError;
+  StackTrace? _bootStackTrace;
+
   @override
   void initState() {
     super.initState();
-    _connectivitySub = Connectivity().onConnectivityChanged.listen(
-      _onConnectivityChanged,
-    );
-    unawaited(Connectivity().checkConnectivity().then(_onConnectivityChanged));
     WidgetsBinding.instance.addObserver(this);
     if (_isDesktop) {
       windowManager.addListener(this);
       trayManager.addListener(this);
+    }
+    unawaited(_runBootstrap());
+  }
+
+  Future<void> _runBootstrap() async {
+    try {
+      await _bootstrapServices();
+      if (!mounted) return;
+      setState(() => _bootDone = true);
+      _attachPostBootHooks();
+    } catch (e, st) {
+      debugPrint('LocalChat bootstrap failed: $e\n$st');
+      if (!mounted) return;
+      setState(() {
+        _bootError = e;
+        _bootStackTrace = st;
+      });
+    }
+  }
+
+  /// Wires connectivity, tray, onboarding, share-inbound, and cold-start
+  /// notification handling. Runs only after services exist so it never
+  /// reads `late` globals before they are assigned.
+  void _attachPostBootHooks() {
+    _connectivitySub = Connectivity().onConnectivityChanged.listen(
+      _onConnectivityChanged,
+    );
+    unawaited(Connectivity().checkConnectivity().then(_onConnectivityChanged));
+    if (_isDesktop) {
       WidgetsBinding.instance.addPostFrameCallback((_) async {
         await _initTray();
         await _syncDesktopNotifyForIncomingMessages();
@@ -709,7 +781,7 @@ class _LocalChatAppState extends State<LocalChatApp>
           await showFirstLaunchOnboardingIfNeeded(ctx);
         }
         if (!mounted) return;
-        if (Platform.isAndroid) {
+        if (!kIsWeb && Platform.isAndroid) {
           await AndroidShareInbound.syncFromNative();
         }
         unawaited(_tryOpenChatFromColdStartNotification());
@@ -861,7 +933,10 @@ class _LocalChatAppState extends State<LocalChatApp>
     _appInForeground =
         state == AppLifecycleState.resumed ||
         state == AppLifecycleState.inactive;
-    if (Platform.isAndroid) {
+    // Bootstrap may not have completed yet (cold start with the app already
+    // resumed). Skip work that touches `late` globals until services exist.
+    if (!_bootDone) return;
+    if (!kIsWeb && Platform.isAndroid) {
       if (state == AppLifecycleState.paused) {
         if (_connections.hasActiveTcpPeers) {
           unawaited(WakelockPlus.enable());
@@ -872,10 +947,28 @@ class _LocalChatAppState extends State<LocalChatApp>
     }
     if (state == AppLifecycleState.resumed) {
       unawaited(_discovery.recoverAfterNetworkOrResume());
-      if (Platform.isAndroid) {
+      if (!kIsWeb && Platform.isAndroid) {
         unawaited(AndroidShareInbound.syncFromNative());
       }
     }
+  }
+
+  Widget _buildHome() {
+    final error = _bootError;
+    if (error != null) {
+      return AppBootError(error: error, stackTrace: _bootStackTrace);
+    }
+    if (!_bootDone) {
+      return const AppSplash();
+    }
+    return HomeScreen(
+      me: _me,
+      discovery: _discovery,
+      connections: _connections,
+      store: _store,
+      globalDiscovery: _globalDiscovery,
+      onGlobalDiscoveryEnabledChanged: _setGlobalDiscoveryEnabled,
+    );
   }
 
   @override
@@ -898,14 +991,7 @@ class _LocalChatAppState extends State<LocalChatApp>
             brightness: Brightness.dark,
             useMaterial3: true,
           ),
-          home: HomeScreen(
-            me: _me,
-            discovery: _discovery,
-            connections: _connections,
-            store: _store,
-            globalDiscovery: _globalDiscovery,
-            onGlobalDiscoveryEnabledChanged: _setGlobalDiscoveryEnabled,
-          ),
+          home: _buildHome(),
         );
       },
     );
