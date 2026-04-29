@@ -33,6 +33,40 @@ Future<void> deletePartialDownloadFile(String? path) async {
   } catch (_) {}
 }
 
+bool _looksLikeFileAccessDenied(Object error) {
+  if (error is PathAccessException) return true;
+  if (error is FileSystemException) {
+    final ln =
+        '${error.message} ${error.osError?.message ?? ''}'.toLowerCase();
+    if (ln.contains('permission denied')) return true;
+    if (ln.contains('access is denied')) return true;
+    final c = error.osError?.errorCode;
+    if (c == 13 || c == 1) return true; // EACCES / EPERM (incl. Android)
+    if (c == 5 && Platform.isWindows) return true; // ERROR_ACCESS_DENIED
+  }
+  final s = error.toString().toLowerCase();
+  return s.contains('permission denied') ||
+      s.contains('errno = 13');
+}
+
+/// Turns raw [FileSystemException]s into a short hint (esp. Android scoped storage).
+String humanizeFileReceiverError(Object error) {
+  if (!_looksLikeFileAccessDenied(error)) {
+    return error.toString();
+  }
+  if (Platform.isAndroid) {
+    return 'Cannot write to your download folder — Android blocked access. '
+        'Open this app’s Settings → Download Location → Change; allow “All files access” '
+        'if the system asks, pick the folder again, then ask the sender to resend.';
+  }
+  if (Platform.isWindows) {
+    return 'Cannot write to the download folder (access denied). '
+        'Choose another folder under Settings → Download Location, then retry.';
+  }
+  return 'Cannot write to the download folder (permission denied). '
+      'Change Download location in Settings, then retry.';
+}
+
 // ---------------------------------------------------------------------------
 // Sender — opens a new TCP socket, sends header, waits for START, streams file
 // ---------------------------------------------------------------------------
@@ -445,7 +479,7 @@ class FileReceiver {
         return;
       }
       await deletePartialDownloadFile(savePath);
-      onFileError?.call(fileId, e.toString(), savePath);
+      onFileError?.call(fileId, humanizeFileReceiverError(e), savePath);
     } finally {
       try {
         await sub.cancel();
@@ -469,8 +503,29 @@ class FileReceiver {
       dir = Directory(dlPath);
       try {
         if (!await dir.exists()) await dir.create(recursive: true);
-      } catch (_) {
-        dir = Directory.systemTemp;
+      } catch (e) {
+        throw FileSystemException(
+          'Cannot access configured download folder',
+          dlPath,
+          e is OSError ? e : null,
+        );
+      }
+      final sep = Platform.pathSeparator;
+      final probePath =
+          '${dir.path}$sep.localchat_write_probe_${DateTime.now().microsecondsSinceEpoch}';
+      final probe = File(probePath);
+      try {
+        await probe.writeAsString('ok', flush: true);
+      } catch (e) {
+        throw FileSystemException(
+          'Cannot write to configured download folder',
+          dir.path,
+          e is OSError ? e : null,
+        );
+      } finally {
+        try {
+          if (await probe.exists()) await probe.delete();
+        } catch (_) {}
       }
     } else {
       dir = Directory.systemTemp;

@@ -30,6 +30,7 @@ import 'message_model.dart';
 import 'message_store.dart';
 import 'deferred_staged_file.dart';
 import 'desktop_drop_queue.dart';
+import 'settings_screen.dart';
 import 'staged_from_drop.dart';
 import 'transfer_manager.dart';
 
@@ -1709,6 +1710,15 @@ class _ChatScreenState extends State<ChatScreen> {
 
   static const _failedRed = Color(0xFFFF3B30);
   static const _cancelledAmber = Color(0xFFFF9500);
+  static bool _isPermissionLikeTransferError(String? error) {
+    final s = (error ?? '').toLowerCase();
+    if (s.isEmpty) return false;
+    return s.contains('cannot write') ||
+        s.contains('permission denied') ||
+        s.contains('access denied') ||
+        s.contains('android blocked access') ||
+        s.contains('all files access');
+  }
 
   Widget _buildBubble(BuildContext context, ChatMessage m) {
     final cs = Theme.of(context).colorScheme;
@@ -1844,6 +1854,51 @@ class _ChatScreenState extends State<ChatScreen> {
                   ),
                 ],
               ),
+              if (isFailed && (t.error ?? '').trim().isNotEmpty) ...[
+                const SizedBox(height: 6),
+                Text(
+                  (t.error ?? '').trim(),
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: subtleColor,
+                    height: 1.35,
+                  ),
+                  maxLines: 8,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
+              if (isFailed && !mine && _isPermissionLikeTransferError(t.error))
+                ...[
+                const SizedBox(height: 4),
+                Align(
+                  alignment: AlignmentDirectional.centerStart,
+                  child: TextButton(
+                    style: TextButton.styleFrom(
+                      padding: EdgeInsets.zero,
+                      minimumSize: Size.zero,
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      foregroundColor: cs.primary,
+                    ),
+                    onPressed: () {
+                      Navigator.of(context).push<void>(
+                        MaterialPageRoute<void>(
+                          builder: (_) =>
+                              SettingsScreen(store: widget.store),
+                        ),
+                      );
+                    },
+                    child: const Text(
+                      'Download folder & permissions',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                        decoration: TextDecoration.underline,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
               const SizedBox(height: 8),
               _actionButton(
                 label: 'Dismiss',
