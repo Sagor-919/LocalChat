@@ -1,0 +1,7 @@
+# Copy this to android/key.properties and fill real values.
+# Do NOT commit the real key.properties.
+storePassword=YOUR_STORE_PASSWORD
+keyPassword=YOUR_KEY_PASSWORD
+keyAlias=YOUR_KEY_ALIAS
+# Path is relative to android/ (rootProject in Gradle), e.g. key.jks or keystores/release.jks
+storeFile=key.jks

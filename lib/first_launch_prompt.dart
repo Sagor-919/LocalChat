@@ -8,6 +8,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'android_app_control.dart';
 import 'android_storage_access.dart';
 import 'app_settings.dart';
+import 'app_snackbar.dart';
 
 /// First open: notifications (mobile), storage (Android), then confirm or pick download folder.
 Future<void> showFirstLaunchOnboardingIfNeeded(BuildContext context) async {
@@ -177,13 +178,9 @@ Future<void> showFirstLaunchOnboardingIfNeeded(BuildContext context) async {
         final fallback = await AppSettings.ensureLocalChatDownloadDirectory();
         await AppSettings.instance.setDownloadPath(fallback);
         if (context.mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text(
-                'Could not write to that folder. Using LocalChat Folder → Downloads.',
-              ),
-              behavior: SnackBarBehavior.floating,
-            ),
+          showAppSnackBar(
+            context,
+            'Could not write to that folder. Using LocalChat Folder → Downloads.',
           );
         }
       }

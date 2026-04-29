@@ -5,11 +5,19 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 
+import 'services/device_identity_service.dart';
+
 class DeviceInfo {
   final String userId;
   String displayName;
+  /// Opaque LAN tag (from [DeviceIdentityService]); empty if unsupported.
+  final String lanStableTag;
 
-  DeviceInfo({required this.userId, required this.displayName});
+  DeviceInfo({
+    required this.userId,
+    required this.displayName,
+    this.lanStableTag = '',
+  });
 
   static Future<DeviceInfo> load() async {
     final prefs = await SharedPreferences.getInstance();
@@ -33,7 +41,8 @@ class DeviceInfo {
       await prefs.setString('device_name', name);
     }
 
-    return DeviceInfo(userId: id, displayName: name);
+    final tag = await DeviceIdentityService.computeLanStableTag();
+    return DeviceInfo(userId: id, displayName: name, lanStableTag: tag);
   }
 
   /// Hostnames like `localhost` after reinstall, or generic placeholders.
@@ -98,6 +107,8 @@ class PeerDevice {
   final String ip;
   final int port;
   DateTime lastSeen;
+  /// From discovery payload; null if legacy peer or wire omitted.
+  final String? lanStableTag;
 
   PeerDevice({
     required this.userId,
@@ -105,6 +116,7 @@ class PeerDevice {
     required this.ip,
     required this.port,
     required this.lastSeen,
+    this.lanStableTag,
   });
 
   Color get avatarColor {

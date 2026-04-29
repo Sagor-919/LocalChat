@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:desktop_drop/desktop_drop.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
@@ -10,6 +11,7 @@ import 'android_share_inbound.dart';
 import 'app_branding.dart';
 import 'chat_screen.dart';
 import 'connection_service.dart';
+import 'desktop_drop_queue.dart';
 import 'device.dart';
 import 'discovery_service.dart';
 import 'message_model.dart';
@@ -51,6 +53,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Timer? _discoveryDebounce;
 
   StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
+  StreamSubscription<String>? _tcpDisconnectSub;
   /// Null until the first [Connectivity.checkConnectivity] completes.
   List<ConnectivityResult>? _connectivityResults;
 
@@ -58,6 +61,23 @@ class _HomeScreenState extends State<HomeScreen> {
       _connectivityResults != null &&
       _connectivityResults!.length == 1 &&
       _connectivityResults!.first == ConnectivityResult.none;
+
+  bool get _supportsHomeFileDrop =>
+      !kIsWeb &&
+      (Platform.isWindows ||
+          Platform.isLinux ||
+          Platform.isMacOS ||
+          Platform.isAndroid);
+
+  void _onHomeFilesDropped(DropDoneDetails details) {
+    if (details.files.isEmpty) return;
+    // desktop_drop notifies every registered DropTarget; home stays mounted under chat.
+    // Only queue when this route is visible (see DropTarget.enable below).
+    final route = ModalRoute.of(context);
+    if (route == null || !route.isCurrent) return;
+    DesktopDropQueue.enqueue(details.files.map((x) => x.path));
+    if (mounted) setState(() {});
+  }
 
   void _onMessageHistoryRevision() {
     final sig = widget.store.consumePendingHistoryClear();
@@ -89,6 +109,12 @@ class _HomeScreenState extends State<HomeScreen> {
     });
 
     widget.discovery.onPeersChanged = _onDiscoveryPeersChanged;
+
+    _tcpDisconnectSub =
+        widget.connections.disconnectedPeerEvents.listen((_) {
+      if (!mounted) return;
+      unawaited(_refreshPeerList());
+    });
 
     unawaited(_initConnectivity());
 
@@ -138,13 +164,41 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _onDiscoveryPeersChanged() {
     _discoveryDebounce?.cancel();
-    _discoveryDebounce = Timer(const Duration(milliseconds: 400), () {
-      if (!mounted) return;
-      for (final p in widget.discovery.peers) {
-        unawaited(widget.store.savePeerInfo(p.userId, p.name, p.ip, p.port));
-      }
-      unawaited(_refreshPeerList());
+    _discoveryDebounce = Timer(const Duration(milliseconds: 160), () {
+      unawaited(_applyDiscoverySavesAndRefresh());
     });
+  }
+
+  /// LAN-tag merge (same device, new UUID), then persist discovery hints.
+  Future<void> _applyDiscoverySavesAndRefresh() async {
+    if (!mounted) return;
+    for (final p in widget.discovery.peers) {
+      final tag = p.lanStableTag?.trim() ?? '';
+      if (tag.isNotEmpty) {
+        final conflicts =
+            await widget.store.peerIdsMatchingLanTag(tag, p.userId);
+        for (final oldId in conflicts) {
+          await widget.store.mergePeerLanIdentity(
+            fromPeerId: oldId,
+            toPeerId: p.userId,
+            name: p.name,
+            ip: p.ip,
+            port: p.port,
+            lanStableTag: tag,
+          );
+          await widget.connections.disconnect(oldId);
+        }
+      }
+      await widget.store.savePeerInfo(
+        p.userId,
+        p.name,
+        p.ip,
+        p.port,
+        lanStableTag: p.lanStableTag,
+      );
+    }
+    if (!mounted) return;
+    await _refreshPeerList();
   }
 
   Future<void> _refreshPeerList() async {
@@ -249,6 +303,7 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void dispose() {
     _connectivitySub?.cancel();
+    _tcpDisconnectSub?.cancel();
     _discoveryDebounce?.cancel();
     widget.store.messageHistoryRevision.removeListener(_onMessageHistoryRevision);
     _fileMsgSub?.cancel();
@@ -333,9 +388,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final cs = Theme.of(context).colorScheme;
     final isDark = Theme.of(context).brightness == Brightness.dark;
 
-    final home = Scaffold(
-      backgroundColor: isDark ? cs.surface : const Color(0xFFF5F5FA),
-      body: SafeArea(
+    Widget body = SafeArea(
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -384,6 +437,54 @@ class _HomeScreenState extends State<HomeScreen> {
                   );
                 },
               ),
+            if (_supportsHomeFileDrop)
+              ValueListenableBuilder<int>(
+                valueListenable: DesktopDropQueue.revision,
+                builder: (context, rev, child) {
+                  final n = DesktopDropQueue.count;
+                  if (n <= 0) return const SizedBox.shrink();
+                  final cs2 = Theme.of(context).colorScheme;
+                  return Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                    child: Material(
+                      color: cs2.secondaryContainer,
+                      borderRadius: BorderRadius.circular(12),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 12, vertical: 10),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Icon(Icons.upload_file_rounded,
+                                size: 22, color: cs2.onSecondaryContainer),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                n == 1
+                                    ? '1 file to send — open a chat'
+                                    : '$n files to send — open a chat',
+                                style: TextStyle(
+                                  color: cs2.onSecondaryContainer,
+                                  fontSize: 13,
+                                  height: 1.35,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                            TextButton(
+                              onPressed: () {
+                                DesktopDropQueue.clear();
+                                if (mounted) setState(() {});
+                              },
+                              child: const Text('Dismiss'),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  );
+                },
+              ),
             Padding(
               padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
               child: _buildProfileCard(context),
@@ -410,7 +511,19 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ],
         ),
-      ),
+    );
+
+    if (_supportsHomeFileDrop) {
+      body = DropTarget(
+        enable: ModalRoute.of(context)?.isCurrent ?? true,
+        onDragDone: _onHomeFilesDropped,
+        child: body,
+      );
+    }
+
+    final home = Scaffold(
+      backgroundColor: isDark ? cs.surface : const Color(0xFFF5F5FA),
+      body: body,
     );
 
     final useAndroidBackToBg =

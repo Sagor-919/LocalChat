@@ -3,17 +3,25 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:path_provider/path_provider.dart';
 
 import 'connection_service.dart';
 import 'file_transfer_service.dart';
 import 'message_model.dart';
 import 'message_store.dart';
+import 'package:path/path.dart' as p;
+
+import 'android_share_inbound.dart';
+import 'attachment_prepare.dart';
+import 'deferred_staged_file.dart';
+
+enum OutgoingTransferPhase { preparing, transferring }
 
 class TransferState {
   final String fileId;
   final String peerId;
   final String fileName;
-  final int totalBytes;
+  int totalBytes;
   final bool isSending;
   String? filePath;
 
@@ -21,10 +29,16 @@ class TransferState {
   double progress = 0;
   String? error;
   bool cancelled = false;
+  bool cancelRequested = false;
   /// Paused mid-transfer (local); not an error — partial file kept on receiver.
   bool isPaused = false;
   FileSender? sender;
+  Process? prepProcess;
+  final List<String> tempPathsForCleanup = [];
+  OutgoingTransferPhase outgoingPhase;
   final Stopwatch stopwatch = Stopwatch()..start();
+  /// Shown in chat while [outgoingPhase] is [OutgoingTransferPhase.preparing].
+  String preparingStatus = '';
 
   TransferState({
     required this.fileId,
@@ -33,6 +47,7 @@ class TransferState {
     required this.totalBytes,
     required this.isSending,
     this.filePath,
+    this.outgoingPhase = OutgoingTransferPhase.transferring,
   });
 
   double get currentSpeed {
@@ -75,7 +90,6 @@ class TransferManager {
 
   late ConnectionService _connections;
   late MessageStore _store;
-  late String _myId;
   FileReceiver? _receiver;
   FlutterLocalNotificationsPlugin? _notifPlugin;
   Timer? _notifTimer;
@@ -92,7 +106,7 @@ class TransferManager {
   }) async {
     _connections = connections;
     _store = store;
-    _myId = myId;
+    assert(myId.isNotEmpty);
     if (!kIsWeb && Platform.isAndroid) {
       _notifPlugin = notificationsPlugin;
     }
@@ -124,65 +138,266 @@ class TransferManager {
     }
   }
 
-  /// Initiate sending a file to a peer. Creates the ChatMessage, stores it,
-  /// sends file_notify, and runs the FileSender in the background.
-  Future<void> sendFile({
+  void _cleanupOutgoingTemps(TransferState t) {
+    for (final path in t.tempPathsForCleanup) {
+      try {
+        final f = File(path);
+        if (f.existsSync()) f.deleteSync();
+      } catch (_) {}
+    }
+    t.tempPathsForCleanup.clear();
+  }
+
+  static String _sanitizeOutboundFilename(String name) {
+    final s = name.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_').trim();
+    if (s.isEmpty) return 'file';
+    return s.length > 120 ? s.substring(0, 120) : s;
+  }
+
+  /// Copy to app documents so we never store a path that [cleanupOutgoingTemps] will delete later.
+  Future<String> _persistOutboundFileToDocuments(
+    String sourcePath,
+    String messageId,
+    String attachmentName,
+  ) async {
+    final root = await getApplicationDocumentsDirectory();
+    final dir = Directory(p.join(root.path, 'outbound_attachments'));
+    if (!await dir.exists()) {
+      await dir.create(recursive: true);
+    }
+    final ext = p.extension(attachmentName);
+    final base = _sanitizeOutboundFilename(p.basenameWithoutExtension(attachmentName));
+    final destPath = p.join(dir.path, '${messageId}_$base$ext');
+    await File(sourcePath).copy(destPath);
+    return destPath;
+  }
+
+  /// [initialMessage] must already be in [MessageStore]. Prepares file (copy / folder zip), then sends.
+  Future<void> prepareAndSendOutbound({
+    required ChatMessage initialMessage,
     required String peerId,
     required String peerIp,
     String? peerDisplayName,
-    required String fileId,
-    required String fileName,
-    required String filePath,
-    required int fileSize,
-    int? timestamp,
+    required String sourcePath,
+    String? androidContentUri,
+    required StagedSourceKind kind,
+    required bool duplicatePathInBatch,
   }) async {
-    final msg = ChatMessage(
-      id: fileId,
-      senderId: _myId,
-      text: 'File: $fileName',
-      timestamp: timestamp ?? DateTime.now().millisecondsSinceEpoch,
-      isMine: true,
-      attachmentName: fileName,
-      attachmentPath: filePath,
-      attachmentSize: fileSize,
-    );
-
-    await _store.add(
-      peerId,
-      msg,
-      peerDisplayName: peerDisplayName,
-      peerIp: peerIp,
-      peerTcpPort: ConnectionService.tcpPort,
-    );
-    _fileMessages.add(FileMessageEvent(peerId, msg));
-
-    final notified = _connections.sendJson(peerId, {
-      'type': 'file_notify',
-      'id': fileId,
-      'name': fileName,
-      'size': fileSize,
-      'offset': 0,
-    });
-
+    final id = initialMessage.id;
+    final hasContentUri =
+        androidContentUri != null && androidContentUri.isNotEmpty;
+    final preparing = kind == StagedSourceKind.folderToZip ||
+        duplicatePathInBatch ||
+        hasContentUri;
     final t = TransferState(
-      fileId: fileId,
+      fileId: id,
       peerId: peerId,
-      fileName: fileName,
-      totalBytes: fileSize,
+      fileName: initialMessage.attachmentName!,
+      totalBytes: initialMessage.attachmentSize ?? 0,
       isSending: true,
-      filePath: filePath,
+      filePath: null,
+      outgoingPhase: preparing
+          ? OutgoingTransferPhase.preparing
+          : OutgoingTransferPhase.transferring,
     );
-    transfers[fileId] = t;
-    if (!notified) {
-      t.error =
-          'Not connected — wait for peer or pull down to refresh peers, then retry.';
-      _notify();
-      return;
-    }
+    transfers[id] = t;
     _notify();
+    await _runPrepareAndSend(
+      initialMessage: initialMessage,
+      peerId: peerId,
+      peerIp: peerIp,
+      peerDisplayName: peerDisplayName,
+      sourcePath: sourcePath,
+      androidContentUri: androidContentUri,
+      kind: kind,
+      duplicatePathInBatch: duplicatePathInBatch,
+    );
+  }
 
-    final targetIp = _resolveFileTransferHost(peerId, peerIp);
-    unawaited(_runSend(t, targetIp));
+  Future<void> _runPrepareAndSend({
+    required ChatMessage initialMessage,
+    required String peerId,
+    required String peerIp,
+    String? peerDisplayName,
+    required String sourcePath,
+    String? androidContentUri,
+    required StagedSourceKind kind,
+    required bool duplicatePathInBatch,
+  }) async {
+    final t = transfers[initialMessage.id];
+    if (t == null) return;
+
+    try {
+      late String sendPath;
+      late int sendSize;
+
+      if (kind == StagedSourceKind.folderToZip) {
+        t.outgoingPhase = OutgoingTransferPhase.preparing;
+        t.totalBytes = 0;
+        t.transferredBytes = 0;
+        t.progress = 0;
+        t.preparingStatus = 'Zipping folder in background…';
+        _notify();
+
+        final normalized = sourcePath.replaceAll(RegExp(r'[/\\]+$'), '');
+        final folderName = p.basename(normalized);
+        final zipPath = p.join(
+          Directory.systemTemp.path,
+          '${initialMessage.id}_$folderName.zip',
+        );
+        t.tempPathsForCleanup.add(zipPath);
+
+        await createFolderZip(
+          directoryPath: normalized,
+          folderName: folderName,
+          zipOutPath: zipPath,
+          isCancelled: () => t.cancelRequested,
+          onProcessStarted: (proc) => t.prepProcess = proc,
+        );
+        t.prepProcess = null;
+
+        if (t.cancelRequested) throw const AttachmentPrepareCancelled();
+
+        sendPath = zipPath;
+        sendSize = await File(zipPath).length();
+      } else {
+        var workPath = sourcePath;
+        final uri = androidContentUri;
+        if (uri != null && uri.isNotEmpty) {
+          t.outgoingPhase = OutgoingTransferPhase.preparing;
+          t.totalBytes = 0;
+          t.transferredBytes = 0;
+          t.progress = 0;
+          t.preparingStatus = 'Reading shared file…';
+          _notify();
+          final mat = uniqueTempPath(
+            Directory.systemTemp.path,
+            '${initialMessage.id}_share',
+            initialMessage.attachmentName!,
+          );
+          t.tempPathsForCleanup.add(mat);
+          await AndroidShareInbound.materializeContentUriToFile(
+            contentUri: uri,
+            destPath: mat,
+          );
+          if (t.cancelRequested) throw const AttachmentPrepareCancelled();
+          workPath = mat;
+        }
+
+        final f = File(workPath);
+        if (!await f.exists()) {
+          throw AttachmentPrepareException('File not found: $workPath');
+        }
+
+        if (duplicatePathInBatch) {
+          t.outgoingPhase = OutgoingTransferPhase.preparing;
+          final len = await f.length();
+          t.totalBytes = len;
+          t.transferredBytes = 0;
+          t.progress = 0;
+          t.preparingStatus = 'Copying for send…';
+          t.stopwatch.reset();
+          t.stopwatch.start();
+          _notify();
+
+          final dest = uniqueTempPath(
+            Directory.systemTemp.path,
+            initialMessage.id,
+            initialMessage.attachmentName!,
+          );
+          t.tempPathsForCleanup.add(dest);
+
+          await copyFileChunked(
+            workPath,
+            dest,
+            onProgress: (copied, total) {
+              t.transferredBytes = copied;
+              t.progress = total == 0 ? 0 : copied / total;
+              _notify();
+            },
+            isCancelled: () => t.cancelRequested,
+          );
+
+          if (t.cancelRequested) throw const AttachmentPrepareCancelled();
+
+          sendPath = dest;
+          sendSize = await File(dest).length();
+        } else {
+          sendPath = workPath;
+          sendSize = await f.length();
+        }
+      }
+
+      if (t.cancelRequested) throw const AttachmentPrepareCancelled();
+
+      // Temp prep paths (content URI, duplicate batch, zip) are deleted after send; DB must
+      // reference a permanent copy so thumbnails and open keep working.
+      var outboundPath = sendPath;
+      if (t.tempPathsForCleanup.contains(sendPath)) {
+        t.preparingStatus = 'Saving to device…';
+        _notify();
+        outboundPath = await _persistOutboundFileToDocuments(
+          sendPath,
+          initialMessage.id,
+          initialMessage.attachmentName!,
+        );
+      }
+
+      await _store.updateOutboundAttachment(
+        peerId,
+        initialMessage.id,
+        path: outboundPath,
+        size: sendSize,
+      );
+
+      final updated = initialMessage.copyWith(
+        attachmentPath: outboundPath,
+        attachmentSize: sendSize,
+      );
+      _fileMessages.add(FileMessageEvent(peerId, updated));
+
+      t.filePath = outboundPath;
+      t.totalBytes = sendSize;
+      t.transferredBytes = 0;
+      t.progress = 0;
+      t.outgoingPhase = OutgoingTransferPhase.transferring;
+      t.preparingStatus = '';
+      t.stopwatch.reset();
+      t.stopwatch.start();
+      _notify();
+
+      final notified = _connections.sendJson(peerId, {
+        'type': 'file_notify',
+        'id': initialMessage.id,
+        'name': t.fileName,
+        'size': sendSize,
+        'offset': 0,
+      });
+
+      if (!notified) {
+        t.error =
+            'Not connected — wait for peer or pull down to refresh peers, then retry.';
+        _notify();
+        return;
+      }
+
+      final targetIp = _resolveFileTransferHost(peerId, peerIp);
+      unawaited(_runSend(t, targetIp));
+    } catch (e) {
+      final t2 = transfers[initialMessage.id];
+      if (t2 == null) return;
+      t2.preparingStatus = '';
+      if (e is AttachmentPrepareCancelled || t2.cancelRequested) {
+        t2.error = 'Cancelled';
+        t2.cancelled = true;
+      } else {
+        t2.error = e.toString();
+      }
+      t2.prepProcess = null;
+      _cleanupOutgoingTemps(t2);
+      _notify();
+      await _emitStoredFileMessageForPreview(peerId, initialMessage.id);
+    }
   }
 
   /// Prefer the address from the live chat TCP socket (matches successful retry path).
@@ -226,6 +441,7 @@ class TransferManager {
         },
       );
       t.isPaused = false;
+      _cleanupOutgoingTemps(t);
       transfers.remove(t.fileId);
       _notify();
     } catch (e) {
@@ -258,6 +474,11 @@ class TransferManager {
   void cancel(String fileId) {
     final t = transfers[fileId];
     if (t == null) return;
+    t.cancelRequested = true;
+    try {
+      t.prepProcess?.kill(ProcessSignal.sigkill);
+    } catch (_) {}
+    t.prepProcess = null;
     if (t.isSending) {
       t.sender?.cancel();
     } else {
@@ -272,7 +493,12 @@ class TransferManager {
   /// Local user paused an outgoing transfer (we are sender).
   void pauseOutgoing(String fileId) {
     final t = transfers[fileId];
-    if (t == null || !t.isSending || t.error != null) return;
+    if (t == null ||
+        !t.isSending ||
+        t.error != null ||
+        t.outgoingPhase == OutgoingTransferPhase.preparing) {
+      return;
+    }
     final peerId = t.peerId;
     _connections.sendJson(peerId, {
       'type': 'file_control',
@@ -309,7 +535,11 @@ class TransferManager {
   /// Remote peer paused their receive — we are sending; stop our file socket.
   void handleRemotePauseOutgoing(String fileId) {
     final t = transfers[fileId];
-    if (t == null || !t.isSending) return;
+    if (t == null ||
+        !t.isSending ||
+        t.outgoingPhase == OutgoingTransferPhase.preparing) {
+      return;
+    }
     Future<void>.delayed(const Duration(milliseconds: 80), () {
       t.sender?.pause();
     });
@@ -345,6 +575,9 @@ class TransferManager {
     final t = transfers.remove(fileId);
     _notify();
     if (t == null) return;
+    if (t.isSending) {
+      _cleanupOutgoingTemps(t);
+    }
     unawaited(_persistDismissedTransfer(t.peerId, fileId));
   }
 

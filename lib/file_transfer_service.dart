@@ -4,6 +4,8 @@ import 'dart:io';
 import 'dart:math' show min;
 import 'dart:typed_data';
 
+import 'package:synchronized/synchronized.dart';
+
 import 'app_settings.dart';
 
 const int kFileTransferPort = 4042;
@@ -126,7 +128,8 @@ class FileSender {
       (data) {
         if (c.isCompleted) return;
         buf.write(utf8.decode(data, allowMalformed: true));
-        if (buf.toString().contains('START')) c.complete();
+        final bufStr = buf.toString();
+        if (bufStr.contains('START')) c.complete();
       },
       onError: (Object e) {
         if (!c.isCompleted) c.completeError(e);
@@ -139,10 +142,19 @@ class FileSender {
       cancelOnError: true,
     );
 
+    final timer = Timer(const Duration(seconds: 8), () {
+      if (!c.isCompleted) {
+        c.completeError(TimeoutException('Timed out waiting for START'));
+      }
+    });
+
     try {
-      await c.future.timeout(const Duration(seconds: 8));
+      await c.future;
     } finally {
-      await sub.cancel();
+      timer.cancel();
+      try {
+        await sub.cancel();
+      } catch (_) {}
     }
   }
 }
@@ -156,6 +168,7 @@ class FileReceiver {
   final Set<String> _cancelledIds = {};
   final Set<String> _pausedIds = {};
   final Map<String, Socket> _socketsByFileId = {};
+  final Lock _transferIdsLock = Lock();
 
   /// When [offset] > 0, resolve path to existing partial file (same [fileId]).
   Future<String?> Function(String fileId, int offset, String safeName)?
@@ -174,13 +187,17 @@ class FileReceiver {
   void Function(String fileId, String savePath, int bytesReceived)? onFilePaused;
 
   void cancelReceive(String fileId) {
-    _cancelledIds.add(fileId);
-    _destroySocketFor(fileId);
+    unawaited(_transferIdsLock.synchronized(() async {
+      _cancelledIds.add(fileId);
+      _destroySocketFor(fileId);
+    }));
   }
 
   void pauseReceive(String fileId) {
-    _pausedIds.add(fileId);
-    _destroySocketFor(fileId);
+    unawaited(_transferIdsLock.synchronized(() async {
+      _pausedIds.add(fileId);
+      _destroySocketFor(fileId);
+    }));
   }
 
   void _destroySocketFor(String fileId) {
@@ -221,13 +238,19 @@ class FileReceiver {
 
       var offset = 0;
       while (offset < data.length) {
-        if (_cancelledIds.contains(fileId)) {
+        final (isCancelled, isPaused) = await _transferIdsLock.synchronized(
+          () => (
+            _cancelledIds.contains(fileId),
+            _pausedIds.contains(fileId),
+          ),
+        );
+        if (isCancelled) {
           if (!done.isCompleted) {
             done.completeError(const _CancelledException());
           }
           return;
         }
-        if (_pausedIds.contains(fileId)) {
+        if (isPaused) {
           if (!done.isCompleted) {
             done.completeError(const TransferPausedException());
           }
@@ -359,7 +382,9 @@ class FileReceiver {
         } catch (_) {}
         raf = null;
         _socketsByFileId.remove(fileId);
-        _pausedIds.remove(fileId);
+        await _transferIdsLock.synchronized(() {
+          _pausedIds.remove(fileId);
+        });
         onFilePaused?.call(fileId, path, fileWritten);
         return;
       } on _CancelledException catch (_) {
@@ -368,7 +393,9 @@ class FileReceiver {
         } catch (_) {}
         raf = null;
         _socketsByFileId.remove(fileId);
-        _cancelledIds.remove(fileId);
+        await _transferIdsLock.synchronized(() {
+          _cancelledIds.remove(fileId);
+        });
         await deletePartialDownloadFile(path);
         onFileError?.call(fileId, 'Transfer cancelled', path);
         return;
@@ -378,8 +405,12 @@ class FileReceiver {
       raf = null;
 
       _socketsByFileId.remove(fileId);
-      final wasPaused = _pausedIds.remove(fileId);
-      final wasCancelled = _cancelledIds.remove(fileId);
+      final (wasPaused, wasCancelled) = await _transferIdsLock.synchronized(
+        () => (
+          _pausedIds.remove(fileId),
+          _cancelledIds.remove(fileId),
+        ),
+      );
 
       if (totalBytes == 0 ? fileWritten == 0 : fileWritten == totalBytes) {
         onFileComplete?.call(fileId, path);
@@ -396,8 +427,10 @@ class FileReceiver {
         }
       }
     } catch (e) {
-      _cancelledIds.remove(fileId);
-      _pausedIds.remove(fileId);
+      await _transferIdsLock.synchronized(() {
+        _cancelledIds.remove(fileId);
+        _pausedIds.remove(fileId);
+      });
       _socketsByFileId.remove(fileId);
 
       if (e is _CancelledException) {
@@ -451,13 +484,14 @@ class FileReceiver {
     final baseName = dot > 0 ? safeName.substring(0, dot) : safeName;
     final ext = dot > 0 ? safeName.substring(dot) : '';
 
-    for (var i = 1; i < 10000; i++) {
+    const maxIterations = 100;
+    for (var i = 1; i < maxIterations; i++) {
       path = '${dir.path}$sep$baseName ($i)$ext';
       if (!await File(path).exists()) return path;
     }
 
     final stamp = DateTime.now().millisecondsSinceEpoch;
-    return '${dir.path}$sep$stamp-$safeName';
+    return '${dir.path}$sep${stamp}_$safeName';
   }
 
   Future<void> stop() async {

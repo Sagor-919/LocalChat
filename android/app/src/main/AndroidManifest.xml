@@ -19,6 +19,8 @@
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/>
     <!-- Required to show the system “ignore battery optimizations” prompt for this package. -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
+    <!-- Optional: keep CPU from sleeping while a chat TCP session is open and app is backgrounded. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
     <application
         android:label="Local Chat"
         android:name="${applicationName}"
@@ -62,6 +64,15 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.flutter_local_chat_files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/flutter_local_chat_file_paths" />
+        </provider>
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and

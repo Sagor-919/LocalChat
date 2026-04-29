@@ -5,12 +5,15 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:open_filex/open_filex.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import 'android_app_control.dart';
 import 'android_storage_access.dart';
 import 'app_branding.dart';
+import 'app_metadata.dart';
 import 'app_settings.dart';
+import 'app_snackbar.dart';
 import 'message_store.dart';
 
 class SettingsScreen extends StatefulWidget {
@@ -25,6 +28,8 @@ class SettingsScreen extends StatefulWidget {
 class _SettingsScreenState extends State<SettingsScreen>
     with WidgetsBindingObserver {
   final _settings = AppSettings.instance;
+
+  late final Future<PackageInfo> _packageInfoFuture = PackageInfo.fromPlatform();
 
   /// null until first read from the platform.
   bool? _batteryUnrestricted;
@@ -181,13 +186,9 @@ class _SettingsScreenState extends State<SettingsScreen>
                         } else {
                           await androidOpenApplicationDetailsSettings();
                           if (context.mounted) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(
-                                behavior: SnackBarBehavior.floating,
-                                content: Text(
-                                  'In App info → Battery, remove unrestricted or enable optimization if you prefer.',
-                                ),
-                              ),
+                            showAppSnackBar(
+                              context,
+                              'In App info → Battery, remove unrestricted or enable optimization if you prefer.',
                             );
                           }
                         }
@@ -326,11 +327,43 @@ class _SettingsScreenState extends State<SettingsScreen>
                         fontWeight: FontWeight.w800,
                         fontSize: 22,
                         color: cs.onSurface)),
-                Text('v1.0.0',
-                    style: TextStyle(
-                        color: cs.outline,
-                        fontSize: 13,
-                        fontWeight: FontWeight.w500)),
+                FutureBuilder<PackageInfo>(
+                  future: _packageInfoFuture,
+                  builder: (context, snap) {
+                    final p = snap.data;
+                    final ver = p?.version ?? '—';
+                    return Column(
+                      children: [
+                        Text(
+                          'Version $ver',
+                          style: TextStyle(
+                            color: cs.outline,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        Text(
+                          AppMetadata.releaseLabel,
+                          style: TextStyle(
+                            color: cs.outline.withValues(alpha: 0.85),
+                            fontSize: 12,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ],
+                    );
+                  },
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  'Publisher · ${AppMetadata.publisher}',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: cs.outline,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
                 const SizedBox(height: 20),
                 const Divider(height: 1, indent: 20, endIndent: 20),
                 const SizedBox(height: 16),
@@ -355,13 +388,13 @@ class _SettingsScreenState extends State<SettingsScreen>
                   ),
                 ),
                 const SizedBox(height: 8),
-                Text('Developed By',
+                Text('Developer',
                     style: TextStyle(
                         color: cs.outline,
                         fontSize: 12,
                         fontWeight: FontWeight.w600,
                         letterSpacing: 0.5)),
-                Text('Sagor Hossen',
+                Text(AppMetadata.developer,
                     style: TextStyle(
                         fontWeight: FontWeight.w700,
                         fontSize: 17,
@@ -371,24 +404,25 @@ class _SettingsScreenState extends State<SettingsScreen>
                 ListTile(
                   leading: Icon(Icons.language, color: cs.primary),
                   title: const Text('Website'),
-                  trailing: Text('RecklessGalaxy.com',
+                  trailing: Text(AppMetadata.publisher,
                       style: TextStyle(
                           color: cs.primary,
                           fontSize: 14,
                           fontWeight: FontWeight.w500)),
-                  onTap: () => _launchUrl('https://recklessgalaxy.com'),
+                  onTap: () => _launchUrl(AppMetadata.publisherUrl),
                 ),
                 ListTile(
                   shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(16)),
                   leading: Icon(Icons.email_outlined, color: cs.primary),
                   title: const Text('Email'),
-                  trailing: Text('sagor@recklessgalaxy.com',
+                  trailing: Text(AppMetadata.supportEmail,
                       style: TextStyle(
                           color: cs.primary,
                           fontSize: 14,
                           fontWeight: FontWeight.w500)),
-                  onTap: () => _launchUrl('mailto:sagor@recklessgalaxy.com'),
+                  onTap: () =>
+                      _launchUrl('mailto:${AppMetadata.supportEmail}'),
                 ),
                 const SizedBox(height: 8),
               ],
@@ -447,22 +481,13 @@ class _SettingsScreenState extends State<SettingsScreen>
       final ok = await probeDirectoryWritable(dir);
       if (!ok) {
         if (mounted) {
-          ScaffoldMessenger.of(context)
-            ..clearSnackBars()
-            ..showSnackBar(
-              SnackBar(
-                content: const Text(
-                  'Cannot write to that folder. Grant “All files access” for Local Chat in system settings, or pick another folder.',
-                ),
-                behavior: SnackBarBehavior.floating,
-                action: SnackBarAction(
-                  label: 'Settings',
-                  onPressed: () {
-                    openLocalChatAppSettings();
-                  },
-                ),
-              ),
-            );
+          showAppSnackBarWithAction(
+            context,
+            message:
+                'Cannot write to that folder. Grant “All files access” for Local Chat in system settings, or pick another folder.',
+            actionLabel: 'Settings',
+            onAction: openLocalChatAppSettings,
+          );
         }
         return;
       }
@@ -502,12 +527,7 @@ class _SettingsScreenState extends State<SettingsScreen>
               Navigator.pop(ctx);
               await widget.store.clearAll();
               if (mounted) {
-                ScaffoldMessenger.of(context)
-                  ..clearSnackBars()
-                  ..showSnackBar(const SnackBar(
-                    content: Text('All chats cleared'),
-                    behavior: SnackBarBehavior.floating,
-                  ));
+                showAppSnackBar(context, 'All chats cleared');
               }
             },
             style: FilledButton.styleFrom(

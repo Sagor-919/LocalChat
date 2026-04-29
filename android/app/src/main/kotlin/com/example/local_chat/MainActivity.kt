@@ -1,5 +1,8 @@
 package com.example.local_chat
 
+import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.database.Cursor
@@ -7,18 +10,19 @@ import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.provider.OpenableColumns
 import android.provider.Settings
+import androidx.core.content.FileProvider
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.io.FileOutputStream
 import java.util.Collections
-import java.util.UUID
 import java.util.concurrent.Executors
 
 class MainActivity : FlutterActivity() {
@@ -27,6 +31,13 @@ class MainActivity : FlutterActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val ioExecutor = Executors.newSingleThreadExecutor()
     private val pendingShareUris = Collections.synchronizedList(ArrayList<String>())
+
+    /// Native file picker (URI-only); avoids file_picker copying every file to cache at pick time.
+    private var pendingAttachmentPickResult: MethodChannel.Result? = null
+
+    companion object {
+        private const val REQUEST_CODE_PICK_ATTACHMENTS = 0x1F42
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -81,6 +92,51 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    private fun queryOpenableSizeBytes(uri: Uri): Long? {
+        try {
+            if (uri.scheme == "file") {
+                val rawPath = uri.path ?: return null
+                val path = java.net.URLDecoder.decode(rawPath, Charsets.UTF_8.name())
+                val f = File(path)
+                return if (f.exists() && f.isFile) f.length() else null
+            }
+            if (uri.scheme != "content") return null
+            var cursor: Cursor? = null
+            try {
+                cursor = contentResolver.query(
+                    uri,
+                    arrayOf(OpenableColumns.SIZE),
+                    null,
+                    null,
+                    null,
+                )
+                if (cursor != null && cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(OpenableColumns.SIZE)
+                    if (idx >= 0 && !cursor.isNull(idx)) {
+                        return cursor.getLong(idx)
+                    }
+                }
+            } finally {
+                cursor?.close()
+            }
+        } catch (_: Exception) {
+        }
+        return null
+    }
+
+    private fun extractUrisFromPickIntent(data: Intent): List<Uri> {
+        val out = mutableListOf<Uri>()
+        if (data.clipData != null) {
+            val cd = data.clipData!!
+            for (i in 0 until cd.itemCount) {
+                out.add(cd.getItemAt(i).uri)
+            }
+        } else if (data.data != null) {
+            out.add(data.data!!)
+        }
+        return out
+    }
+
     private fun queryDisplayName(uri: Uri): String? {
         if (uri.scheme == "file") {
             return uri.lastPathSegment?.let { java.net.URLDecoder.decode(it, Charsets.UTF_8.name()) }
@@ -102,7 +158,8 @@ class MainActivity : FlutterActivity() {
         return null
     }
 
-    private fun materializeUri(uri: Uri): Map<String, String>? {
+    /// Share rows for Flutter: `file` → path on disk; `content` → URI only (copy at send time).
+    private fun describeShareForDart(uri: Uri): Map<String, String>? {
         try {
             if (uri.scheme == "file") {
                 val rawPath = uri.path ?: return null
@@ -112,20 +169,112 @@ class MainActivity : FlutterActivity() {
                 return mapOf("path" to f.absolutePath, "name" to f.name)
             }
             if (uri.scheme == "content") {
-                val input = contentResolver.openInputStream(uri) ?: return null
                 val displayName =
                     queryDisplayName(uri) ?: "shared_${System.currentTimeMillis()}"
-                val safe = displayName.replace(Regex("[/\\\\]"), "_")
-                val outFile = File(cacheDir, "${UUID.randomUUID()}_$safe")
-                FileOutputStream(outFile).use { out ->
-                    input.use { inp -> inp.copyTo(out) }
-                }
-                return mapOf("path" to outFile.absolutePath, "name" to displayName)
+                return mapOf("contentUri" to uri.toString(), "name" to displayName)
             }
         } catch (e: Exception) {
             e.printStackTrace()
         }
         return null
+    }
+
+    private fun materializeContentUriToFile(uri: Uri, destFile: File): Boolean {
+        try {
+            if (uri.scheme != "content") return false
+            val input = contentResolver.openInputStream(uri) ?: return false
+            destFile.parentFile?.mkdirs()
+            FileOutputStream(destFile).use { out ->
+                input.use { inp -> inp.copyTo(out) }
+            }
+            return destFile.exists()
+        } catch (e: Exception) {
+            e.printStackTrace()
+            try {
+                if (destFile.exists()) destFile.delete()
+            } catch (_: Exception) {
+            }
+        }
+        return false
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == REQUEST_CODE_PICK_ATTACHMENTS) {
+            deliverAttachmentPickResult(resultCode, data)
+            return
+        }
+        super.onActivityResult(requestCode, resultCode, data)
+    }
+
+    private fun deliverAttachmentPickResult(resultCode: Int, data: Intent?) {
+        val pending = pendingAttachmentPickResult
+        pendingAttachmentPickResult = null
+        if (pending == null) return
+        if (resultCode != Activity.RESULT_OK || data == null) {
+            pending.success(emptyList<Map<String, Any?>>())
+            return
+        }
+        val uris = extractUrisFromPickIntent(data)
+        if (uris.isEmpty()) {
+            pending.success(emptyList<Map<String, Any?>>())
+            return
+        }
+        for (uri in uris) {
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT && uri.scheme == "content") {
+                    contentResolver.takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                    )
+                }
+            } catch (_: SecurityException) {
+            }
+        }
+        ioExecutor.execute {
+            try {
+                val out = ArrayList<Map<String, Any?>>()
+                for (uri in uris) {
+                    val name =
+                        queryDisplayName(uri)
+                            ?: "file_${System.currentTimeMillis()}"
+                    val size = queryOpenableSizeBytes(uri)
+                    when (uri.scheme) {
+                        "file" -> {
+                            val rawPath = uri.path ?: continue
+                            val path =
+                                java.net.URLDecoder.decode(rawPath, Charsets.UTF_8.name())
+                            val f = File(path)
+                            if (!f.exists() || !f.isFile) continue
+                            val row = hashMapOf<String, Any?>(
+                                "name" to name,
+                                "path" to f.absolutePath,
+                            )
+                            if (size != null) row["size"] = size
+                            out.add(row)
+                        }
+                        "content" -> {
+                            val row = hashMapOf<String, Any?>(
+                                "name" to name,
+                                "contentUri" to uri.toString(),
+                            )
+                            if (size != null) row["size"] = size
+                            out.add(row)
+                        }
+                        else -> {
+                        }
+                    }
+                }
+                mainHandler.post {
+                    pending.success(out)
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                mainHandler.post {
+                    pending.error("PICK", e.message, null)
+                }
+            }
+        }
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -175,6 +324,96 @@ class MainActivity : FlutterActivity() {
                         result.error("SETTINGS", e.message, null)
                     }
                 }
+                "copyImageToClipboard" -> {
+                    val path = call.argument<String>("path") ?: run {
+                        result.error("ARG", "path required", null)
+                        return@setMethodCallHandler
+                    }
+                    val file = File(path)
+                    if (!file.exists() || !file.isFile) {
+                        result.error("NOT_FOUND", "file missing", null)
+                        return@setMethodCallHandler
+                    }
+                    try {
+                        val uri = try {
+                            FileProvider.getUriForFile(
+                                this,
+                                "$packageName.flutter_local_chat_files",
+                                file,
+                            )
+                        } catch (_: Exception) {
+                            val clipDir = File(cacheDir, "clipboard")
+                            clipDir.mkdirs()
+                            val dest = File(clipDir, "${System.currentTimeMillis()}_${file.name}")
+                            file.copyTo(dest, overwrite = true)
+                            FileProvider.getUriForFile(
+                                this,
+                                "$packageName.flutter_local_chat_files",
+                                dest,
+                            )
+                        }
+                        val clip = ClipData.newUri(contentResolver, "Image", uri)
+                        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        cm.setPrimaryClip(clip)
+                        result.success(null)
+                    } catch (e: Exception) {
+                        result.error("CLIPBOARD", e.message, null)
+                    }
+                }
+                "openFolderInFileManager" -> {
+                    val path = call.argument<String>("path") ?: ""
+                    val folder = File(path)
+                    if (!folder.exists()) {
+                        result.error("NOT_FOUND", "path missing", null)
+                        return@setMethodCallHandler
+                    }
+                    val target = if (folder.isFile) folder.parentFile else folder
+                    if (target == null || !target.exists()) {
+                        result.error("NOT_FOUND", "bad folder", null)
+                        return@setMethodCallHandler
+                    }
+                    try {
+                        when {
+                            tryOpenFolderAsDocumentUri(target) -> result.success(null)
+                            tryOpenAndroidDataInDocumentsUi() -> result.success(null)
+                            tryOpenFolderWithFileProvider(target) -> result.success(null)
+                            tryOpenAppSettingsForStorage() -> result.success(null)
+                            else -> result.error("OPEN", "Could not open folder", null)
+                        }
+                    } catch (e: Exception) {
+                        result.error("OPEN", e.message, null)
+                    }
+                }
+                else -> result.notImplemented()
+            }
+        }
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "local_chat/attachments",
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "pickFiles" -> {
+                    if (pendingAttachmentPickResult != null) {
+                        result.error(
+                            "already_active",
+                            "File picker is already active",
+                            null,
+                        )
+                        return@setMethodCallHandler
+                    }
+                    pendingAttachmentPickResult = result
+                    val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                        addCategory(Intent.CATEGORY_OPENABLE)
+                        type = "*/*"
+                        putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                    }
+                    try {
+                        startActivityForResult(intent, REQUEST_CODE_PICK_ATTACHMENTS)
+                    } catch (e: Exception) {
+                        pendingAttachmentPickResult = null
+                        result.error("PICK", e.message, null)
+                    }
+                }
                 else -> result.notImplemented()
             }
         }
@@ -219,7 +458,7 @@ class MainActivity : FlutterActivity() {
             "local_chat/share",
         ).setMethodCallHandler { call, result ->
             when (call.method) {
-                "getPendingShareMaterialized" -> {
+                "drainPendingShares" -> {
                     ioExecutor.execute {
                         try {
                             val out = ArrayList<Map<String, String>>()
@@ -230,7 +469,7 @@ class MainActivity : FlutterActivity() {
                             }
                             for (uriStr in copy) {
                                 val uri = Uri.parse(uriStr)
-                                val m = materializeUri(uri)
+                                val m = describeShareForDart(uri)
                                 if (m != null) {
                                     out.add(m)
                                 }
@@ -245,8 +484,108 @@ class MainActivity : FlutterActivity() {
                         }
                     }
                 }
+                "materializeContentUri" -> {
+                    val uriStr = call.argument<String>("uri")
+                    val destPath = call.argument<String>("destPath")
+                    if (uriStr.isNullOrEmpty() || destPath.isNullOrEmpty()) {
+                        result.error("ARG", "uri and destPath required", null)
+                        return@setMethodCallHandler
+                    }
+                    ioExecutor.execute {
+                        try {
+                            val ok =
+                                materializeContentUriToFile(Uri.parse(uriStr), File(destPath))
+                            mainHandler.post {
+                                if (ok) {
+                                    result.success(null)
+                                } else {
+                                    result.error("SHARE", "materialize failed", null)
+                                }
+                            }
+                        } catch (e: Exception) {
+                            mainHandler.post {
+                                result.error("SHARE", e.message, null)
+                            }
+                        }
+                    }
+                }
                 else -> result.notImplemented()
             }
+        }
+    }
+
+    /// Opens a folder in the system Documents / Files UI (primary external storage).
+    /// Avoids FileProvider + `vnd.android.document/directory`, which often routes to archive/extractor apps.
+    private fun tryOpenFolderAsDocumentUri(target: File): Boolean {
+        return try {
+            if (!target.exists()) return false
+            val folder = if (target.isDirectory) target else target.parentFile ?: return false
+            val extRoot = Environment.getExternalStorageDirectory()?.canonicalFile?.canonicalPath
+                ?: return false
+            val folderPath = folder.canonicalFile.canonicalPath
+            if (!folderPath.startsWith(extRoot)) return false
+            val relative = folderPath.removePrefix(extRoot).trimStart('/')
+            val docId = "primary:$relative"
+            val encoded = Uri.encode(docId)
+            val uri = Uri.parse(
+                "content://com.android.externalstorage.documents/document/$encoded",
+            )
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                data = uri
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(intent)
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun tryOpenFolderWithFileProvider(target: File): Boolean {
+        return try {
+            val uri = FileProvider.getUriForFile(
+                this,
+                "$packageName.flutter_local_chat_files",
+                target,
+            )
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "vnd.android.document/directory")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(intent)
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun tryOpenAndroidDataInDocumentsUi(): Boolean {
+        return try {
+            val docId = "primary:Android/data/$packageName"
+            val uri = Uri.parse(
+                "content://com.android.externalstorage.documents/document/" +
+                    Uri.encode(docId),
+            )
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                data = uri
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(intent)
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun tryOpenAppSettingsForStorage(): Boolean {
+        return try {
+            val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                data = Uri.parse("package:$packageName")
+            }
+            startActivity(intent)
+            true
+        } catch (_: Exception) {
+            false
         }
     }
 }
