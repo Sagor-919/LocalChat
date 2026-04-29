@@ -68,6 +68,7 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> {
   static const _uuid = Uuid();
+  static const _kNeedsLanMsg = 'File transfer needs a LAN connection';
   static const MethodChannel _appControlChannel =
       MethodChannel('local_chat/app_control');
 
@@ -126,6 +127,8 @@ class _ChatScreenState extends State<ChatScreen> {
 
   String get _peerId => widget.peer.userId;
   TransferManager get _tm => TransferManager.instance;
+  bool get _fileTransferAvailable => widget.connections.isConnected(_peerId);
+  bool get _fileActionsEnabled => _fileTransferAvailable;
 
   /// Same as [compareChatMessagesChronological] — must match [MessageStore] SQL order.
   static int _compareMessages(ChatMessage a, ChatMessage b) =>
@@ -329,7 +332,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (HardwareKeyboard.instance.isShiftPressed) return false;
     if (!mounted) return false;
     final textReady = normalizeOutgoingMessageText(_input.text).isNotEmpty;
-    final canSend = textReady || (_connected && _staged.isNotEmpty);
+    final canSend = textReady || (_fileTransferAvailable && _staged.isNotEmpty);
     if (!canSend) return false;
     unawaited(_sendAll());
     return true;
@@ -912,7 +915,10 @@ class _ChatScreenState extends State<ChatScreen> {
     final hasFiles = _staged.isNotEmpty;
 
     if (!hasText && !hasFiles) return;
-    if (hasFiles && !_connected) return;
+    if (hasFiles && !_fileTransferAvailable) {
+      _showCopyFeedback(_kNeedsLanMsg);
+      return;
+    }
 
     if (hasText) {
       final live = _resolveLivePeer();
@@ -966,6 +972,10 @@ class _ChatScreenState extends State<ChatScreen> {
     DeferredStagedFile df, {
     required bool duplicatePathInBatch,
   }) async {
+    if (!_fileTransferAvailable) {
+      _showCopyFeedback(_kNeedsLanMsg);
+      return;
+    }
     final live = _resolveLivePeer();
     if (!widget.connections.isConnected(_peerId)) {
       await widget.connections.connectTo(live, forceNew: false);
@@ -1461,7 +1471,8 @@ class _ChatScreenState extends State<ChatScreen> {
   Widget _wrapChatDropTarget(BuildContext context, Widget child) {
     if (!_supportsFileDrop) return child;
     return DropTarget(
-      enable: ModalRoute.of(context)?.isCurrent ?? true,
+      enable:
+          (ModalRoute.of(context)?.isCurrent ?? true) && _fileActionsEnabled,
       onDragDone: _onDropDone,
       child: child,
     );
@@ -2390,7 +2401,8 @@ class _ChatScreenState extends State<ChatScreen> {
           final textReady = normalizeOutgoingMessageText(
             _input.text,
           ).isNotEmpty;
-          final canSend = textReady || (_connected && _staged.isNotEmpty);
+          final canSend =
+              textReady || (_fileTransferAvailable && _staged.isNotEmpty);
           return Row(
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [

@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -9,7 +10,8 @@ class AppSettings {
   static final instance = AppSettings._();
   AppSettings._();
 
-  static const _kFirstLaunchOnboardingComplete = 'first_launch_onboarding_complete';
+  static const _kFirstLaunchOnboardingComplete =
+      'first_launch_onboarding_complete';
   /// Legacy key from notification-only first run; counts as onboarding done.
   static const _kFirstLaunchPermissionsDone = 'first_launch_permissions_done';
 
@@ -34,24 +36,28 @@ class AppSettings {
 
     notificationsMuted.value = _prefs.getBool('notifications_muted') ?? false;
 
-    if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
+    if (!kIsWeb && (Platform.isWindows || Platform.isLinux || Platform.isMacOS)) {
       desktopRunInBackground.value =
           _prefs.getBool('desktop_run_in_background') ?? true;
     }
 
-    final savedPath = _prefs.getString('download_path');
-    if (savedPath == null || savedPath.isEmpty) {
-      final path = await ensureLocalChatDownloadDirectory();
-      downloadPath.value = path;
-      await _prefs.setString('download_path', path);
+    if (kIsWeb) {
+      downloadPath.value = _prefs.getString('download_path') ?? '';
     } else {
-      downloadPath.value = savedPath;
-      try {
-        await Directory(savedPath).create(recursive: true);
-      } catch (_) {}
+      final savedPath = _prefs.getString('download_path');
+      if (savedPath == null || savedPath.isEmpty) {
+        final path = await ensureLocalChatDownloadDirectory();
+        downloadPath.value = path;
+        await _prefs.setString('download_path', path);
+      } else {
+        downloadPath.value = savedPath;
+        try {
+          await Directory(savedPath).create(recursive: true);
+        } catch (_) {}
+      }
     }
 
-    if (Platform.isWindows) {
+    if (!kIsWeb && Platform.isWindows) {
       startWithWindows.value = await _readStartupRegistry();
     }
   }
@@ -72,7 +78,8 @@ class AppSettings {
   }
 
   Future<void> setDesktopRunInBackground(bool enabled) async {
-    if (!(Platform.isWindows || Platform.isLinux || Platform.isMacOS)) {
+    if (kIsWeb ||
+        !(Platform.isWindows || Platform.isLinux || Platform.isMacOS)) {
       return;
     }
     desktopRunInBackground.value = enabled;
@@ -95,7 +102,7 @@ class AppSettings {
   }
 
   Future<void> setStartWithWindows(bool enabled) async {
-    if (!Platform.isWindows) return;
+    if (kIsWeb || !Platform.isWindows) return;
     startWithWindows.value = enabled;
     final exe = Platform.resolvedExecutable;
     /// Logon startup: pass `--autostart` so [main] can hide the window and stay in tray only.
@@ -104,16 +111,20 @@ class AppSettings {
       await Process.run('reg', [
         'add',
         r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
-        '/v', 'LocalChat',
-        '/t', 'REG_SZ',
-        '/d', runValue,
+        '/v',
+        'LocalChat',
+        '/t',
+        'REG_SZ',
+        '/d',
+        runValue,
         '/f',
       ]);
     } else {
       await Process.run('reg', [
         'delete',
         r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
-        '/v', 'LocalChat',
+        '/v',
+        'LocalChat',
         '/f',
       ]);
     }
@@ -124,7 +135,8 @@ class AppSettings {
       final result = await Process.run('reg', [
         'query',
         r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
-        '/v', 'LocalChat',
+        '/v',
+        'LocalChat',
       ]);
       return result.exitCode == 0;
     } catch (_) {
@@ -134,6 +146,7 @@ class AppSettings {
 
   /// Default save folder: `…/LocalChat Folder/Downloads` (received files live under Downloads).
   static Future<String> ensureLocalChatDownloadDirectory() async {
+    if (kIsWeb) return '';
     const rootName = 'LocalChat Folder';
     const downloadsName = 'Downloads';
     if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {

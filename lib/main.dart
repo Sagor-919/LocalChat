@@ -12,6 +12,7 @@ import 'package:window_manager/window_manager.dart';
 
 import 'app_branding.dart';
 import 'app_settings.dart';
+import 'app_splash.dart';
 import 'android_share_inbound.dart';
 import 'chat_crypto.dart';
 import 'chat_screen.dart';
@@ -61,7 +62,8 @@ Future<void> _restoreLanAfterLinkRecovery() async {
 
 void _onConnectivityChanged(List<ConnectivityResult> results) {
   final offline = _connectivityIsOffline(results);
-  final wasOffline = _lastConnectivityResults != null &&
+  final wasOffline =
+      _lastConnectivityResults != null &&
       _connectivityIsOffline(_lastConnectivityResults!);
   _lastConnectivityResults = List<ConnectivityResult>.from(results);
 
@@ -101,7 +103,7 @@ Future<void> _syncDesktopNotifyForIncomingMessages() async {
   } catch (_) {}
 }
 
-/// Windows taskbar “pulse” (indeterminate progress bar under the icon) when
+/// Windows taskbar "pulse" (indeterminate progress bar under the icon) when
 /// the window is not in the foreground — includes minimized, tray-hidden, and
 /// unfocused (another app on top).
 Future<void> _pulseWindowsTaskbarForAttention() async {
@@ -168,7 +170,9 @@ bool _isOpenChatNotificationTap(NotificationResponse r) {
 }
 
 Future<void> _handleIncomingEncryptedMessage(
-    String peerId, Map<String, dynamic> json) async {
+  String peerId,
+  Map<String, dynamic> json,
+) async {
   final ct = json['ct'] as String?;
   if (ct == null || ct.isEmpty) return;
   final (text, _) = await ChatCrypto.decryptMessage(_me.userId, peerId, ct);
@@ -177,7 +181,8 @@ Future<void> _handleIncomingEncryptedMessage(
     id: json['id'] as String? ?? '',
     senderId: json['from'] as String? ?? '',
     text: text,
-    timestamp: (json['time'] as num?)?.toInt() ??
+    timestamp:
+        (json['time'] as num?)?.toInt() ??
         DateTime.now().millisecondsSinceEpoch,
     isMine: (json['from'] as String?) == _me.userId,
   );
@@ -213,7 +218,10 @@ Future<void> _handleIncomingTextMessage(String peerId, ChatMessage msg) async {
 }
 
 /// Receiver acknowledged [messageId]; we confirm back so both sides agree delivery completed.
-Future<void> _completeDeliveryHandshake(String peerId, String messageId) async {
+Future<void> _completeDeliveryHandshake(
+  String peerId,
+  String messageId,
+) async {
   final ok = _connections.sendJson(peerId, {
     'type': 'message_ack_confirm',
     'id': messageId,
@@ -221,10 +229,16 @@ Future<void> _completeDeliveryHandshake(String peerId, String messageId) async {
   });
   if (ok) {
     await _store.updateDeliveryState(
-        peerId, messageId, MessageDelivery.delivered);
+      peerId,
+      messageId,
+      MessageDelivery.delivered,
+    );
   } else {
     await _store.updateDeliveryState(
-        peerId, messageId, MessageDelivery.awaitingConfirm);
+      peerId,
+      messageId,
+      MessageDelivery.awaitingConfirm,
+    );
   }
 }
 
@@ -387,50 +401,40 @@ NotificationDetails _incomingMessageNotificationDetails() {
   );
 }
 
-Future<void> main(List<String> args) async {
-  WidgetsFlutterBinding.ensureInitialized();
-
-  if (Platform.isWindows) {
-    _windowsAutostartLaunch = args.contains('--autostart');
+/// Notifications plugin init is best-effort: failures should never block startup.
+Future<void> _initNotificationsSafe() async {
+  try {
+    await _notifications.initialize(
+      const InitializationSettings(
+        android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+        windows: WindowsInitializationSettings(
+          appName: 'Local Chat',
+          appUserModelId: 'com.localchat.app',
+          guid: 'd3c1f8a0-1234-5678-9abc-def012345678',
+        ),
+      ),
+      onDidReceiveNotificationResponse: _onNotificationTapped,
+    );
+  } catch (e, st) {
+    debugPrint('Local notifications init failed: $e\n$st');
   }
+}
 
-  if (!kIsWeb &&
-      (Platform.isWindows || Platform.isLinux || Platform.isMacOS)) {
-    for (var i = 0; i < args.length; i++) {
-      if (args[i] == '--share-file' && i + 1 < args.length) {
-        final p = args[++i];
-        if (p.isNotEmpty && stagedDropPathExists(p)) {
-          DesktopDropQueue.enqueue([p]);
-        }
-      }
-    }
-  }
-
+/// Heavy bootstrap: settings, device info, message store, sockets, notifications,
+/// file transfer. Runs from [_LocalChatAppState] behind the splash so the first
+/// frame paints before any blocking I/O.
+Future<void> _bootstrapServices() async {
   await AppSettings.instance.init();
-  if (Platform.isWindows && _windowsAutostartLaunch) {
+  if (!kIsWeb && Platform.isWindows && _windowsAutostartLaunch) {
     _deferOnboardingUntilWindowShown =
         !AppSettings.instance.firstLaunchOnboardingComplete;
   }
 
-  if (_isDesktop) {
-    await windowManager.ensureInitialized();
-    // Initializes ITaskbarList3; required before setProgressBar / taskbar APIs.
-    await windowManager.waitUntilReadyToShow();
-    const windowWidth = 420.0;
-    const windowHeight = 720.0;
-    await windowManager.setSize(const Size(windowWidth, windowHeight));
-    await windowManager.setMinimumSize(const Size(360, 500));
-    await windowManager.center();
-    await windowManager.setTitle('Local Chat');
-    await windowManager.setPreventClose(true);
-    if (Platform.isWindows && _windowsAutostartLaunch) {
-      await windowManager.hide();
-    } else {
-      await windowManager.show();
-    }
-  }
-  _me = await DeviceInfo.load();
-  _store = await MessageStore.init();
+  // Device info and message store are independent — run in parallel.
+  final (me, store) = await (DeviceInfo.load(), MessageStore.init()).wait;
+  _me = me;
+  _store = store;
+
   _discovery = DiscoveryService(me: _me);
   _connections = ConnectionService(me: _me);
   _discovery.hasActiveChatTcp = (id) => _connections.isConnected(id);
@@ -444,20 +448,7 @@ Future<void> main(List<String> args) async {
     notificationsPlugin: _notifications,
   );
 
-  try {
-    await _notifications.initialize(
-      const InitializationSettings(
-        android: AndroidInitializationSettings('@mipmap/ic_launcher'),
-        windows: WindowsInitializationSettings(
-            appName: 'Local Chat',
-            appUserModelId: 'com.localchat.app',
-            guid: 'd3c1f8a0-1234-5678-9abc-def012345678'),
-      ),
-      onDidReceiveNotificationResponse: _onNotificationTapped,
-    );
-  } catch (e, st) {
-    debugPrint('Local notifications init failed: $e\n$st');
-  }
+  await _initNotificationsSafe();
 
   _connections.onMessage = (peerId, json) {
     final type = json['type'] as String?;
@@ -561,6 +552,51 @@ Future<void> main(List<String> args) async {
       flashWindowsTaskbarIcon();
     }
   });
+}
+
+Future<void> main(List<String> args) async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // ---- Synchronous-ish prelude (~tens of ms) ----
+  // Goal: reach [runApp] as fast as possible so the splash paints first.
+  // Heavy I/O (sqlite, sockets, notifications) moves to [_bootstrapServices].
+
+  if (!kIsWeb && Platform.isWindows) {
+    _windowsAutostartLaunch = args.contains('--autostart');
+  }
+
+  if (!kIsWeb && (Platform.isWindows || Platform.isLinux || Platform.isMacOS)) {
+    for (var i = 0; i < args.length; i++) {
+      if (args[i] == '--share-file' && i + 1 < args.length) {
+        final p = args[++i];
+        if (p.isNotEmpty && stagedDropPathExists(p)) {
+          DesktopDropQueue.enqueue([p]);
+        }
+      }
+    }
+  }
+
+  if (_isDesktop) {
+    try {
+      await windowManager.ensureInitialized();
+      // Initializes ITaskbarList3; required before setProgressBar / taskbar APIs.
+      await windowManager.waitUntilReadyToShow();
+      const windowWidth = 420.0;
+      const windowHeight = 720.0;
+      await windowManager.setSize(const Size(windowWidth, windowHeight));
+      await windowManager.setMinimumSize(const Size(360, 500));
+      await windowManager.center();
+      await windowManager.setTitle('Local Chat');
+      await windowManager.setPreventClose(true);
+      if (Platform.isWindows && _windowsAutostartLaunch) {
+        await windowManager.hide();
+      } else {
+        await windowManager.show();
+      }
+    } catch (e, st) {
+      debugPrint('Window manager init failed: $e\n$st');
+    }
+  }
 
   runApp(const LocalChatApp());
 }
@@ -582,41 +618,63 @@ class LocalChatApp extends StatefulWidget {
 
 class _LocalChatAppState extends State<LocalChatApp>
     with WidgetsBindingObserver, TrayListener, WindowListener {
+  bool _ready = false;
+  Object? _bootError;
   StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
 
   @override
   void initState() {
     super.initState();
-    _connectivitySub =
-        Connectivity().onConnectivityChanged.listen(_onConnectivityChanged);
-    unawaited(Connectivity().checkConnectivity().then(_onConnectivityChanged));
-    WidgetsBinding.instance.addObserver(this);
-    if (_isDesktop) {
-      windowManager.addListener(this);
-      trayManager.addListener(this);
-      WidgetsBinding.instance.addPostFrameCallback((_) async {
-        await _initTray();
-        await _syncDesktopNotifyForIncomingMessages();
+    unawaited(_bootstrap());
+  }
+
+  Future<void> _bootstrap() async {
+    try {
+      await _bootstrapServices();
+      if (!mounted) return;
+      setState(() => _ready = true);
+
+      final connectivity = Connectivity();
+      _connectivitySub = connectivity.onConnectivityChanged
+          .listen(_onConnectivityChanged);
+      unawaited(
+        connectivity.checkConnectivity().then(_onConnectivityChanged),
+      );
+      WidgetsBinding.instance.addObserver(this);
+
+      if (_isDesktop) {
+        windowManager.addListener(this);
+        trayManager.addListener(this);
+        WidgetsBinding.instance.addPostFrameCallback((_) async {
+          await _initTray();
+          await _syncDesktopNotifyForIncomingMessages();
+          WidgetsBinding.instance.addPostFrameCallback((_) async {
+            final ctx = appNavigatorKey.currentContext;
+            if (ctx != null &&
+                ctx.mounted &&
+                !_deferOnboardingUntilWindowShown) {
+              await showFirstLaunchOnboardingIfNeeded(ctx);
+            }
+            unawaited(_tryOpenChatFromColdStartNotification());
+          });
+        });
+      } else {
         WidgetsBinding.instance.addPostFrameCallback((_) async {
           final ctx = appNavigatorKey.currentContext;
-          if (ctx != null && ctx.mounted && !_deferOnboardingUntilWindowShown) {
+          if (ctx != null && ctx.mounted) {
             await showFirstLaunchOnboardingIfNeeded(ctx);
+          }
+          if (!mounted) return;
+          if (!kIsWeb && Platform.isAndroid) {
+            await AndroidShareInbound.syncFromNative();
           }
           unawaited(_tryOpenChatFromColdStartNotification());
         });
-      });
-    } else {
-      WidgetsBinding.instance.addPostFrameCallback((_) async {
-        final ctx = appNavigatorKey.currentContext;
-        if (ctx != null && ctx.mounted) {
-          await showFirstLaunchOnboardingIfNeeded(ctx);
-        }
-        if (!mounted) return;
-        if (Platform.isAndroid) {
-          await AndroidShareInbound.syncFromNative();
-        }
-        unawaited(_tryOpenChatFromColdStartNotification());
-      });
+      }
+    } catch (e, st) {
+      debugPrint('Bootstrap failed: $e\n$st');
+      if (!mounted) return;
+      setState(() => _bootError = e);
     }
   }
 
@@ -750,18 +808,18 @@ class _LocalChatAppState extends State<LocalChatApp>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     _appInForeground = state == AppLifecycleState.resumed ||
         state == AppLifecycleState.inactive;
-    if (Platform.isAndroid) {
+    if (!kIsWeb && Platform.isAndroid) {
       if (state == AppLifecycleState.paused) {
-        if (_connections.hasActiveTcpPeers) {
+        if (_ready && _connections.hasActiveTcpPeers) {
           unawaited(WakelockPlus.enable());
         }
       } else if (state == AppLifecycleState.resumed) {
         unawaited(WakelockPlus.disable());
       }
     }
-    if (state == AppLifecycleState.resumed) {
+    if (state == AppLifecycleState.resumed && _ready) {
       unawaited(_discovery.recoverAfterNetworkOrResume());
-      if (Platform.isAndroid) {
+      if (!kIsWeb && Platform.isAndroid) {
         unawaited(AndroidShareInbound.syncFromNative());
       }
     }
@@ -787,12 +845,16 @@ class _LocalChatAppState extends State<LocalChatApp>
             brightness: Brightness.dark,
             useMaterial3: true,
           ),
-          home: HomeScreen(
-            me: _me,
-            discovery: _discovery,
-            connections: _connections,
-            store: _store,
-          ),
+          home: _bootError != null
+              ? AppBootError(error: _bootError!)
+              : !_ready
+                  ? const AppSplash()
+                  : HomeScreen(
+                      me: _me,
+                      discovery: _discovery,
+                      connections: _connections,
+                      store: _store,
+                    ),
         );
       },
     );
