@@ -290,9 +290,15 @@ class _ChatScreenState extends State<ChatScreen> {
         if (!mounted) return;
         final dropped = DesktopDropQueue.takeAll();
         if (dropped.isEmpty) return;
-        _stageFiles(
-          dropped.map(deferredStagedFileFromLocalPath).whereType<DeferredStagedFile>().toList(),
-        );
+        final initial = dropped
+            .map(deferredStagedFileFromLocalPath)
+            .whereType<DeferredStagedFile>()
+            .toList();
+        if (!kIsWeb && Platform.isAndroid) {
+          unawaited(_stageDroppedFilesAndroidAware(initial));
+        } else {
+          _stageFiles(initial);
+        }
       });
     }
   }
@@ -890,12 +896,50 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _onDropDone(DropDoneDetails details) {
-    _stageFiles(
-      details.files
-          .map(deferredStagedFileFromDropItem)
-          .whereType<DeferredStagedFile>()
-          .toList(),
-    );
+    final initial = details.files
+        .map(deferredStagedFileFromDropItem)
+        .whereType<DeferredStagedFile>()
+        .toList();
+    if (initial.isEmpty) return;
+    if (!kIsWeb && Platform.isAndroid) {
+      unawaited(_stageDroppedFilesAndroidAware(initial));
+    } else {
+      _stageFiles(initial);
+    }
+  }
+
+  /// Android drag-and-drop names often arrive without an extension because content
+  /// providers (Google Photos, Files, MediaStore) don't include it in DISPLAY_NAME or
+  /// because the URI is opaque. Resolve missing extensions via MIME type before staging.
+  Future<void> _stageDroppedFilesAndroidAware(
+    List<DeferredStagedFile> initial,
+  ) async {
+    final fixed = <DeferredStagedFile>[];
+    for (final df in initial) {
+      final uri = df.androidContentUri;
+      final hasExt = p.extension(df.displayName).isNotEmpty;
+      if (uri == null || uri.isEmpty || hasExt) {
+        fixed.add(df);
+        continue;
+      }
+      final resolved = await AndroidAttachmentPicker.resolveContentName(uri);
+      if (resolved == null ||
+          resolved.isEmpty ||
+          p.extension(resolved).isEmpty) {
+        fixed.add(df);
+        continue;
+      }
+      fixed.add(DeferredStagedFile(
+        androidContentUri: uri,
+        displayName: resolved,
+        sourcePath: df.sourcePath,
+        kind: df.kind,
+        knownSizeBytes: df.knownSizeBytes,
+        clipboardPasteHash: df.clipboardPasteHash,
+      ));
+    }
+    if (!mounted) return;
+    _stageFiles(fixed);
   }
 
   // -----------------------------------------------------------------------

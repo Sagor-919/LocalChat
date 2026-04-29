@@ -16,6 +16,7 @@ import android.os.Looper
 import android.os.PowerManager
 import android.provider.OpenableColumns
 import android.provider.Settings
+import android.webkit.MimeTypeMap
 import androidx.core.content.FileProvider
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -139,7 +140,9 @@ class MainActivity : FlutterActivity() {
 
     private fun queryDisplayName(uri: Uri): String? {
         if (uri.scheme == "file") {
-            return uri.lastPathSegment?.let { java.net.URLDecoder.decode(it, Charsets.UTF_8.name()) }
+            val raw = uri.lastPathSegment ?: return null
+            val decoded = java.net.URLDecoder.decode(raw, Charsets.UTF_8.name())
+            return ensureExtension(decoded, uri)
         }
         var cursor: Cursor? = null
         try {
@@ -148,7 +151,7 @@ class MainActivity : FlutterActivity() {
                 val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
                 if (idx >= 0) {
                     val n = cursor.getString(idx)
-                    if (!n.isNullOrBlank()) return n
+                    if (!n.isNullOrBlank()) return ensureExtension(n, uri)
                 }
             }
         } catch (_: Exception) {
@@ -156,6 +159,25 @@ class MainActivity : FlutterActivity() {
             cursor?.close()
         }
         return null
+    }
+
+    /// Some providers (e.g. Photos / Files) return DISPLAY_NAME without an extension;
+    /// derive one from the resolved MIME type so staged + saved files keep their type.
+    private fun ensureExtension(name: String, uri: Uri): String {
+        val dot = name.lastIndexOf('.')
+        if (dot > 0 && dot < name.length - 1) return name
+        val ext = lookupExtensionForUri(uri) ?: return name
+        return "$name.$ext"
+    }
+
+    private fun lookupExtensionForUri(uri: Uri): String? {
+        val mime = try {
+            contentResolver.getType(uri)
+        } catch (_: Exception) {
+            null
+        } ?: return null
+        val ext = MimeTypeMap.getSingleton().getExtensionFromMimeType(mime)
+        return ext?.takeIf { it.isNotBlank() }
     }
 
     /// Share rows for Flutter: `file` → path on disk; `content` → URI only (copy at send time).
@@ -412,6 +434,21 @@ class MainActivity : FlutterActivity() {
                     } catch (e: Exception) {
                         pendingAttachmentPickResult = null
                         result.error("PICK", e.message, null)
+                    }
+                }
+                "resolveContentName" -> {
+                    val uriStr = call.argument<String>("uri")
+                    if (uriStr.isNullOrEmpty()) {
+                        result.error("ARG", "uri required", null)
+                        return@setMethodCallHandler
+                    }
+                    ioExecutor.execute {
+                        val resolved = try {
+                            queryDisplayName(Uri.parse(uriStr))
+                        } catch (_: Exception) {
+                            null
+                        }
+                        mainHandler.post { result.success(resolved) }
                     }
                 }
                 else -> result.notImplemented()

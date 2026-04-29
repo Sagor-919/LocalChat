@@ -57,4 +57,21 @@ class AndroidAttachmentPicker {
       return const [];
     }
   }
+
+  /// Resolves DISPLAY_NAME (and a MIME-derived extension fallback) for a `content://` URI.
+  /// Used to recover extensions after Android drag-and-drop, where dropped names often
+  /// arrive without one (e.g. media providers return doc IDs / display names sans suffix).
+  static Future<String?> resolveContentName(String uri) async {
+    if (kIsWeb || !Platform.isAndroid) return null;
+    if (uri.isEmpty) return null;
+    try {
+      final res = await _channel
+          .invokeMethod<String>('resolveContentName', {'uri': uri});
+      if (res == null || res.isEmpty) return null;
+      return res;
+    } on PlatformException catch (e) {
+      debugPrint('AndroidAttachmentPicker.resolveContentName: $e');
+      return null;
+    }
+  }
 }
