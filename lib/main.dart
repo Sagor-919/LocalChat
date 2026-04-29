@@ -35,6 +35,7 @@ late DeviceInfo _me;
 late DiscoveryService _discovery;
 late ConnectionService _connections;
 late MessageStore _store;
+StreamSubscription<FileMessageEvent>? _fileMessagesSub;
 final FlutterLocalNotificationsPlugin _notifications =
     FlutterLocalNotificationsPlugin();
 bool _appInForeground = true;
@@ -533,7 +534,7 @@ Future<void> _bootstrapServices() async {
     }
   };
 
-  TransferManager.instance.fileMessages.listen((event) {
+  _fileMessagesSub = TransferManager.instance.fileMessages.listen((event) {
     if (event.message.isMine) return;
     if (_shouldAlertIncomingMessage() &&
         !AppSettings.instance.notificationsMuted.value) {
@@ -681,6 +682,8 @@ class _LocalChatAppState extends State<LocalChatApp>
   @override
   void dispose() {
     _connectivitySub?.cancel();
+    _fileMessagesSub?.cancel();
+    TransferManager.instance.dispose();
     if (_isDesktop) {
       windowManager.removeListener(this);
       trayManager.removeListener(this);

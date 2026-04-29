@@ -22,6 +22,7 @@ class DiscoveryService {
   final DeviceInfo me;
   final Map<String, PeerDevice> _peers = {};
   RawDatagramSocket? _socket;
+  StreamSubscription<RawSocketEvent>? _socketSub;
   Timer? _broadcastTimer;
   Timer? _cleanupTimer;
   Timer? _broadcastTargetsTimer;
@@ -49,7 +50,16 @@ class DiscoveryService {
       } catch (_) {}
     }
 
-    await _bindUdpSocket();
+    try {
+      await _bindUdpSocket();
+    } catch (e) {
+      if (Platform.isAndroid) {
+        try {
+          _androidDiscovery.invokeMethod<void>('releaseMulticastLock');
+        } catch (_) {}
+      }
+      rethrow;
+    }
     _attachDatagramListener();
 
     unawaited(_refreshBroadcastTargets());
@@ -80,7 +90,8 @@ class DiscoveryService {
   void _attachDatagramListener() {
     final s = _socket;
     if (s == null) return;
-    s.listen((event) {
+    _socketSub?.cancel();
+    _socketSub = s.listen((event) {
       if (event != RawSocketEvent.read) return;
       final dg = s.receive();
       if (dg == null) return;
@@ -97,6 +108,8 @@ class DiscoveryService {
   /// Close and rebind so discovery works again without killing the process.
   Future<void> rebindUdpSocket() async {
     if (!_started) return;
+    _socketSub?.cancel();
+    _socketSub = null;
     try {
       _socket?.close();
     } catch (_) {}
@@ -273,7 +286,11 @@ class DiscoveryService {
     _broadcastTargetsTimer?.cancel();
     _broadcastTargetsTimer = null;
     _broadcastTimer?.cancel();
+    _broadcastTimer = null;
     _cleanupTimer?.cancel();
+    _cleanupTimer = null;
+    _socketSub?.cancel();
+    _socketSub = null;
     _socket?.close();
     _socket = null;
     if (Platform.isAndroid) {

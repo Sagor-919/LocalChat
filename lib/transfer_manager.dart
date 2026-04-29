@@ -121,6 +121,14 @@ class TransferManager {
     await _receiver!.startServer();
   }
 
+  void dispose() {
+    _notifTimer?.cancel();
+    _notifTimer = null;
+    _receiver?.stop();
+    if (!_transferUpdates.isClosed) _transferUpdates.close();
+    if (!_fileMessages.isClosed) _fileMessages.close();
+  }
+
   /// Called from main.dart when a file_notify arrives over the chat TCP.
   /// Pre-registers the expected incoming transfer so we can map fileId -> peerId.
   void registerIncoming(

@@ -19,11 +19,19 @@ class ConnectionService {
   static const Duration heartbeatInterval = Duration(seconds: 30);
   static const Duration pingTimeout = Duration(seconds: 10);
 
+  /// Maximum JSON line length. Peers sending larger frames are likely malformed
+  /// or malicious — close the socket rather than buffering indefinitely.
+  static const int _maxLineBytes = 1 * 1024 * 1024; // 1 MB
+
   final DeviceInfo me;
   ServerSocket? _server;
 
   final Map<String, Socket> _sockets = {};
   final Map<String, StringBuffer> _buffers = {};
+
+  /// Peers currently being dialled — prevents a second concurrent connectTo()
+  /// for the same peer from racing and creating a zombie socket.
+  final Set<String> _connecting = {};
 
   final Uuid _uuid = const Uuid();
   Timer? _heartbeatTimer;
@@ -131,6 +139,10 @@ class ConnectionService {
     final existing = _sockets[peer.userId];
     if (existing != null) return existing;
 
+    // Prevent two concurrent dials to the same peer from racing.
+    if (_connecting.contains(peer.userId)) return null;
+    _connecting.add(peer.userId);
+
     try {
       final socket = await _connectChatSocket(peer.ip, peer.port);
 
@@ -141,6 +153,8 @@ class ConnectionService {
       return socket;
     } catch (_) {
       return null;
+    } finally {
+      _connecting.remove(peer.userId);
     }
   }
 
@@ -151,6 +165,12 @@ class ConnectionService {
     socket.listen(
       (data) {
         buf.write(utf8.decode(data, allowMalformed: true));
+        if (_bufferOverflow(buf)) {
+          // Peer is sending a line larger than 1 MB — treat as malformed.
+          buf.clear();
+          try { socket.destroy(); } catch (_) {}
+          return;
+        }
         _processBuffer(buf, peerId, (resolvedId, json) {
           if (peerId == null && resolvedId != null) {
             peerId = resolvedId;
@@ -197,6 +217,12 @@ class ConnectionService {
       socket.setOption(SocketOption.tcpNoDelay, true);
     } catch (_) {}
   }
+
+  /// Returns `true` if the buffer has grown past [_maxLineBytes] without a
+  /// newline, indicating a malformed or malicious sender. Caller should close
+  /// the socket.
+  static bool _bufferOverflow(StringBuffer buf) =>
+      buf.length > _maxLineBytes;
 
   void _processBuffer(
     StringBuffer buf,
