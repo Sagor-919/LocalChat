@@ -28,14 +28,47 @@ String _displayNameForContentUri(String uri) {
   return 'shared_file';
 }
 
+String _extFromPathLike(String raw) {
+  final ext = p.extension(raw.trim());
+  return ext;
+}
+
+String _contentUriExtension(String uri) {
+  try {
+    final u = Uri.parse(uri);
+    if (u.pathSegments.isNotEmpty) {
+      final last = u.pathSegments.last;
+      final ext = _extFromPathLike(last);
+      if (ext.isNotEmpty) return ext;
+    }
+  } catch (_) {}
+  return '';
+}
+
+String _nameWithPreservedExtension({
+  required String preferredName,
+  required String fallbackPathLike,
+}) {
+  final name = preferredName.trim();
+  if (name.isEmpty) return name;
+  if (_extFromPathLike(name).isNotEmpty) return name;
+  final ext = _extFromPathLike(fallbackPathLike);
+  if (ext.isEmpty) return name;
+  return '$name$ext';
+}
+
 /// Maps a queue/CLI filesystem path or Android `content://` string to a staged attachment.
 DeferredStagedFile? deferredStagedFileFromLocalPath(String path) {
   final trimmed = path.trim();
   if (trimmed.isEmpty) return null;
   if (isStagedDropContentUri(trimmed)) {
+    final base = _displayNameForContentUri(trimmed);
+    final displayName = _extFromPathLike(base).isNotEmpty
+        ? base
+        : '$base${_contentUriExtension(trimmed)}';
     return DeferredStagedFile(
       androidContentUri: trimmed,
-      displayName: _displayNameForContentUri(trimmed),
+      displayName: displayName,
     );
   }
   if (Directory(trimmed).existsSync()) {
@@ -70,9 +103,15 @@ DeferredStagedFile? deferredStagedFileFromDropItem(DropItem item) {
   }
 
   if (path.isNotEmpty && isStagedDropContentUri(path)) {
-    final displayName = nameFromX.isNotEmpty
-        ? nameFromX
-        : _displayNameForContentUri(path);
+    final fallbackName = _displayNameForContentUri(path);
+    final baseName = nameFromX.isNotEmpty ? nameFromX : fallbackName;
+    final withPathExt = _nameWithPreservedExtension(
+      preferredName: baseName,
+      fallbackPathLike: path,
+    );
+    final displayName = _extFromPathLike(withPathExt).isNotEmpty
+        ? withPathExt
+        : '$withPathExt${_contentUriExtension(path)}';
     return DeferredStagedFile(
       androidContentUri: path,
       displayName: displayName,
@@ -91,7 +130,12 @@ DeferredStagedFile? deferredStagedFileFromDropItem(DropItem item) {
   if (path.isEmpty) return null;
 
   final displayName =
-      nameFromX.isNotEmpty ? nameFromX : p.basename(path);
+      nameFromX.isNotEmpty
+          ? _nameWithPreservedExtension(
+              preferredName: nameFromX,
+              fallbackPathLike: path,
+            )
+          : p.basename(path);
   return DeferredStagedFile(
     sourcePath: path,
     displayName: displayName,

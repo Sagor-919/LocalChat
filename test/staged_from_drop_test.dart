@@ -19,6 +19,14 @@ void main() {
     expect(f.kind, StagedSourceKind.file);
   });
 
+  test('content URI display name preserves extension when available', () {
+    final f = deferredStagedFileFromLocalPath(
+      'content://com.android.providers.downloads/document/report.pdf',
+    );
+    expect(f, isNotNull);
+    expect(f!.displayName.endsWith('.pdf'), isTrue);
+  });
+
   test('deferredStagedFileFromLocalPath directory is folderToZip', () async {
     final dir = await Directory.systemTemp.createTemp('lc_drop_test_');
     try {
