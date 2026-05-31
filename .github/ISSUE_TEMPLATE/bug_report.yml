@@ -1,0 +1,58 @@
+name: Bug report
+description: Report something that is not working correctly.
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open...
+        2. Tap...
+        3. See...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      multiple: true
+      options:
+        - Android
+        - Windows
+        - Linux
+        - macOS
+        - Web preview
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: LocalChat version
+      placeholder: "1.8.0+8"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: Add logs, screenshots, or screen recordings if available.

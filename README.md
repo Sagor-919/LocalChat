@@ -149,6 +149,8 @@ Current tests cover attachment preparation, folder zipping, dropped-file staging
 3. Run `flutter test` and `flutter analyze` before opening a PR.
 4. Update `README.md` or `docs/FEATURES.md` when behavior changes.
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contributor guidelines and [SECURITY.md](SECURITY.md) for private vulnerability reporting.
+
 ## License
 
 LocalChat is open source under the [MIT License](LICENSE).
