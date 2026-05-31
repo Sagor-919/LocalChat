@@ -1,17 +1,16 @@
-# Windows: open files in Local Chat from Explorer
+# Windows: Open Files in Local Chat from Explorer
 
-Flutter desktop apps are not registered in the system **Share** sheet the same way as Store apps. You can still send a file path into Local Chat using a **“Send to Local Chat”** context-menu entry.
+Flutter desktop apps are not registered in the Windows Share sheet the same way as Store apps. LocalChat supports a simpler command-line handoff instead:
 
-## Steps
+```bat
+local_chat.exe --share-file "C:\path\to\file.txt"
+```
 
-1. Build or install Local Chat and note the full path to `local_chat.exe` (for example `C:\Apps\local_chat\local_chat.exe`).
-2. Open Notepad, paste the template below, replace `FULL_PATH_TO_EXE` with your real path (keep the quotes).
-3. Save as `local_chat_sendto.reg`, double-click it, and confirm the merge.
-4. In File Explorer, right-click a file → **Show more options** (Windows 11) → **Send to** → **Local Chat** (if you used the SendTo folder method), **or** use the **context menu** method below.
+The app queues the file. Open a chat to stage and send it, matching the home-screen drag-and-drop flow.
 
-### Context menu (per user, no admin)
+## Context Menu Entry
 
-Save as `local_chat_context.reg` (adjust the exe path):
+Save the following as `local_chat_context.reg`, adjust the executable path, then double-click the file and confirm the registry merge.
 
 ```reg
 Windows Registry Editor Version 5.00
@@ -24,6 +23,10 @@ Windows Registry Editor Version 5.00
 @="\"C:\\Apps\\local_chat\\local_chat.exe\" --share-file \"%1\""
 ```
 
-After merging, right-click a file → **Send with Local Chat**. The app queues the file; open a chat to attach it (same flow as drag-and-drop on the home screen).
+After merging, right-click a file in File Explorer and choose **Send with Local Chat**.
 
-**Multiple files:** run the app once per file, or drag several files onto the home window.
+## Notes
+
+- This is a per-user registry entry and does not require administrator access.
+- On Windows 11, the entry may appear under **Show more options**.
+- Multiple files can be sent by invoking the app once per file, or by dragging several files onto the LocalChat home window.
