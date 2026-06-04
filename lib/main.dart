@@ -6,6 +6,7 @@ import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:window_manager/window_manager.dart';
@@ -14,9 +15,12 @@ import 'app_branding.dart';
 import 'app_settings.dart';
 import 'app_splash.dart';
 import 'android_share_inbound.dart';
-import 'client_platform.dart';
 import 'chat_crypto.dart';
+import 'chat_protocol_handler.dart';
 import 'chat_screen.dart';
+import 'debug_log.dart';
+import 'discovery_signing.dart';
+import 'storage_usage.dart';
 import 'connection_service.dart';
 import 'desktop_drop_queue.dart';
 import 'device.dart';
@@ -220,31 +224,6 @@ Future<void> _handleIncomingTextMessage(String peerId, ChatMessage msg) async {
   }
 }
 
-/// Receiver acknowledged [messageId]; we confirm back so both sides agree delivery completed.
-Future<void> _completeDeliveryHandshake(
-  String peerId,
-  String messageId,
-) async {
-  final ok = _connections.sendJson(peerId, {
-    'type': 'message_ack_confirm',
-    'id': messageId,
-    'from': _me.userId,
-  });
-  if (ok) {
-    await _store.updateDeliveryState(
-      peerId,
-      messageId,
-      MessageDelivery.delivered,
-    );
-  } else {
-    await _store.updateDeliveryState(
-      peerId,
-      messageId,
-      MessageDelivery.awaitingConfirm,
-    );
-  }
-}
-
 Future<PeerDevice?> _peerDeviceFromStore(String peerId) async {
   final infos = await _store.loadAllPeerInfos();
   final info = infos[peerId];
@@ -428,6 +407,15 @@ Future<void> _initNotificationsSafe() async {
 /// frame paints before any blocking I/O.
 Future<void> _bootstrapServices() async {
   await AppSettings.instance.init();
+  try {
+    final cleaned = await cleanLocalChatTempPrepArtifacts();
+    DebugLog.instance.log(
+      'Startup temp prep cleanup: ${cleaned.deleted} file(s), '
+      '${cleaned.freedBytes} bytes',
+    );
+  } catch (e) {
+    DebugLog.instance.log('Startup temp cleanup failed: $e');
+  }
   if (!kIsWeb && Platform.isWindows && _windowsAutostartLaunch) {
     _deferOnboardingUntilWindowShown =
         !AppSettings.instance.firstLaunchOnboardingComplete;
@@ -441,6 +429,10 @@ Future<void> _bootstrapServices() async {
   _discovery = DiscoveryService(me: _me);
   _connections = ConnectionService(me: _me);
   _discovery.hasActiveChatTcp = (id) => _connections.isConnected(id);
+  final prefs = await SharedPreferences.getInstance();
+  _discovery.setDiscoveryHmacSecret(
+    await DiscoverySigning.ensureSecret(prefs),
+  );
   await _connections.startServer();
   await _discovery.start();
 
@@ -474,136 +466,16 @@ Future<void> _bootstrapServices() async {
 
   await _initNotificationsSafe();
 
-  _connections.onMessage = (peerId, json) {
-    final type = json['type'] as String?;
-
-    if (type == 'ping') {
-      final id = json['id'] as String?;
-      if (id != null) _connections.handleIncomingPing(peerId, id);
-      return;
-    }
-    if (type == 'pong') {
-      final id = json['id'] as String?;
-      if (id != null) _connections.handlePong(peerId, id);
-      return;
-    }
-
-    if (type == 'hello') {
-      final name = (json['name'] as String? ?? '').trim();
-      final plat = (json['platform'] as String? ?? '').trim();
-      if (plat.isNotEmpty) {
-        _discovery.updatePeerPlatform(peerId, plat);
-      }
-      final peer = _discoveryPeerById(peerId);
-      final sock = _connections.getSocket(peerId);
-      final ip = (peer?.ip ?? sock?.remoteAddress.address ?? '').trim();
-      final port = peer?.port ?? ConnectionService.tcpPort;
-      final displayName = name.isNotEmpty
-          ? name
-          : ((peer?.name ?? '').trim().isNotEmpty ? peer!.name : 'Peer');
-      unawaited(_store.savePeerInfo(
-        peerId,
-        displayName,
-        ip,
-        port,
-        lanStableTag: peer?.lanStableTag,
-      ));
-      _connections.sendJson(peerId, {
-        'type': 'hello',
-        'id': _me.userId,
-        'name': _me.displayName,
-        'platform': localClientPlatform,
-      });
-      return;
-    }
-
-    if (type == 'message_ack_confirm') {
-      // Original receiver: sender confirmed they recorded delivery after our message_ack.
-      return;
-    }
-
-    if (type == 'message_ack') {
-      final id = json['id'] as String?;
-      if (id != null && id.isNotEmpty) {
-        unawaited(_completeDeliveryHandshake(peerId, id));
-      }
-      return;
-    }
-
-    if (type == 'message') {
-      final enc = json['enc'] == true;
-      if (enc) {
-        unawaited(_handleIncomingEncryptedMessage(peerId, json));
-      } else {
-        final msg = ChatMessage.fromJson(json, _me.userId);
-        if (msg != null) {
-          unawaited(_handleIncomingTextMessage(peerId, msg));
-        }
-      }
-      return;
-    }
-
-    if (type == 'file_offer') {
-      final peer = _discoveryPeerById(peerId);
-      final peerName = peer?.name ?? 'Peer';
-      unawaited(TransferManager.instance.onIncomingFileOffer(
-        peerId,
-        json,
-        peerDisplayName: peerName,
-      ));
-      return;
-    }
-
-    if (type == 'file_accept') {
-      final id = json['id'] as String?;
-      if (id != null && id.isNotEmpty) {
-        TransferManager.instance.onFileAccept(peerId, id);
-      }
-      return;
-    }
-
-    if (type == 'file_reject') {
-      final id = json['id'] as String?;
-      if (id != null && id.isNotEmpty) {
-        TransferManager.instance.onFileReject(peerId, id);
-      }
-      return;
-    }
-
-    if (type == 'file_notify') {
-      TransferManager.instance.registerIncoming(
-        peerId,
-        json['id'] as String? ?? '',
-        json['name'] as String? ?? '',
-        (json['size'] as num?)?.toInt() ?? 0,
-        folderRoot: json['folderRoot'] as String?,
-        batchMessageId: json['batchMessageId'] as String?,
-        batchTotalSize: (json['batchTotalSize'] as num?)?.toInt(),
-      );
-      return;
-    }
-
-    if (type == 'file_control') {
-      final id = json['id'] as String?;
-      if (id == null || id.isEmpty) return;
-      final from = json['from'] as String? ?? '';
-      final pause = json['pause'] == true;
-      if (pause) {
-        if (from == 'sender') {
-          TransferManager.instance.handleRemotePauseIncoming(id);
-        } else if (from == 'receiver') {
-          TransferManager.instance.handleRemotePauseOutgoing(id);
-        }
-      } else {
-        if (from == 'receiver') {
-          TransferManager.instance.handleRemoteResumeOutgoing(id);
-        } else if (from == 'sender') {
-          TransferManager.instance.handleRemoteResumeIncoming(id);
-        }
-      }
-      return;
-    }
-  };
+  final protocol = ChatProtocolHandler(
+    me: _me,
+    connections: _connections,
+    discovery: _discovery,
+    store: _store,
+    discoveryPeerById: _discoveryPeerById,
+    onIncomingPlainMessage: _handleIncomingTextMessage,
+    onIncomingEncryptedMessage: _handleIncomingEncryptedMessage,
+  );
+  _connections.onMessage = protocol.handle;
 
   _fileMessagesSub = TransferManager.instance.fileMessages.listen((event) {
     if (event.message.isMine) return;
@@ -629,6 +501,27 @@ Future<void> _bootstrapServices() async {
 Future<void> main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
 
+  if (kIsWeb) {
+    runApp(
+      MaterialApp(
+        home: Scaffold(
+          body: Center(
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Text(
+                'Local Chat is not available on web. '
+                'Use the Windows, macOS, Linux, or Android build on your LAN.',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 16),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    return;
+  }
+
   // ---- Synchronous-ish prelude (~tens of ms) ----
   // Goal: reach [runApp] as fast as possible so the splash paints first.
   // Heavy I/O (sqlite, sockets, notifications) moves to [_bootstrapServices].
@@ -642,6 +535,12 @@ Future<void> main(List<String> args) async {
       if (args[i] == '--share-file' && i + 1 < args.length) {
         final p = args[++i];
         if (p.isNotEmpty && stagedDropPathExists(p)) {
+          DesktopDropQueue.enqueue([p]);
+        }
+      }
+      if (args[i] == '--share-folder' && i + 1 < args.length) {
+        final p = args[++i];
+        if (p.isNotEmpty && Directory(p).existsSync()) {
           DesktopDropQueue.enqueue([p]);
         }
       }

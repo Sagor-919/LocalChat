@@ -7,7 +7,9 @@ import 'package:flutter/services.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 
 import 'client_platform.dart';
+import 'debug_log.dart';
 import 'device.dart';
+import 'discovery_signing.dart';
 
 class DiscoveryService {
   static const int udpPort = 4040;
@@ -23,6 +25,8 @@ class DiscoveryService {
   final DeviceInfo me;
   final Map<String, PeerDevice> _peers = {};
   RawDatagramSocket? _socket;
+  RawDatagramSocket? _socketV6;
+  String? _discoveryHmacSecret;
   StreamSubscription<RawSocketEvent>? _socketSub;
   Timer? _broadcastTimer;
   Timer? _cleanupTimer;
@@ -38,6 +42,10 @@ class DiscoveryService {
   bool _started = false;
 
   DiscoveryService({required this.me});
+
+  void setDiscoveryHmacSecret(String? secret) {
+    _discoveryHmacSecret = secret;
+  }
 
   List<PeerDevice> get peers => _peers.values.toList();
 
@@ -86,6 +94,18 @@ class DiscoveryService {
     );
     _socket!.broadcastEnabled = true;
     _joinMulticastGroups();
+    try {
+      _socketV6 = await RawDatagramSocket.bind(
+        InternetAddress.anyIPv6,
+        udpPort,
+        reuseAddress: reuseAddr,
+        reusePort: false,
+      );
+      _socketV6!.broadcastEnabled = true;
+    } catch (e) {
+      DebugLog.instance.log('IPv6 discovery bind skipped: $e');
+      _socketV6 = null;
+    }
   }
 
   void _attachDatagramListener() {
@@ -102,6 +122,18 @@ class DiscoveryService {
         _handleMessage(msg, dg.address.address);
       } catch (_) {}
     });
+    final s6 = _socketV6;
+    if (s6 != null) {
+      s6.listen((event) {
+        if (event != RawSocketEvent.read) return;
+        final dg = s6.receive();
+        if (dg == null) return;
+        try {
+          final msg = utf8.decode(dg.data);
+          _handleMessage(msg, dg.address.address);
+        } catch (_) {}
+      });
+    }
   }
 
   /// After Wi‑Fi/VPN changes, the old [RawDatagramSocket] may stop receiving
@@ -115,6 +147,10 @@ class DiscoveryService {
       _socket?.close();
     } catch (_) {}
     _socket = null;
+    try {
+      _socketV6?.close();
+    } catch (_) {}
+    _socketV6 = null;
 
     if (Platform.isAndroid) {
       try {
@@ -208,8 +244,12 @@ class DiscoveryService {
   void _broadcast() {
     final tag = me.lanStableTag.trim();
     final tagField = tag.isEmpty ? '-' : tag;
-    final msg =
+    var msg =
         'LOCALCHAT|${me.userId}|${me.displayName}|$tcpPort|$tagField|${localClientPlatform}';
+    final secret = _discoveryHmacSecret;
+    if (secret != null && secret.isNotEmpty) {
+      msg = DiscoverySigning.appendSignature(msg, secret);
+    }
     final data = utf8.encode(msg);
     try {
       _socket?.send(data, InternetAddress('255.255.255.255'), udpPort);
@@ -222,11 +262,29 @@ class DiscoveryService {
         _socket?.send(data, target, udpPort);
       } catch (_) {}
     }
+    try {
+      _socketV6?.send(
+        data,
+        InternetAddress('ff02::1', type: InternetAddressType.IPv6),
+        udpPort,
+      );
+    } catch (_) {}
   }
 
   void _handleMessage(String raw, String senderIp) {
     if (!raw.startsWith('LOCALCHAT|')) return;
-    final parts = raw.split('|');
+    final secret = _discoveryHmacSecret;
+    var payload = raw;
+    if (secret != null && secret.isNotEmpty) {
+      final split = DiscoverySigning.splitSignedLine(raw);
+      if (split.sig != null) {
+        if (!DiscoverySigning.verifyPayload(split.payload, split.sig!, secret)) {
+          return;
+        }
+        payload = split.payload;
+      }
+    }
+    final parts = payload.split('|');
     if (parts.length < 4) return;
 
     final userId = parts[1];
