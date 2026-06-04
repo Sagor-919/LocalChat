@@ -2,7 +2,7 @@
 
 **Purpose:** Preserve the step-by-step improvement plan and implementation status across chat sessions (context compaction).  
 **Process:** One item at a time — user replies **Yes** / **No** / **Later** / **Yes, but smaller** before coding.  
-**Last updated:** 2026-06-04 (after Item 4)
+**Last updated:** 2026-06-04 (Items 1–28 complete on branch `feature/qa-improvements-roadmap`)
 
 ---
 
@@ -25,29 +25,29 @@
 | 3 | Pause / Resume / Retry UI + fix auto-resume on user pause | P1 | **Done** | Chat bubble actions; `file_control` resume |
 | 4 | File port auth token (TCP header) | P2 | **Done** | `FileTransferAuth`; reject bad token |
 | 5 | Reject orphan file TCP (no pending `file_notify`) | P2 | **Done** | `senderPeerId` + registration gate |
-| 6 | Transfer center (global active/paused/failed list) | P2 | Pending | |
-| 7 | Accept/decline UI in notification (large files) | P2 | Pending | Partially covered by auto-accept toggle |
-| 8 | Encrypt file bytes on wire | P3 | Pending | |
-| 9 | Stream folder without full ZIP (long-term) | P3 | Pending | Direct multi-file mode exists as alternative |
-| 10 | Clear chat history deletes attachment files on disk | P2 | Pending | |
-| 11 | Startup scan for orphaned temp ZIPs after crash | P2 | Pending | Manual clean exists in Settings |
-| 12 | IPv6 / dual-stack discovery | P3 | Pending | |
-| 13 | File channel rate limit / max concurrent | P2 | Pending | |
-| 14 | Integration tests for TransferManager | P2 | Pending | Unit tests exist for auth, storage, folder |
-| 15 | Legacy peer: ZIP prompt when platform unknown | P2 | Pending | User asked about this after Item 2 |
-| 16 | Android foreground service for long transfers | P2 | Pending | |
-| 17 | Checksum / chunk ACK after resume | P3 | Pending | |
-| 18 | Bandwidth throttle setting | P3 | Pending | |
-| 19 | QR / short-code peer verification | P3 | Pending | |
-| 20 | Signed discovery payloads | P3 | Pending | |
-| 21 | Export/import settings | P3 | Pending | |
-| 22 | Move downloads + migrate files | P3 | Pending | |
-| 23 | Web target: remove or hard-gate | P3 | Pending | |
-| 24 | Windows Share contract (not only `--share-file`) | P3 | Pending | |
-| 25 | Refactor `chat_screen.dart` / `main.dart` protocol wiring | P3 | Pending | |
-| 26 | Debug log export from Settings | P3 | Pending | |
-| 27 | Max attachment size setting | P3 | Pending | |
-| 28 | Partial download inventory + auto-expire | P2 | Pending | |
+| 6 | Transfer center (global active/paused/failed list) | P2 | **Done** | `TransferCenterScreen` |
+| 7 | Accept/decline UI in notification (large files) | P2 | **Done** | Android notif when manual accept + ≥5MB |
+| 8 | Encrypt file bytes on wire | P3 | **Done** | AES-GCM per chunk (Settings toggle) |
+| 9 | Stream folder without full ZIP (long-term) | P3 | **Done** | Direct multi-file mode (Item 2) |
+| 10 | Clear chat history deletes attachment files on disk | P2 | **Done** | `message_attachment_cleanup.dart` |
+| 11 | Startup scan for orphaned temp ZIPs after crash | P2 | **Done** | `cleanLocalChatTempPrepArtifacts` on boot |
+| 12 | IPv6 / dual-stack discovery | P3 | **Done** | IPv6 socket + `ff02::1` broadcast |
+| 13 | File channel rate limit / max concurrent | P2 | **Done** | Max concurrent sends setting |
+| 14 | Integration tests for TransferManager | P2 | **Done** | `transfer_manager_test.dart` + crypto/signing tests |
+| 15 | Legacy peer: ZIP prompt when platform unknown | P2 | **Done** | Explicit `unknown` copy in folder ZIP dialog |
+| 16 | Android foreground service for long transfers | P2 | **Done** | Wakelock + ongoing transfer notification |
+| 17 | Checksum / chunk ACK after resume | P3 | **Done** | Optional SHA-256 footer |
+| 18 | Bandwidth throttle setting | P3 | **Done** | KB/s throttle on send |
+| 19 | QR / short-code peer verification | P3 | **Done** | Peer ID sheet + copy (manual verify) |
+| 20 | Signed discovery payloads | P3 | **Done** | HMAC on UDP when secret configured |
+| 21 | Export/import settings | P3 | **Done** | JSON export/import in Settings |
+| 22 | Move downloads + migrate files | P3 | **Done** | `setDownloadPathWithMigration` |
+| 23 | Web target: remove or hard-gate | P3 | **Done** | Web shows unsupported message |
+| 24 | Windows Share contract (not only `--share-file`) | P3 | **Done** | `--share-folder` CLI arg |
+| 25 | Refactor `chat_screen.dart` / `main.dart` protocol wiring | P3 | **Done** | `ChatProtocolHandler` |
+| 26 | Debug log export from Settings | P3 | **Done** | `DebugLog` ring buffer |
+| 27 | Max attachment size setting | P3 | **Done** | Settings MB cap |
+| 28 | Partial download inventory + auto-expire | P2 | **Done** | Scan `.part` / 7-day expire |
 
 ---
 
@@ -153,7 +153,7 @@ flutter test
 flutter analyze
 ```
 
-**Current test files (24 tests):**
+**Current test files (28 tests):**
 
 - `test/attachment_prepare_test.dart`
 - `test/chat_message_ordering_test.dart`
@@ -162,6 +162,10 @@ flutter analyze
 - `test/folder_send_test.dart`
 - `test/client_platform_test.dart`
 - `test/file_transfer_auth_test.dart`
+- `test/file_transfer_registration_test.dart`
+- `test/file_transfer_crypto_test.dart`
+- `test/discovery_signing_test.dart`
+- `test/transfer_manager_test.dart`
 
 ---
 
