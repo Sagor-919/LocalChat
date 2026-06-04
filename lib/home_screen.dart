@@ -17,6 +17,7 @@ import 'discovery_service.dart';
 import 'message_model.dart';
 import 'message_store.dart';
 import 'settings_screen.dart';
+import 'transfer_center_screen.dart';
 import 'transfer_manager.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -761,6 +762,17 @@ class _HomeScreenState extends State<HomeScreen> {
                     ),
                   ],
                 ),
+              ),
+              IconButton(
+                onPressed: () {
+                  Navigator.of(context).push(
+                    MaterialPageRoute<void>(
+                      builder: (_) => const TransferCenterScreen(),
+                    ),
+                  );
+                },
+                icon: Icon(Icons.swap_horiz, color: cs.onSurfaceVariant),
+                tooltip: 'Transfers',
               ),
               IconButton(
                 onPressed: () {
