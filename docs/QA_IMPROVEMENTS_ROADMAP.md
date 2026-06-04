@@ -24,7 +24,7 @@
 | 2 | Receiver preflight + auto-accept + folder send modes + Android→ZIP prompt | P0/P1 | **Done** | Merged with user refinements during Item 2 discussion |
 | 3 | Pause / Resume / Retry UI + fix auto-resume on user pause | P1 | **Done** | Chat bubble actions; `file_control` resume |
 | 4 | File port auth token (TCP header) | P2 | **Done** | `FileTransferAuth`; reject bad token |
-| 5 | Reject orphan file TCP (no pending `file_notify`) | P2 | **Pending** | **Next candidate** |
+| 5 | Reject orphan file TCP (no pending `file_notify`) | P2 | **Done** | `senderPeerId` + registration gate |
 | 6 | Transfer center (global active/paused/failed list) | P2 | Pending | |
 | 7 | Accept/decline UI in notification (large files) | P2 | Pending | Partially covered by auto-accept toggle |
 | 8 | Encrypt file bytes on wire | P3 | Pending | |
@@ -123,17 +123,9 @@
 
 ---
 
-## Item 5 — Spec (not implemented yet)
+### Item 5 — Reject orphan file TCP
 
-**Goal:** Reject file TCP connections when there is no matching pending `file_notify` for that `fileId` (and optionally require `senderPeerId` in header).
-
-**Suggested steps when approved:**
-
-1. Extend TCP header with optional `senderPeerId` (must match chat peer for registered transfer).
-2. In `FileReceiver`, if `validateTransferToken` passes but no pending registration → close socket.
-3. Tighten `_onReceiveStarted` timeout path (currently 3s wait for unknown `fileId`).
-4. Add test: connect with valid token but no registration → rejected.
-5. Update [`FILE_TRANSFER_PROTOCOL.md`](FILE_TRANSFER_PROTOCOL.md).
+**Shipped:** `senderPeerId` in TCP header; validator matches registered peer; `isIncomingRegistered` before file write; orphan receive path deletes partial file; 800ms notify wait then abort.
 
 ---
 

@@ -160,6 +160,7 @@ class TransferManager {
     _receiver = FileReceiver();
     _receiver!.resumePathResolver = _resolveResumeReceivePath;
     _receiver!.validateTransferToken = _validateIncomingTransferToken;
+    _receiver!.isIncomingRegistered = _isIncomingRegistered;
     _receiver!.onFileStarted = _onReceiveStarted;
     _receiver!.onProgress = _onReceiveProgress;
     _receiver!.onFileComplete = _onReceiveComplete;
@@ -211,12 +212,18 @@ class TransferManager {
     _tokenPeerByFileId.remove(fileId);
   }
 
+  Future<bool> _isIncomingRegistered(String fileId) async =>
+      _tokenPeerByFileId.containsKey(fileId);
+
   Future<bool> _validateIncomingTransferToken(
     String fileId,
     String? token,
+    String? senderPeerId,
   ) async {
     final peerId = _tokenPeerByFileId[fileId];
     if (peerId == null) return false;
+    if (senderPeerId == null || senderPeerId.isEmpty) return false;
+    if (senderPeerId != peerId) return false;
     return FileTransferAuth.verify(_myId, peerId, fileId, token);
   }
 
@@ -792,6 +799,7 @@ class TransferManager {
         startOffset: startOff,
         folderRoot: folderRoot,
         token: _outboundToken(t.peerId, t.fileId),
+        senderPeerId: _myId,
         onProgress: (sent, total) {
           if (onChunkSent != null) {
             final delta = sent - lastReported;
@@ -1097,13 +1105,19 @@ class TransferManager {
       _waiters[fileId] = waiter;
       try {
         pending = await waiter.completer.future
-            .timeout(const Duration(seconds: 3));
+            .timeout(const Duration(milliseconds: 800));
       } catch (_) {
         _waiters.remove(fileId);
       }
     }
-    final peerId = pending?.peerId ?? 'unknown';
-    final batchId = pending?.batchMessageId;
+    if (pending == null) {
+      await deletePartialDownloadFile(savePath);
+      _clearIncomingToken(fileId);
+      _receiver?.cancelReceive(fileId);
+      return;
+    }
+    final peerId = pending.peerId;
+    final batchId = pending.batchMessageId;
 
     if (batchId != null) {
       _receiveBatchParent[fileId] = batchId;
@@ -1112,7 +1126,7 @@ class TransferManager {
       return;
     }
 
-    if (pending?.batchTotalSize != null) {
+    if (pending.batchTotalSize != null) {
       _folderBatchRootIds.add(fileId);
     }
 
@@ -1123,7 +1137,7 @@ class TransferManager {
       timestamp: DateTime.now().millisecondsSinceEpoch,
       isMine: false,
       attachmentName: fileName,
-      attachmentSize: pending?.batchTotalSize ?? fileSize,
+      attachmentSize: pending.batchTotalSize ?? fileSize,
     );
 
     final sockIp =
@@ -1136,7 +1150,7 @@ class TransferManager {
     );
     _fileMessages.add(FileMessageEvent(peerId, msg));
 
-    final batchTotal = pending?.batchTotalSize;
+    final batchTotal = pending.batchTotalSize;
     transfers[fileId] = TransferState(
       fileId: fileId,
       peerId: peerId,

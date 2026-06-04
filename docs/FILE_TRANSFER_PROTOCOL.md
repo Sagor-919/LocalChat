@@ -119,6 +119,7 @@ Handler: [`main.dart`](../lib/main.dart) → [`TransferManager`](../lib/transfer
   "size": 12345,
   "offset": 0,
   "token": "<64-char hex sha256>",
+  "senderPeerId": "<sender userId uuid>",
   "folderRoot": "OptionalFolderName"
 }
 ```
@@ -135,8 +136,9 @@ token = SHA256( UTF8("localchat:file:v1:" + ids[0] + ":" + ids[1] + ":" + fileId
 Implementation: [`FileTransferAuth`](../lib/file_transfer_auth.dart).
 
 - Receiver stores expected token when `file_notify` is processed.
-- Validation: [`FileReceiver.validateTransferToken`](../lib/file_transfer_service.dart).
-- Failure: socket closed, error `Rejected: invalid or missing transfer token`.
+- Validation: [`FileReceiver.validateTransferToken`](../lib/file_transfer_service.dart) — `senderPeerId` must match registered peer; token must match.
+- `isIncomingRegistered`: rejects TCP when no pending `file_notify` for `fileId`.
+- Failure: socket closed, error `Rejected: invalid or missing transfer token` or `Rejected: no pending transfer for this file`.
 
 ### After header
 
@@ -201,12 +203,10 @@ Auto-resume after network blip: only if **`userPaused` is false**.
 
 ---
 
-## Planned (Item 5 — not implemented)
+## Orphan TCP rejection (Item 5)
 
-- Reject TCP when no pending registration for `fileId`.
-- Optional `senderPeerId` in TCP header must match chat peer.
-
-See [`QA_IMPROVEMENTS_ROADMAP.md`](QA_IMPROVEMENTS_ROADMAP.md) Item 5.
+- `senderPeerId` in header must match the peer from `file_notify`.
+- No registration → connection closed before `START` (no chat row with `unknown` peer).
 
 ---
 

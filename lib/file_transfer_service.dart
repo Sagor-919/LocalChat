@@ -98,6 +98,7 @@ class FileSender {
     int startOffset = 0,
     String? folderRoot,
     required String token,
+    required String senderPeerId,
   }) async {
     if (startOffset < 0 || startOffset > fileSize) {
       throw ArgumentError('Invalid startOffset');
@@ -113,6 +114,7 @@ class FileSender {
         'size': fileSize,
         'offset': startOffset,
         'token': token,
+        'senderPeerId': senderPeerId,
       };
       if (folderRoot != null && folderRoot.isNotEmpty) {
         header['folderRoot'] = folderRoot;
@@ -216,8 +218,15 @@ class FileReceiver {
   Future<String?> Function(String fileId, int offset, String safeName)?
       resumePathResolver;
 
-  /// When set, incoming TCP must present a matching [token] in the header.
-  Future<bool> Function(String fileId, String? token)? validateTransferToken;
+  /// When set, incoming TCP must present a matching [token] and [senderPeerId].
+  Future<bool> Function(
+    String fileId,
+    String? token,
+    String? senderPeerId,
+  )? validateTransferToken;
+
+  /// When set, [fileId] must have a pending [file_notify] registration.
+  Future<bool> Function(String fileId)? isIncomingRegistered;
 
   Future<void> Function(
     String fileId,
@@ -379,7 +388,8 @@ class FileReceiver {
       final validator = validateTransferToken;
       if (validator != null) {
         final headerToken = header['token'] as String?;
-        final ok = await validator(fileId, headerToken);
+        final senderPeerId = header['senderPeerId'] as String?;
+        final ok = await validator(fileId, headerToken, senderPeerId);
         if (!ok) {
           try {
             await socket.close();
@@ -387,6 +397,22 @@ class FileReceiver {
           onFileError?.call(
             fileId,
             'Rejected: invalid or missing transfer token',
+            null,
+          );
+          return;
+        }
+      }
+
+      final regCheck = isIncomingRegistered;
+      if (regCheck != null) {
+        final registered = await regCheck(fileId);
+        if (!registered) {
+          try {
+            await socket.close();
+          } catch (_) {}
+          onFileError?.call(
+            fileId,
+            'Rejected: no pending transfer for this file',
             null,
           );
           return;
