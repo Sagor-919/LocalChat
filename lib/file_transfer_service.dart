@@ -4,10 +4,13 @@ import 'dart:io';
 import 'dart:math' show min;
 import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart';
+import 'package:cryptography/cryptography.dart';
 import 'package:path/path.dart' as p;
 import 'package:synchronized/synchronized.dart';
 
 import 'app_settings.dart';
+import 'file_transfer_crypto.dart';
 import 'folder_send.dart';
 
 const int kFileTransferPort = 4042;
@@ -99,6 +102,10 @@ class FileSender {
     String? folderRoot,
     required String token,
     required String senderPeerId,
+    String? encryptPeerId,
+    bool encryptPayload = false,
+    int? throttleBytesPerSec,
+    bool appendChecksum = false,
   }) async {
     if (startOffset < 0 || startOffset > fileSize) {
       throw ArgumentError('Invalid startOffset');
@@ -119,10 +126,26 @@ class FileSender {
       if (folderRoot != null && folderRoot.isNotEmpty) {
         header['folderRoot'] = folderRoot;
       }
+      if (encryptPayload) {
+        header['encrypted'] = true;
+      }
+      if (appendChecksum) {
+        header['checksum'] = true;
+      }
       socket.write('${jsonEncode(header)}\n');
       await socket.flush();
 
       await _waitForStart(socket);
+
+      SecretKey? encKey;
+      if (encryptPayload && encryptPeerId != null) {
+        encKey = await FileTransferCrypto.secretKey(
+          senderPeerId,
+          encryptPeerId,
+          fileId,
+        );
+      }
+      var encSeq = 0;
 
       final raf = await file.open();
       try {
@@ -139,13 +162,34 @@ class FileSender {
           final buf = await raf.read(toRead);
           if (buf.isEmpty) break;
 
-          socket.add(buf);
+          if (encKey != null) {
+            final enc = await FileTransferCrypto.encryptChunk(
+              encKey,
+              encSeq++,
+              buf,
+            );
+            socket.add(FileTransferCrypto.lengthPrefix(enc));
+          } else {
+            socket.add(buf);
+          }
           await socket.flush();
           bytesSent += buf.length;
           onProgress(startOffset + bytesSent, fileSize);
+          if (throttleBytesPerSec != null && throttleBytesPerSec > 0) {
+            final us = buf.length * 1000000 ~/ throttleBytesPerSec;
+            if (us > 0) {
+              await Future<void>.delayed(Duration(microseconds: us));
+            }
+          }
         }
       } finally {
         await raf.close();
+      }
+
+      if (appendChecksum) {
+        final digest = await sha256.bind(file.openRead()).first;
+        socket.write('\nCHECKSUM:${digest.toString()}\n');
+        await socket.flush();
       }
 
       await socket.close();
@@ -228,6 +272,9 @@ class FileReceiver {
   /// When set, [fileId] must have a pending [file_notify] registration.
   Future<bool> Function(String fileId)? isIncomingRegistered;
 
+  /// Local user id for decrypting encrypted file payloads.
+  String? localPeerId;
+
   Future<void> Function(
     String fileId,
     String fileName,
@@ -290,11 +337,75 @@ class FileReceiver {
     int resumeOffset = 0;
     String fileId = '';
     String? savePath;
+    var encrypted = false;
+    var expectChecksum = false;
+    SecretKey? decKey;
+    final encBuffer = <int>[];
+    var decSeq = 0;
+    Digest? payloadDigest;
+    final digestSink = _DigestCaptureSink((d) => payloadDigest = d);
+    final payloadHasher = sha256.startChunkedConversion(digestSink);
 
     late StreamSubscription<List<int>> sub;
 
+    Future<void> writePlain(Uint8List plain) async {
+      if (raf == null) return;
+      var offset = 0;
+      while (offset < plain.length) {
+        final (isCancelled, isPaused) = await _transferIdsLock.synchronized(
+          () => (
+            _cancelledIds.contains(fileId),
+            _pausedIds.contains(fileId),
+          ),
+        );
+        if (isCancelled) {
+          if (!done.isCompleted) {
+            done.completeError(const _CancelledException());
+          }
+          return;
+        }
+        if (isPaused) {
+          if (!done.isCompleted) {
+            done.completeError(const TransferPausedException());
+          }
+          return;
+        }
+        if (fileWritten < totalBytes) {
+          final take = min(plain.length - offset, totalBytes - fileWritten);
+          final slice = plain.sublist(offset, offset + take);
+          payloadHasher.add(slice);
+          await raf!.writeFrom(slice);
+          fileWritten += take;
+          offset += take;
+          onProgress?.call(fileId, fileWritten, totalBytes);
+        } else {
+          offset = plain.length;
+        }
+      }
+    }
+
+    Future<void> processEncryptedPayload(Uint8List data) async {
+      encBuffer.addAll(data);
+      while (encBuffer.length >= 4) {
+        final len = ByteData.sublistView(
+          Uint8List.fromList(encBuffer.sublist(0, 4)),
+        ).getUint32(0);
+        if (encBuffer.length < 4 + len) break;
+        final cipher = Uint8List.fromList(encBuffer.sublist(4, 4 + len));
+        encBuffer.removeRange(0, 4 + len);
+        if (decKey == null) return;
+        final plain =
+            await FileTransferCrypto.decryptChunk(decKey, decSeq++, cipher);
+        await writePlain(plain);
+      }
+    }
+
     Future<void> processFilePayload(Uint8List data) async {
       if (!setupDone || raf == null) return;
+      if (encrypted) {
+        await processEncryptedPayload(data);
+        return;
+      }
 
       var offset = 0;
       while (offset < data.length) {
@@ -320,12 +431,13 @@ class FileReceiver {
         if (fileWritten < totalBytes) {
           final take = min(data.length - offset, totalBytes - fileWritten);
           final slice = data.sublist(offset, offset + take);
-          await raf.writeFrom(slice);
+          payloadHasher.add(slice);
+          await raf!.writeFrom(slice);
           fileWritten += take;
           offset += take;
           onProgress?.call(fileId, fileWritten, totalBytes);
         } else {
-          // Ignore trailing bytes (e.g. legacy checksum footer from older clients).
+          encBuffer.addAll(data.sublist(offset));
           offset = data.length;
         }
       }
@@ -420,6 +532,21 @@ class FileReceiver {
       }
 
       final folderRoot = header['folderRoot'] as String?;
+      encrypted = header['encrypted'] == true;
+      expectChecksum = header['checksum'] == true;
+      final headerSender = header['senderPeerId'] as String?;
+      final localId = localPeerId;
+      if (encrypted &&
+          headerSender != null &&
+          headerSender.isNotEmpty &&
+          localId != null &&
+          localId.isNotEmpty) {
+        decKey = await FileTransferCrypto.secretKey(
+          headerSender,
+          localId,
+          fileId,
+        );
+      }
 
       late final String path;
       if (resumeOffset > 0) {
@@ -506,6 +633,22 @@ class FileReceiver {
           _cancelledIds.remove(fileId),
         ),
       );
+
+      if (expectChecksum && encBuffer.isNotEmpty) {
+        final tail = utf8.decode(encBuffer, allowMalformed: true);
+        final m = RegExp(r'CHECKSUM:([a-f0-9]{64})').firstMatch(tail);
+        if (m != null) {
+          final expected = m.group(1)!;
+          payloadHasher.close();
+          digestSink.close();
+          final actual = payloadDigest?.toString() ?? '';
+          if (expected != actual) {
+            await deletePartialDownloadFile(path);
+            onFileError?.call(fileId, 'Checksum mismatch after transfer', path);
+            return;
+          }
+        }
+      }
 
       if (totalBytes == 0 ? fileWritten == 0 : fileWritten == totalBytes) {
         onFileComplete?.call(fileId, path);
@@ -637,6 +780,15 @@ class FileReceiver {
     await _server?.close();
     _server = null;
   }
+}
+
+class _DigestCaptureSink implements Sink<Digest> {
+  _DigestCaptureSink(this._onDigest);
+  final void Function(Digest) _onDigest;
+  @override
+  void add(Digest data) => _onDigest(data);
+  @override
+  void close() {}
 }
 
 class _CancelledException implements Exception {
