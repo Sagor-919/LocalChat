@@ -12,15 +12,20 @@ import 'message_store.dart';
 import 'package:path/path.dart' as p;
 
 import 'android_share_inbound.dart';
+import 'app_settings.dart';
 import 'attachment_prepare.dart';
 import 'deferred_staged_file.dart';
+import 'client_platform.dart';
+import 'file_transfer_auth.dart';
+import 'folder_send.dart';
+import 'storage_usage.dart';
 
 enum OutgoingTransferPhase { preparing, transferring }
 
 class TransferState {
   final String fileId;
   final String peerId;
-  final String fileName;
+  String fileName;
   int totalBytes;
   final bool isSending;
   String? filePath;
@@ -32,6 +37,8 @@ class TransferState {
   bool cancelRequested = false;
   /// Paused mid-transfer (local); not an error — partial file kept on receiver.
   bool isPaused = false;
+  /// User tapped Pause — do not auto-resume on transient [TransferPausedException].
+  bool userPaused = false;
   FileSender? sender;
   Process? prepProcess;
   final List<String> tempPathsForCleanup = [];
@@ -67,8 +74,31 @@ class _PendingReceive {
   final String peerId;
   final String fileName;
   final int fileSize;
-  const _PendingReceive(this.peerId, this.fileName, this.fileSize);
+  final String? folderRoot;
+  /// When set, bytes attach to an existing chat message (folder direct extras).
+  final String? batchMessageId;
+  /// Full folder size for the first file in a direct folder batch.
+  final int? batchTotalSize;
+
+  const _PendingReceive(
+    this.peerId,
+    this.fileName,
+    this.fileSize, {
+    this.folderRoot,
+    this.batchMessageId,
+    this.batchTotalSize,
+  });
 }
+
+/// Manual accept UI when [AppSettings.autoAcceptIncomingFiles] is false.
+typedef IncomingFileOfferDialog = Future<bool> Function({
+  required String peerId,
+  required String peerDisplayName,
+  required String fileId,
+  required String fileLabel,
+  required int fileSizeBytes,
+  bool folderBatch,
+});
 
 class _PendingWaiter {
   final Completer<_PendingReceive> completer = Completer();
@@ -90,6 +120,7 @@ class TransferManager {
 
   late ConnectionService _connections;
   late MessageStore _store;
+  late String _myId;
   FileReceiver? _receiver;
   FlutterLocalNotificationsPlugin? _notifPlugin;
   Timer? _notifTimer;
@@ -97,6 +128,20 @@ class TransferManager {
 
   /// Receiver-side partial path for resume (same [fileId]).
   final Map<String, String> _receivePathByFileId = {};
+
+  /// Sub-file TCP id → batch chat message id (folder direct receive).
+  final Map<String, String> _receiveBatchParent = {};
+  final Map<String, int> _receiveBatchFileSize = {};
+  final Map<String, int> _batchCompletedBytes = {};
+  final Set<String> _folderBatchRootIds = {};
+
+  final Map<String, Completer<bool>> _acceptWaiters = {};
+
+  /// Expected TCP auth token per incoming [fileId] (from [registerIncoming]).
+  final Map<String, String> _expectedTokenByFileId = {};
+  final Map<String, String> _tokenPeerByFileId = {};
+
+  IncomingFileOfferDialog? incomingFileOfferDialog;
 
   Future<void> init({
     required ConnectionService connections,
@@ -106,6 +151,7 @@ class TransferManager {
   }) async {
     _connections = connections;
     _store = store;
+    _myId = myId;
     assert(myId.isNotEmpty);
     if (!kIsWeb && Platform.isAndroid) {
       _notifPlugin = notificationsPlugin;
@@ -113,6 +159,7 @@ class TransferManager {
 
     _receiver = FileReceiver();
     _receiver!.resumePathResolver = _resolveResumeReceivePath;
+    _receiver!.validateTransferToken = _validateIncomingTransferToken;
     _receiver!.onFileStarted = _onReceiveStarted;
     _receiver!.onProgress = _onReceiveProgress;
     _receiver!.onFileComplete = _onReceiveComplete;
@@ -135,14 +182,140 @@ class TransferManager {
     String peerId,
     String fileId,
     String fileName,
-    int fileSize,
-  ) {
-    final pending = _PendingReceive(peerId, fileName, fileSize);
+    int fileSize, {
+    String? folderRoot,
+    String? batchMessageId,
+    int? batchTotalSize,
+  }) {
+    _tokenPeerByFileId[fileId] = peerId;
+    _expectedTokenByFileId[fileId] =
+        FileTransferAuth.token(_myId, peerId, fileId);
+    final pending = _PendingReceive(
+      peerId,
+      fileName,
+      fileSize,
+      folderRoot: folderRoot,
+      batchMessageId: batchMessageId,
+      batchTotalSize: batchTotalSize,
+    );
     final waiter = _waiters.remove(fileId);
     if (waiter != null) {
       waiter.completer.complete(pending);
     } else {
       _pending[fileId] = pending;
+    }
+  }
+
+  void _clearIncomingToken(String fileId) {
+    _expectedTokenByFileId.remove(fileId);
+    _tokenPeerByFileId.remove(fileId);
+  }
+
+  Future<bool> _validateIncomingTransferToken(
+    String fileId,
+    String? token,
+  ) async {
+    final peerId = _tokenPeerByFileId[fileId];
+    if (peerId == null) return false;
+    return FileTransferAuth.verify(_myId, peerId, fileId, token);
+  }
+
+  String _outboundToken(String peerId, String fileId) =>
+      FileTransferAuth.token(_myId, peerId, fileId);
+
+  void onFileAccept(String peerId, String fileId) {
+    _acceptWaiters.remove(_acceptKey(peerId, fileId))?.complete(true);
+  }
+
+  void onFileReject(String peerId, String fileId) {
+    _acceptWaiters.remove(_acceptKey(peerId, fileId))?.complete(false);
+  }
+
+  static String _acceptKey(String peerId, String fileId) => '$peerId|$fileId';
+
+  Future<void> onIncomingFileOffer(
+    String peerId,
+    Map<String, dynamic> json, {
+    required String peerDisplayName,
+  }) async {
+    final fileId = json['id'] as String? ?? '';
+    if (fileId.isEmpty) return;
+    final name = json['name'] as String? ?? 'file';
+    final size = (json['size'] as num?)?.toInt() ?? 0;
+    final folderBatch = json['folderBatch'] == true;
+
+    var accept = false;
+    if (AppSettings.instance.autoAcceptIncomingFiles.value) {
+      final pre = await preflightReceiveDestination(
+        downloadPath: AppSettings.instance.downloadPath.value,
+        requiredBytes: size,
+      );
+      accept = pre.ok;
+      if (!accept) {
+        _connections.sendJson(peerId, {
+          'type': 'file_reject',
+          'id': fileId,
+          'reason': pre.reason ?? 'Cannot receive file',
+        });
+        return;
+      }
+    } else {
+      final dialog = incomingFileOfferDialog;
+      if (dialog == null) {
+        _connections.sendJson(peerId, {
+          'type': 'file_reject',
+          'id': fileId,
+          'reason': 'Receiver cannot prompt for acceptance',
+        });
+        return;
+      }
+      accept = await dialog(
+        peerId: peerId,
+        peerDisplayName: peerDisplayName,
+        fileId: fileId,
+        fileLabel: name,
+        fileSizeBytes: size,
+        folderBatch: folderBatch,
+      );
+    }
+
+    _connections.sendJson(peerId, {
+      'type': accept ? 'file_accept' : 'file_reject',
+      'id': fileId,
+      if (!accept) 'reason': 'Declined',
+    });
+  }
+
+  Future<bool> _sendOfferAndWait({
+    required String peerId,
+    required String fileId,
+    required String name,
+    required int size,
+    bool folderBatch = false,
+  }) async {
+    final key = _acceptKey(peerId, fileId);
+    final waiter = Completer<bool>();
+    _acceptWaiters[key] = waiter;
+
+    final sent = _connections.sendJson(peerId, {
+      'type': 'file_offer',
+      'id': fileId,
+      'name': name,
+      'size': size,
+      if (folderBatch) 'folderBatch': true,
+    });
+    if (!sent) {
+      _acceptWaiters.remove(key);
+      return false;
+    }
+
+    try {
+      return await waiter.future.timeout(
+        const Duration(minutes: 30),
+        onTimeout: () => false,
+      );
+    } finally {
+      _acceptWaiters.remove(key);
     }
   }
 
@@ -190,6 +363,8 @@ class TransferManager {
     String? androidContentUri,
     required StagedSourceKind kind,
     required bool duplicatePathInBatch,
+    String? peerPlatform,
+    bool? forceFolderAsZip,
   }) async {
     final id = initialMessage.id;
     final hasContentUri =
@@ -219,6 +394,8 @@ class TransferManager {
       androidContentUri: androidContentUri,
       kind: kind,
       duplicatePathInBatch: duplicatePathInBatch,
+      peerPlatform: peerPlatform,
+      forceFolderAsZip: forceFolderAsZip,
     );
   }
 
@@ -231,6 +408,8 @@ class TransferManager {
     String? androidContentUri,
     required StagedSourceKind kind,
     required bool duplicatePathInBatch,
+    String? peerPlatform,
+    bool? forceFolderAsZip,
   }) async {
     final t = transfers[initialMessage.id];
     if (t == null) return;
@@ -240,6 +419,19 @@ class TransferManager {
       late int sendSize;
 
       if (kind == StagedSourceKind.folderToZip) {
+        final useZip = forceFolderAsZip ??
+            (AppSettings.instance.folderSendAsZip.value ||
+                !peerReceivesFolderAsFiles(peerPlatform));
+        if (!useZip) {
+          await _runPrepareAndSendFolderDirect(
+            initialMessage: initialMessage,
+            peerId: peerId,
+            peerIp: peerIp,
+            sourcePath: sourcePath,
+          );
+          return;
+        }
+
         t.outgoingPhase = OutgoingTransferPhase.preparing;
         t.totalBytes = 0;
         t.transferredBytes = 0;
@@ -249,8 +441,19 @@ class TransferManager {
 
         final normalized = sourcePath.replaceAll(RegExp(r'[/\\]+$'), '');
         final folderName = p.basename(normalized);
+        final estBytes = await estimateDirectoryByteSize(normalized);
+        final tempRoot = Directory.systemTemp.path;
+        final free = await freeBytesForPath(tempRoot);
+        if (free != null && free < estBytes + kFolderZipHeadroomBytes) {
+          throw AttachmentPrepareException(
+            'Not enough free space to build ZIP (need about '
+            '${formatStorageBytes(estBytes + kFolderZipHeadroomBytes)}, '
+            'have about ${formatStorageBytes(free)} on temp drive)',
+          );
+        }
+
         final zipPath = p.join(
-          Directory.systemTemp.path,
+          tempRoot,
           '${initialMessage.id}_$folderName.zip',
         );
         t.tempPathsForCleanup.add(zipPath);
@@ -374,6 +577,18 @@ class TransferManager {
       t.stopwatch.start();
       _notify();
 
+      final accepted = await _sendOfferAndWait(
+        peerId: peerId,
+        fileId: initialMessage.id,
+        name: t.fileName,
+        size: sendSize,
+      );
+      if (!accepted) {
+        t.error = 'Recipient declined or did not accept the file';
+        _notify();
+        return;
+      }
+
       final notified = _connections.sendJson(peerId, {
         'type': 'file_notify',
         'id': initialMessage.id,
@@ -408,6 +623,131 @@ class TransferManager {
     }
   }
 
+  Future<void> _runPrepareAndSendFolderDirect({
+    required ChatMessage initialMessage,
+    required String peerId,
+    required String peerIp,
+    required String sourcePath,
+  }) async {
+    final t = transfers[initialMessage.id];
+    if (t == null) return;
+
+    try {
+      final normalized = sourcePath.replaceAll(RegExp(r'[/\\]+$'), '');
+      final folderName = p.basename(normalized);
+      final entries = await listFolderEntries(normalized);
+      if (entries.isEmpty) {
+        throw AttachmentPrepareException('Folder is empty');
+      }
+      final total = totalFolderBytes(entries);
+      final label = '$folderName (${entries.length} files)';
+
+      t.outgoingPhase = OutgoingTransferPhase.preparing;
+      t.preparingStatus = 'Preparing folder (${entries.length} files)…';
+      t.totalBytes = total;
+      t.transferredBytes = 0;
+      t.progress = 0;
+      _notify();
+
+      await _store.updateOutboundAttachment(
+        peerId,
+        initialMessage.id,
+        size: total,
+      );
+      final updated = initialMessage.copyWith(
+        attachmentName: label,
+        attachmentSize: total,
+      );
+      _fileMessages.add(FileMessageEvent(peerId, updated));
+      t.fileName = label;
+
+      if (t.cancelRequested) throw const AttachmentPrepareCancelled();
+
+      final accepted = await _sendOfferAndWait(
+        peerId: peerId,
+        fileId: initialMessage.id,
+        name: label,
+        size: total,
+        folderBatch: true,
+      );
+      if (!accepted) {
+        t.error = 'Recipient declined or did not accept the folder';
+        _notify();
+        return;
+      }
+
+      t.outgoingPhase = OutgoingTransferPhase.transferring;
+      t.preparingStatus = '';
+      t.stopwatch.reset();
+      t.stopwatch.start();
+      _notify();
+
+      final targetIp = _resolveFileTransferHost(peerId, peerIp);
+      var batchSent = 0;
+
+      for (var i = 0; i < entries.length; i++) {
+        if (t.cancelRequested) throw const AttachmentPrepareCancelled();
+        final e = entries[i];
+        final subId = i == 0 ? initialMessage.id : '${initialMessage.id}_f$i';
+
+        final notified = _connections.sendJson(peerId, {
+          'type': 'file_notify',
+          'id': subId,
+          'name': i == 0 ? label : e.relativePath,
+          'size': e.sizeBytes,
+          'offset': 0,
+          'folderRoot': folderName,
+          if (i > 0) 'batchMessageId': initialMessage.id,
+          if (i == 0) 'batchTotalSize': total,
+        });
+        if (!notified) {
+          throw StateError('Lost connection while sending folder');
+        }
+
+        final subState = TransferState(
+          fileId: subId,
+          peerId: peerId,
+          fileName: e.relativePath,
+          totalBytes: e.sizeBytes,
+          isSending: true,
+          filePath: e.absolutePath,
+        );
+        await _runSend(
+          subState,
+          targetIp,
+          tcpFileName: e.relativePath,
+          folderRoot: folderName,
+          onChunkSent: (sent) {
+            batchSent += sent;
+            t.transferredBytes = batchSent.clamp(0, total);
+            t.progress = total == 0 ? 0 : t.transferredBytes / total;
+            _notify();
+          },
+        );
+        if (subState.error != null) {
+          throw StateError(subState.error!);
+        }
+      }
+
+      transfers.remove(initialMessage.id);
+      _notify();
+    } catch (e) {
+      final t2 = transfers[initialMessage.id];
+      if (t2 == null) return;
+      t2.preparingStatus = '';
+      if (e is AttachmentPrepareCancelled || t2.cancelRequested) {
+        t2.error = 'Cancelled';
+        t2.cancelled = true;
+      } else {
+        t2.error = e.toString();
+      }
+      _notify();
+      await _emitStoredFileMessageForPreview(peerId, initialMessage.id);
+    } finally {
+      await _emitStoredFileMessageForPreview(peerId, initialMessage.id);
+    }
+  }
+
   /// Prefer the address from the live chat TCP socket (matches successful retry path).
   String _resolveFileTransferHost(String peerId, String discoveryIp) {
     final sock = _connections.getSocket(peerId);
@@ -429,53 +769,75 @@ class TransferManager {
     }
   }
 
-  Future<void> _runSend(TransferState t, String peerIp) async {
+  Future<void> _runSend(
+    TransferState t,
+    String peerIp, {
+    String? tcpFileName,
+    String? folderRoot,
+    void Function(int bytesDelta)? onChunkSent,
+    int? previousSent,
+  }) async {
     final sender = FileSender();
     t.sender = sender;
     final startOff = t.transferredBytes;
+    var lastReported = previousSent ?? startOff;
 
     try {
       await sender.send(
         host: peerIp,
         fileId: t.fileId,
-        fileName: t.fileName,
+        fileName: tcpFileName ?? t.fileName,
         fileSize: t.totalBytes,
         file: File(t.filePath!),
         startOffset: startOff,
+        folderRoot: folderRoot,
+        token: _outboundToken(t.peerId, t.fileId),
         onProgress: (sent, total) {
-          t.transferredBytes = sent;
-          t.progress = total == 0 ? 0 : sent / total;
-          _notify();
+          if (onChunkSent != null) {
+            final delta = sent - lastReported;
+            if (delta > 0) onChunkSent(delta);
+            lastReported = sent;
+          } else {
+            t.transferredBytes = sent;
+            t.progress = total == 0 ? 0 : sent / total;
+            _notify();
+          }
         },
       );
       t.isPaused = false;
-      _cleanupOutgoingTemps(t);
-      transfers.remove(t.fileId);
-      _notify();
+      if (onChunkSent == null) {
+        _cleanupOutgoingTemps(t);
+        transfers.remove(t.fileId);
+        _notify();
+      }
     } catch (e) {
       if (e is TransferPausedException) {
         t.isPaused = true;
         t.error = null;
         t.sender = null;
         _notify();
-        // No Pause/Resume in UI — auto-continue outgoing sends after a brief pause.
-        Future<void>.delayed(const Duration(milliseconds: 400), () {
-          final t2 = transfers[t.fileId];
-          if (t2 != null &&
-              t2.isPaused &&
-              t2.isSending &&
-              t2.error == null &&
-              !t2.cancelled) {
-            resumeOutgoing(t.fileId);
-          }
-        });
+        if (!t.userPaused) {
+          Future<void>.delayed(const Duration(milliseconds: 400), () {
+            final t2 = transfers[t.fileId];
+            if (t2 != null &&
+                t2.isPaused &&
+                !t2.userPaused &&
+                t2.isSending &&
+                t2.error == null &&
+                !t2.cancelled) {
+              resumeOutgoing(t.fileId);
+            }
+          });
+        }
       } else {
         t.isPaused = false;
         t.error = e.toString();
         _notify();
       }
     } finally {
-      await _emitStoredFileMessageForPreview(t.peerId, t.fileId);
+      if (onChunkSent == null) {
+        await _emitStoredFileMessageForPreview(t.peerId, t.fileId);
+      }
     }
   }
 
@@ -495,6 +857,7 @@ class TransferManager {
     t.error = 'Cancelled';
     t.cancelled = true;
     t.isPaused = false;
+    t.userPaused = false;
     _notify();
   }
 
@@ -507,6 +870,7 @@ class TransferManager {
         t.outgoingPhase == OutgoingTransferPhase.preparing) {
       return;
     }
+    t.userPaused = true;
     final peerId = t.peerId;
     _connections.sendJson(peerId, {
       'type': 'file_control',
@@ -523,6 +887,7 @@ class TransferManager {
   void pauseIncoming(String fileId) {
     final t = transfers[fileId];
     if (t == null || t.isSending || t.error != null) return;
+    t.userPaused = true;
     final peerId = t.peerId;
     _connections.sendJson(peerId, {
       'type': 'file_control',
@@ -553,7 +918,37 @@ class TransferManager {
     });
   }
 
+  /// Receiver is ready again — continue sending from [transferredBytes].
+  void handleRemoteResumeOutgoing(String fileId) {
+    resumeOutgoing(fileId);
+  }
+
+  /// Sender will send again — clear local receive pause gate.
+  void handleRemoteResumeIncoming(String fileId) {
+    _receiver?.resumeReceive(fileId);
+    final t = transfers[fileId];
+    if (t != null && !t.isSending) {
+      t.isPaused = false;
+      t.userPaused = false;
+      _notify();
+    }
+  }
+
   /// Resume sending after [TransferPausedException] / pause.
+  void resumeIncoming(String fileId) {
+    final t = transfers[fileId];
+    if (t == null || t.isSending || !t.isPaused || t.error != null) return;
+    t.userPaused = false;
+    t.isPaused = false;
+    _connections.sendJson(t.peerId, {
+      'type': 'file_control',
+      'id': fileId,
+      'pause': false,
+      'from': 'receiver',
+    });
+    _notify();
+  }
+
   void resumeOutgoing(String fileId) {
     final t = transfers[fileId];
     if (t == null || !t.isSending || !t.isPaused) return;
@@ -563,6 +958,7 @@ class TransferManager {
     final peerSocket = _connections.getSocket(peerId);
     if (peerSocket == null) return;
 
+    t.userPaused = false;
     _connections.sendJson(peerId, {
       'type': 'file_notify',
       'id': fileId,
@@ -609,6 +1005,12 @@ class TransferManager {
     if (t == null) return;
 
     if (!t.isSending) {
+      if (t.isPaused && t.transferredBytes > 0) {
+        resumeIncoming(fileId);
+        t.error = null;
+        _notify();
+        return;
+      }
       transfers.remove(fileId);
       _notify();
       return;
@@ -622,6 +1024,16 @@ class TransferManager {
     final peerSocket = _connections.getSocket(peerId);
     if (peerSocket == null) return;
 
+    t.error = null;
+    t.cancelled = false;
+    t.userPaused = false;
+
+    if (t.transferredBytes > 0) {
+      t.isPaused = true;
+      resumeOutgoing(fileId);
+      return;
+    }
+
     _connections.sendJson(peerId, {
       'type': 'file_notify',
       'id': fileId,
@@ -630,8 +1042,6 @@ class TransferManager {
       'offset': 0,
     });
 
-    t.error = null;
-    t.cancelled = false;
     t.isPaused = false;
     t.transferredBytes = 0;
     t.progress = 0;
@@ -693,6 +1103,18 @@ class TransferManager {
       }
     }
     final peerId = pending?.peerId ?? 'unknown';
+    final batchId = pending?.batchMessageId;
+
+    if (batchId != null) {
+      _receiveBatchParent[fileId] = batchId;
+      _receiveBatchFileSize[fileId] = fileSize;
+      _notify();
+      return;
+    }
+
+    if (pending?.batchTotalSize != null) {
+      _folderBatchRootIds.add(fileId);
+    }
 
     final msg = ChatMessage(
       id: fileId,
@@ -701,7 +1123,7 @@ class TransferManager {
       timestamp: DateTime.now().millisecondsSinceEpoch,
       isMine: false,
       attachmentName: fileName,
-      attachmentSize: fileSize,
+      attachmentSize: pending?.batchTotalSize ?? fileSize,
     );
 
     final sockIp =
@@ -714,14 +1136,37 @@ class TransferManager {
     );
     _fileMessages.add(FileMessageEvent(peerId, msg));
 
+    final batchTotal = pending?.batchTotalSize;
     transfers[fileId] = TransferState(
       fileId: fileId,
       peerId: peerId,
       fileName: fileName,
-      totalBytes: fileSize,
+      totalBytes: batchTotal ?? fileSize,
       isSending: false,
     );
     _notify();
+  }
+
+  void _finishFolderBatchReceive(TransferState batch, String lastSavedPath) {
+    final peerId = batch.peerId;
+    final batchId = batch.fileId;
+    _folderBatchRootIds.remove(batchId);
+    transfers.remove(batchId);
+    _batchCompletedBytes.remove(batchId);
+    _clearIncomingToken(batchId);
+    final folderPath = p.dirname(lastSavedPath);
+    _store.updateAttachmentPath(peerId, batchId, folderPath);
+    final updated = ChatMessage(
+      id: batchId,
+      senderId: peerId,
+      text: 'File: ${batch.fileName}',
+      timestamp: DateTime.now().millisecondsSinceEpoch,
+      isMine: false,
+      attachmentName: batch.fileName,
+      attachmentPath: folderPath,
+      attachmentSize: batch.totalBytes,
+    );
+    _fileMessages.add(FileMessageEvent(peerId, updated));
   }
 
   void _onReceivePaused(String fileId, String savePath, int bytesReceived) {
@@ -737,6 +1182,33 @@ class TransferManager {
   }
 
   void _onReceiveProgress(String fileId, int received, int total) {
+    if (_folderBatchRootIds.contains(fileId)) {
+      final batch = transfers[fileId];
+      if (batch != null) {
+        final base = _batchCompletedBytes[fileId] ?? 0;
+        batch.transferredBytes = base + received;
+        batch.progress = batch.totalBytes == 0
+            ? 0
+            : batch.transferredBytes / batch.totalBytes;
+      }
+      _notify();
+      return;
+    }
+
+    final batchId = _receiveBatchParent[fileId];
+    if (batchId != null) {
+      final batch = transfers[batchId];
+      if (batch != null) {
+        final base = _batchCompletedBytes[batchId] ?? 0;
+        batch.transferredBytes = base + received;
+        batch.progress = batch.totalBytes == 0
+            ? 0
+            : batch.transferredBytes / batch.totalBytes;
+      }
+      _notify();
+      return;
+    }
+
     final t = transfers[fileId];
     if (t == null) return;
     t.transferredBytes = received;
@@ -745,10 +1217,53 @@ class TransferManager {
   }
 
   void _onReceiveComplete(String fileId, String savedPath) {
+    if (_folderBatchRootIds.contains(fileId)) {
+      final added = _receiveBatchFileSize.remove(fileId) ??
+          transfers[fileId]?.totalBytes ??
+          0;
+      _batchCompletedBytes[fileId] = added;
+      final batch = transfers[fileId];
+      if (batch != null) {
+        batch.transferredBytes = added;
+        batch.progress = batch.totalBytes == 0
+            ? 0
+            : added / batch.totalBytes;
+      }
+      _receivePathByFileId.remove(fileId);
+      _clearIncomingToken(fileId);
+      if (batch != null && added >= batch.totalBytes) {
+        _finishFolderBatchReceive(batch, savedPath);
+      }
+      _notify();
+      return;
+    }
+
+    final batchId = _receiveBatchParent.remove(fileId);
+    if (batchId != null) {
+      final added = _receiveBatchFileSize.remove(fileId) ?? 0;
+      final done = (_batchCompletedBytes[batchId] ?? 0) + added;
+      _batchCompletedBytes[batchId] = done;
+      final batch = transfers[batchId];
+      if (batch != null) {
+        batch.transferredBytes = done;
+        batch.progress = batch.totalBytes == 0
+            ? 0
+            : done / batch.totalBytes;
+        if (done >= batch.totalBytes) {
+          _receivePathByFileId.remove(fileId);
+          _clearIncomingToken(fileId);
+          _finishFolderBatchReceive(batch, savedPath);
+        }
+      }
+      _notify();
+      return;
+    }
+
     final t = transfers[fileId];
     if (t == null) return;
     final peerId = t.peerId;
     _receivePathByFileId.remove(fileId);
+    _clearIncomingToken(fileId);
 
     transfers.remove(fileId);
     _notify();
@@ -769,8 +1284,12 @@ class TransferManager {
   }
 
   void _onReceiveError(String fileId, String error, String? savePath) {
+    _clearIncomingToken(fileId);
     final t = transfers[fileId];
-    if (t == null) return;
+    if (t == null) {
+      _notify();
+      return;
+    }
     final peerId = t.peerId;
     t.isPaused = false;
     t.error = error;

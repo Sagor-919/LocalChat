@@ -33,6 +33,8 @@ import 'deferred_staged_file.dart';
 import 'desktop_drop_queue.dart';
 import 'settings_screen.dart';
 import 'staged_from_drop.dart';
+import 'client_platform.dart';
+import 'storage_usage.dart';
 import 'transfer_manager.dart';
 
 /// Lets mouse / trackpad drag the horizontal staged-files strip (desktop).
@@ -827,11 +829,99 @@ class _ChatScreenState extends State<ChatScreen> {
             }
           }
         });
+        _scheduleFolderSizeEstimates(added);
       }
       if (duplicateCount > 0) {
         _showCopyFeedback('Duplicate removed');
       }
     });
+  }
+
+  void _scheduleFolderSizeEstimates(List<DeferredStagedFile> added) {
+    for (final f in added) {
+      if (f.kind != StagedSourceKind.folderToZip) continue;
+      final path = f.sourcePath;
+      if (path == null || path.isEmpty) continue;
+      unawaited(_estimateAndUpdateStagedFolder(f, path));
+    }
+  }
+
+  Future<void> _estimateAndUpdateStagedFolder(
+    DeferredStagedFile template,
+    String directoryPath,
+  ) async {
+    final bytes = await estimateDirectoryByteSize(directoryPath);
+    if (!mounted) return;
+    final key = template.stagingDedupeKey;
+    setState(() {
+      final i = _staged.indexWhere((e) => e.stagingDedupeKey == key);
+      if (i < 0) return;
+      final old = _staged[i];
+      if (old.kind != StagedSourceKind.folderToZip) return;
+      _staged[i] = DeferredStagedFile(
+        sourcePath: old.sourcePath,
+        displayName: old.displayName,
+        kind: old.kind,
+        knownSizeBytes: bytes,
+        clipboardPasteHash: old.clipboardPasteHash,
+      );
+    });
+  }
+
+  Future<bool> _confirmFolderSendsIfNeeded(
+    List<DeferredStagedFile> files,
+  ) async {
+    final folders =
+        files.where((f) => f.kind == StagedSourceKind.folderToZip).toList();
+    if (folders.isEmpty) return true;
+
+    final blocks = <String>[];
+    var needsConfirm = false;
+    final asZip = AppSettings.instance.folderSendAsZip.value;
+    for (final f in folders) {
+      final path = f.sourcePath!;
+      final est = f.knownSizeBytes ?? await estimateDirectoryByteSize(path);
+      String? line;
+      if (asZip) {
+        line = await folderSendStorageWarning(estimatedFolderBytes: est);
+      } else if (est >= kFolderSendConfirmThresholdBytes) {
+        line =
+            'About ${formatStorageBytes(est)} across all files will be sent '
+            'without creating a temporary ZIP on this device.';
+      }
+      if (line != null) {
+        needsConfirm = true;
+        blocks.add('${f.displayName}\n$line');
+      }
+    }
+    if (!needsConfirm) return true;
+
+    final body = blocks.join('\n\n');
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: Text(
+          asZip
+              ? 'Folder send uses temp storage'
+              : 'Send large folder?',
+        ),
+        content: SingleChildScrollView(
+          child: Text(body, style: const TextStyle(height: 1.35)),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Send anyway'),
+          ),
+        ],
+      ),
+    );
+    return confirmed == true;
   }
 
   Future<void> _pickFiles() async {
@@ -870,10 +960,12 @@ class _ChatScreenState extends State<ChatScreen> {
       final dirPath = await FilePicker.platform.getDirectoryPath();
       if (dirPath == null) return;
       final folderName = dirPath.split(Platform.pathSeparator).last;
+      final asZip = AppSettings.instance.folderSendAsZip.value;
       _stageFiles([
         DeferredStagedFile(
           sourcePath: dirPath,
-          displayName: '$folderName.zip',
+          displayName:
+              asZip ? '$folderName.zip' : '$folderName (folder)',
           kind: StagedSourceKind.folderToZip,
         ),
       ]);
@@ -997,6 +1089,10 @@ class _ChatScreenState extends State<ChatScreen> {
 
     if (hasFiles) {
       final raw = List<DeferredStagedFile>.from(_staged);
+      if (!await _confirmFolderSendsIfNeeded(raw)) {
+        _focus.requestFocus();
+        return;
+      }
       setState(() {
         _staged.clear();
         _stagedClipboardHashes.clear();
@@ -1056,6 +1152,13 @@ class _ChatScreenState extends State<ChatScreen> {
     );
     if (inserted) _totalInDb++;
     if (!mounted) return;
+
+    bool? forceFolderAsZip;
+    if (df.kind == StagedSourceKind.folderToZip) {
+      forceFolderAsZip = await _resolveFolderSendAsZip(live);
+      if (forceFolderAsZip == null) return;
+    }
+
     await _tm.prepareAndSendOutbound(
       initialMessage: msg,
       peerId: _peerId,
@@ -1065,11 +1168,70 @@ class _ChatScreenState extends State<ChatScreen> {
       androidContentUri: df.androidContentUri,
       kind: df.kind,
       duplicatePathInBatch: duplicatePathInBatch,
+      peerPlatform: live.platform,
+      forceFolderAsZip: forceFolderAsZip,
     );
+  }
+
+  /// `true` = ZIP, `false` = direct files, `null` = user cancelled.
+  Future<bool?> _resolveFolderSendAsZip(PeerDevice peer) async {
+    if (AppSettings.instance.folderSendAsZip.value) return true;
+    if (peerReceivesFolderAsFiles(peer.platform)) return false;
+
+    final plat = peer.platform ?? 'unknown';
+    final body = plat == 'android'
+        ? '${peer.name} is on Android. Android cannot receive a folder as '
+            'multiple files with paths — only as a single .zip file.\n\n'
+            'Send this folder as a ZIP?'
+        : plat == 'ios'
+            ? '${peer.name} is on iOS, which does not support receiving a '
+                'folder as multiple files. Send as a ZIP instead?'
+            : '${peer.name} may not support receiving a folder as multiple '
+                'files (platform: $plat). Send as a ZIP instead?';
+
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: const Text('Send folder as ZIP?'),
+        content: Text(body),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Send as ZIP'),
+          ),
+        ],
+      ),
+    );
+    return result;
   }
 
   void _cancelTransfer(String fileId) {
     _tm.cancel(fileId);
+  }
+
+  void _pauseTransfer(TransferState t) {
+    if (t.isSending) {
+      _tm.pauseOutgoing(t.fileId);
+    } else {
+      _tm.pauseIncoming(t.fileId);
+    }
+  }
+
+  void _resumeTransfer(TransferState t) {
+    if (t.isSending) {
+      _tm.resumeOutgoing(t.fileId);
+    } else {
+      _tm.resumeIncoming(t.fileId);
+    }
+  }
+
+  void _retryTransfer(String fileId) {
+    _tm.retry(fileId);
   }
 
   String? _mimeTypeForPath(String path) {
@@ -1945,11 +2107,24 @@ class _ChatScreenState extends State<ChatScreen> {
                 ),
               ],
               const SizedBox(height: 8),
-              _actionButton(
-                label: 'Dismiss',
-                icon: Icons.close,
-                color: cs.outline,
-                onTap: () => _tm.dismiss(m.id),
+              Wrap(
+                spacing: 8,
+                runSpacing: 6,
+                children: [
+                  if (mine && t.isSending)
+                    _actionButton(
+                      label: 'Retry',
+                      icon: Icons.refresh,
+                      color: cs.primary,
+                      onTap: () => _retryTransfer(m.id),
+                    ),
+                  _actionButton(
+                    label: 'Dismiss',
+                    icon: Icons.close,
+                    color: cs.outline,
+                    onTap: () => _tm.dismiss(m.id),
+                  ),
+                ],
               ),
             ] else if (isPaused) ...[
               LinearProgressIndicator(
@@ -1966,9 +2141,11 @@ class _ChatScreenState extends State<ChatScreen> {
                   const SizedBox(width: 6),
                   Expanded(
                     child: Text(
-                      t.isSending
-                          ? 'Reconnecting\u2026'
-                          : 'Waiting for sender\u2026',
+                      t.userPaused
+                          ? 'Paused'
+                          : (t.isSending
+                              ? 'Reconnecting\u2026'
+                              : 'Waiting for sender\u2026'),
                       style: TextStyle(
                         fontSize: 12,
                         fontWeight: FontWeight.w600,
@@ -1979,11 +2156,23 @@ class _ChatScreenState extends State<ChatScreen> {
                 ],
               ),
               const SizedBox(height: 8),
-              _actionButton(
-                label: 'Cancel',
-                icon: Icons.stop_circle_outlined,
-                color: _failedRed,
-                onTap: () => _cancelTransfer(m.id),
+              Wrap(
+                spacing: 8,
+                runSpacing: 6,
+                children: [
+                  _actionButton(
+                    label: 'Resume',
+                    icon: Icons.play_arrow_rounded,
+                    color: cs.primary,
+                    onTap: () => _resumeTransfer(t),
+                  ),
+                  _actionButton(
+                    label: 'Cancel',
+                    icon: Icons.stop_circle_outlined,
+                    color: _failedRed,
+                    onTap: () => _cancelTransfer(m.id),
+                  ),
+                ],
               ),
             ] else if (t.isSending &&
                 t.outgoingPhase == OutgoingTransferPhase.preparing) ...[
@@ -2056,22 +2245,28 @@ class _ChatScreenState extends State<ChatScreen> {
                 color: mine ? Colors.white : _iMessageBlue,
               ),
               const SizedBox(height: 6),
-              Row(
+              Text(
+                '${t.isSending ? "Sending\u2026 " : "Receiving\u2026 "}'
+                '${(t.progress * 100).toStringAsFixed(0)}%'
+                ' \u2022 ${_fmtBytes(t.transferredBytes)}/${_fmtBytes(t.totalBytes)}'
+                ' \u2022 ${_fmtSpeed(t.currentSpeed)}',
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: subtleColor,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 8,
+                runSpacing: 6,
                 children: [
-                  Expanded(
-                    child: Text(
-                      '${t.isSending ? "Sending\u2026 " : "Receiving\u2026 "}'
-                      '${(t.progress * 100).toStringAsFixed(0)}%'
-                      ' \u2022 ${_fmtBytes(t.transferredBytes)}/${_fmtBytes(t.totalBytes)}'
-                      ' \u2022 ${_fmtSpeed(t.currentSpeed)}',
-                      style: TextStyle(
-                        fontSize: 11,
-                        fontWeight: FontWeight.w600,
-                        color: subtleColor,
-                      ),
-                    ),
+                  _actionButton(
+                    label: 'Pause',
+                    icon: Icons.pause_rounded,
+                    color: cs.outline,
+                    onTap: () => _pauseTransfer(t),
                   ),
-                  const SizedBox(width: 8),
                   _actionButton(
                     label: 'Cancel',
                     icon: Icons.stop_circle_outlined,
@@ -2740,23 +2935,40 @@ class _StagedThumbTileState extends State<_StagedThumbTile> {
   }
 
   Widget _folderIconColumn() {
+    final kb = widget.knownSizeBytes;
+    final sizeLabel = kb == null
+        ? 'Size\u2026'
+        : formatStorageBytes(kb);
     return Column(
       mainAxisAlignment: MainAxisAlignment.center,
       children: [
         Icon(
           Icons.folder_zip_outlined,
-          size: 24,
+          size: 22,
           color: widget.cs.onSurfaceVariant,
         ),
         const SizedBox(height: 2),
         Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 4),
+          padding: const EdgeInsets.symmetric(horizontal: 3),
           child: Text(
-            widget.name,
-            maxLines: 2,
+            sizeLabel,
+            maxLines: 1,
             overflow: TextOverflow.ellipsis,
             textAlign: TextAlign.center,
-            style: TextStyle(fontSize: 8, color: widget.cs.onSurfaceVariant),
+            style: TextStyle(
+              fontSize: 7,
+              fontWeight: FontWeight.w700,
+              color: widget.cs.primary,
+            ),
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 3),
+          child: Text(
+            'Temp ZIP',
+            maxLines: 1,
+            textAlign: TextAlign.center,
+            style: TextStyle(fontSize: 6, color: widget.cs.onSurfaceVariant),
           ),
         ),
       ],

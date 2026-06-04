@@ -50,12 +50,18 @@ This document maps user-visible behavior to implementation files so contributors
 
 | Area | Behavior | Code |
 | --- | --- | --- |
-| Negotiation | Chat socket sends `file_notify`; file bytes move over a separate TCP connection on fixed file-transfer port 4042 | [`lib/connection_service.dart`](../lib/connection_service.dart), [`lib/transfer_manager.dart`](../lib/transfer_manager.dart), [`lib/file_transfer_service.dart`](../lib/file_transfer_service.dart) |
-| Chunked streaming | File sender/receiver report progress and support cancel, failure, completion, and internal pause/resume recovery states | [`lib/file_transfer_service.dart`](../lib/file_transfer_service.dart), [`lib/transfer_manager.dart`](../lib/transfer_manager.dart) |
-| Folder transfer | Folder send creates a ZIP with the Dart `archive` package in a background isolate before sending | [`lib/attachment_prepare.dart`](../lib/attachment_prepare.dart), [`lib/transfer_manager.dart`](../lib/transfer_manager.dart) |
-| Android shares | Shared `content://` files are queued quickly and materialized to temporary files only when sending | [`lib/android_share_inbound.dart`](../lib/android_share_inbound.dart), [`lib/transfer_manager.dart`](../lib/transfer_manager.dart) |
-| Outbound persistence | Sent attachments are copied to app documents before message metadata is finalized | [`lib/transfer_manager.dart`](../lib/transfer_manager.dart) |
-| Download folder | Received files save under the configured download folder, defaulting to `LocalChat Folder/Downloads` | [`lib/app_settings.dart`](../lib/app_settings.dart), [`lib/settings_screen.dart`](../lib/settings_screen.dart) |
+| Negotiation | `file_offer` → `file_accept`/`file_reject` → `file_notify`; bytes on TCP port 4042 | [`docs/FILE_TRANSFER_PROTOCOL.md`](FILE_TRANSFER_PROTOCOL.md), [`lib/transfer_manager.dart`](../lib/transfer_manager.dart), [`lib/main.dart`](../lib/main.dart) |
+| TCP auth | SHA256 token per `fileId` + peer pair in file header; reject if missing/wrong | [`lib/file_transfer_auth.dart`](../lib/file_transfer_auth.dart), [`lib/file_transfer_service.dart`](../lib/file_transfer_service.dart) |
+| Chunked streaming | Progress, cancel, pause/resume/retry in chat UI; offset resume on TCP | [`lib/file_transfer_service.dart`](../lib/file_transfer_service.dart), [`lib/transfer_manager.dart`](../lib/transfer_manager.dart), [`lib/chat_screen.dart`](../lib/chat_screen.dart) |
+| Folder ZIP mode | Desktop folder → temp ZIP (background isolate) → single file send | [`lib/attachment_prepare.dart`](../lib/attachment_prepare.dart), [`lib/transfer_manager.dart`](../lib/transfer_manager.dart) |
+| Folder direct mode | Settings toggle off ZIP: multi-file send with `folderRoot` paths (desktop peers) | [`lib/folder_send.dart`](../lib/folder_send.dart), [`lib/client_platform.dart`](../lib/client_platform.dart) |
+| Android folder | Prompt sender to ZIP when receiver is Android / unsupported platform | [`lib/chat_screen.dart`](../lib/chat_screen.dart) |
+| Auto-accept | Settings toggle; preflight write + free space before `file_accept` | [`lib/app_settings.dart`](../lib/app_settings.dart), [`lib/storage_usage.dart`](../lib/storage_usage.dart) |
+| Storage UI | Settings → Storage: sizes, clean temp prep archives | [`lib/storage_usage.dart`](../lib/storage_usage.dart), [`lib/settings_screen.dart`](../lib/settings_screen.dart) |
+| Android shares | Shared `content://` files queued; materialized at send time | [`lib/android_share_inbound.dart`](../lib/android_share_inbound.dart) |
+| Outbound persistence | Sent attachments copied to app documents | [`lib/transfer_manager.dart`](../lib/transfer_manager.dart) |
+| Download folder | Configurable path; default `LocalChat Folder/Downloads` | [`lib/app_settings.dart`](../lib/app_settings.dart), [`lib/settings_screen.dart`](../lib/settings_screen.dart) |
+| Peer platform | UDP + `hello` advertise `android`/`windows`/etc. | [`lib/discovery_service.dart`](../lib/discovery_service.dart), [`lib/connection_service.dart`](../lib/connection_service.dart) |
 
 ## Drag, Drop, and Share-In
 
@@ -101,3 +107,14 @@ Current test files:
 - [`test/attachment_prepare_test.dart`](../test/attachment_prepare_test.dart)
 - [`test/chat_message_ordering_test.dart`](../test/chat_message_ordering_test.dart)
 - [`test/staged_from_drop_test.dart`](../test/staged_from_drop_test.dart)
+- [`test/storage_usage_test.dart`](../test/storage_usage_test.dart)
+- [`test/folder_send_test.dart`](../test/folder_send_test.dart)
+- [`test/client_platform_test.dart`](../test/client_platform_test.dart)
+- [`test/file_transfer_auth_test.dart`](../test/file_transfer_auth_test.dart)
+
+## QA improvement program
+
+Step-by-step roadmap (Items 1–28), status, and agent resume instructions:
+
+- [`docs/QA_IMPROVEMENTS_ROADMAP.md`](QA_IMPROVEMENTS_ROADMAP.md)
+- [`docs/FILE_TRANSFER_PROTOCOL.md`](FILE_TRANSFER_PROTOCOL.md)

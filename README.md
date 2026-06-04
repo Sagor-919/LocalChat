@@ -125,12 +125,18 @@ android/
 
 docs/
   FEATURES.md                     Verified feature map with code pointers
+  QA_IMPROVEMENTS_ROADMAP.md      Step-by-step QA items 1–28 (status + resume guide)
+  FILE_TRANSFER_PROTOCOL.md       file_offer/notify/control + TCP auth spec
   windows_share_from_explorer.md  Optional Windows Explorer context-menu setup
 
 test/
   attachment_prepare_test.dart
   chat_message_ordering_test.dart
   staged_from_drop_test.dart
+  storage_usage_test.dart
+  folder_send_test.dart
+  client_platform_test.dart
+  file_transfer_auth_test.dart
 ```
 
 ## Verification
@@ -147,7 +153,7 @@ Current tests cover attachment preparation, folder zipping, dropped-file staging
 1. Fork the repository and create a branch from `main`.
 2. Keep pull requests focused on one concern.
 3. Run `flutter test` and `flutter analyze` before opening a PR.
-4. Update `README.md` or `docs/FEATURES.md` when behavior changes.
+4. Update `README.md` or `docs/FEATURES.md` when behavior changes (see also `docs/QA_IMPROVEMENTS_ROADMAP.md` for the active improvement program).
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contributor guidelines and [SECURITY.md](SECURITY.md) for private vulnerability reporting.
 

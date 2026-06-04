@@ -4,9 +4,11 @@ import 'dart:io';
 import 'dart:math' show min;
 import 'dart:typed_data';
 
+import 'package:path/path.dart' as p;
 import 'package:synchronized/synchronized.dart';
 
 import 'app_settings.dart';
+import 'folder_send.dart';
 
 const int kFileTransferPort = 4042;
 const int kChunkSize = 65536; // 64 KB
@@ -94,6 +96,8 @@ class FileSender {
     required File file,
     required void Function(int sent, int total) onProgress,
     int startOffset = 0,
+    String? folderRoot,
+    required String token,
   }) async {
     if (startOffset < 0 || startOffset > fileSize) {
       throw ArgumentError('Invalid startOffset');
@@ -103,13 +107,17 @@ class FileSender {
     socket.setOption(SocketOption.tcpNoDelay, true);
 
     try {
-      final header = jsonEncode({
+      final header = <String, dynamic>{
         'id': fileId,
         'name': fileName,
         'size': fileSize,
         'offset': startOffset,
-      });
-      socket.write('$header\n');
+        'token': token,
+      };
+      if (folderRoot != null && folderRoot.isNotEmpty) {
+        header['folderRoot'] = folderRoot;
+      }
+      socket.write('${jsonEncode(header)}\n');
       await socket.flush();
 
       await _waitForStart(socket);
@@ -208,6 +216,9 @@ class FileReceiver {
   Future<String?> Function(String fileId, int offset, String safeName)?
       resumePathResolver;
 
+  /// When set, incoming TCP must present a matching [token] in the header.
+  Future<bool> Function(String fileId, String? token)? validateTransferToken;
+
   Future<void> Function(
     String fileId,
     String fileName,
@@ -231,6 +242,12 @@ class FileReceiver {
     unawaited(_transferIdsLock.synchronized(() async {
       _pausedIds.add(fileId);
       _destroySocketFor(fileId);
+    }));
+  }
+
+  void resumeReceive(String fileId) {
+    unawaited(_transferIdsLock.synchronized(() async {
+      _pausedIds.remove(fileId);
     }));
   }
 
@@ -359,12 +376,30 @@ class FileReceiver {
       resumeOffset = (header['offset'] as num?)?.toInt() ?? 0;
       if (resumeOffset < 0) resumeOffset = 0;
 
-      final safeName = fileName.replaceAll(RegExp(r'[/\\]'), '_');
+      final validator = validateTransferToken;
+      if (validator != null) {
+        final headerToken = header['token'] as String?;
+        final ok = await validator(fileId, headerToken);
+        if (!ok) {
+          try {
+            await socket.close();
+          } catch (_) {}
+          onFileError?.call(
+            fileId,
+            'Rejected: invalid or missing transfer token',
+            null,
+          );
+          return;
+        }
+      }
+
+      final folderRoot = header['folderRoot'] as String?;
 
       late final String path;
       if (resumeOffset > 0) {
+        final resumeLabel = fileName.replaceAll(RegExp(r'[/\\]'), '_');
         final resolved =
-            await resumePathResolver?.call(fileId, resumeOffset, safeName);
+            await resumePathResolver?.call(fileId, resumeOffset, resumeLabel);
         if (resolved == null || resolved.isEmpty) {
           onFileError?.call(fileId, 'Cannot resume: missing partial file', null);
           return;
@@ -384,7 +419,7 @@ class FileReceiver {
         raf = await File(path).open(mode: FileMode.append);
         fileWritten = resumeOffset;
       } else {
-        path = await _resolveSavePath(safeName);
+        path = await _resolveSavePath(fileName, folderRoot: folderRoot);
         savePath = path;
         raf = await File(path).open(mode: FileMode.write);
         fileWritten = 0;
@@ -496,7 +531,10 @@ class FileReceiver {
     }
   }
 
-  static Future<String> _resolveSavePath(String safeName) async {
+  static Future<String> _resolveSavePath(
+    String fileName, {
+    String? folderRoot,
+  }) async {
     final dlPath = AppSettings.instance.downloadPath.value;
     Directory dir;
     if (dlPath.isNotEmpty) {
@@ -531,22 +569,42 @@ class FileReceiver {
       dir = Directory.systemTemp;
     }
 
-    final sep = Platform.pathSeparator;
-    var path = '${dir.path}$sep$safeName';
+    final relative = _relativeSavePath(fileName, folderRoot: folderRoot);
+    var path = p.join(dir.path, relative);
+    await Directory(p.dirname(path)).create(recursive: true);
+
     if (!await File(path).exists()) return path;
 
-    final dot = safeName.lastIndexOf('.');
-    final baseName = dot > 0 ? safeName.substring(0, dot) : safeName;
-    final ext = dot > 0 ? safeName.substring(dot) : '';
+    final leaf = p.basename(path);
+    final parent = p.dirname(path);
+    final dot = leaf.lastIndexOf('.');
+    final baseName = dot > 0 ? leaf.substring(0, dot) : leaf;
+    final ext = dot > 0 ? leaf.substring(dot) : '';
 
     const maxIterations = 100;
     for (var i = 1; i < maxIterations; i++) {
-      path = '${dir.path}$sep$baseName ($i)$ext';
+      path = p.join(parent, '$baseName ($i)$ext');
       if (!await File(path).exists()) return path;
     }
 
     final stamp = DateTime.now().millisecondsSinceEpoch;
-    return '${dir.path}$sep${stamp}_$safeName';
+    return p.join(parent, '${stamp}_$leaf');
+  }
+
+  static String _relativeSavePath(String fileName, {String? folderRoot}) {
+    if (folderRoot != null && folderRoot.isNotEmpty) {
+      final safeRoot =
+          folderRoot.replaceAll(RegExp(r'[/\\:*?"<>|]'), '_').trim();
+      if (safeRoot.isEmpty) {
+        return fileName.replaceAll(RegExp(r'[/\\]'), '_');
+      }
+      final rel = sanitizeFolderRelativePath(fileName.replaceAll('\\', '/'));
+      if (rel != null) {
+        return p.join(safeRoot, rel);
+      }
+      return p.join(safeRoot, fileName.replaceAll(RegExp(r'[/\\]'), '_'));
+    }
+    return fileName.replaceAll(RegExp(r'[/\\]'), '_');
   }
 
   Future<void> stop() async {

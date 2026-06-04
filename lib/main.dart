@@ -14,6 +14,7 @@ import 'app_branding.dart';
 import 'app_settings.dart';
 import 'app_splash.dart';
 import 'android_share_inbound.dart';
+import 'client_platform.dart';
 import 'chat_crypto.dart';
 import 'chat_screen.dart';
 import 'connection_service.dart';
@@ -26,6 +27,7 @@ import 'home_screen.dart';
 import 'message_model.dart';
 import 'message_store.dart';
 import 'settings_screen.dart';
+import 'incoming_file_offer.dart';
 import 'transfer_manager.dart';
 import 'windows_taskbar_flash.dart';
 
@@ -449,6 +451,27 @@ Future<void> _bootstrapServices() async {
     notificationsPlugin: _notifications,
   );
 
+  TransferManager.instance.incomingFileOfferDialog = ({
+    required String peerId,
+    required String peerDisplayName,
+    required String fileId,
+    required String fileLabel,
+    required int fileSizeBytes,
+    bool folderBatch = false,
+  }) async {
+    final ctx = appNavigatorKey.currentContext;
+    if (ctx == null) return false;
+    return showIncomingFileOfferDialog(
+      context: ctx,
+      peerDisplayName: peerDisplayName,
+      fileLabel: fileLabel,
+      fileSizeBytes: fileSizeBytes,
+      detailLine: folderBatch
+          ? 'Files will be saved into a folder under your download location.'
+          : null,
+    );
+  };
+
   await _initNotificationsSafe();
 
   _connections.onMessage = (peerId, json) {
@@ -467,6 +490,10 @@ Future<void> _bootstrapServices() async {
 
     if (type == 'hello') {
       final name = (json['name'] as String? ?? '').trim();
+      final plat = (json['platform'] as String? ?? '').trim();
+      if (plat.isNotEmpty) {
+        _discovery.updatePeerPlatform(peerId, plat);
+      }
       final peer = _discoveryPeerById(peerId);
       final sock = _connections.getSocket(peerId);
       final ip = (peer?.ip ?? sock?.remoteAddress.address ?? '').trim();
@@ -481,6 +508,12 @@ Future<void> _bootstrapServices() async {
         port,
         lanStableTag: peer?.lanStableTag,
       ));
+      _connections.sendJson(peerId, {
+        'type': 'hello',
+        'id': _me.userId,
+        'name': _me.displayName,
+        'platform': localClientPlatform,
+      });
       return;
     }
 
@@ -510,24 +543,62 @@ Future<void> _bootstrapServices() async {
       return;
     }
 
+    if (type == 'file_offer') {
+      final peer = _discoveryPeerById(peerId);
+      final peerName = peer?.name ?? 'Peer';
+      unawaited(TransferManager.instance.onIncomingFileOffer(
+        peerId,
+        json,
+        peerDisplayName: peerName,
+      ));
+      return;
+    }
+
+    if (type == 'file_accept') {
+      final id = json['id'] as String?;
+      if (id != null && id.isNotEmpty) {
+        TransferManager.instance.onFileAccept(peerId, id);
+      }
+      return;
+    }
+
+    if (type == 'file_reject') {
+      final id = json['id'] as String?;
+      if (id != null && id.isNotEmpty) {
+        TransferManager.instance.onFileReject(peerId, id);
+      }
+      return;
+    }
+
     if (type == 'file_notify') {
       TransferManager.instance.registerIncoming(
         peerId,
         json['id'] as String? ?? '',
         json['name'] as String? ?? '',
         (json['size'] as num?)?.toInt() ?? 0,
+        folderRoot: json['folderRoot'] as String?,
+        batchMessageId: json['batchMessageId'] as String?,
+        batchTotalSize: (json['batchTotalSize'] as num?)?.toInt(),
       );
+      return;
     }
 
     if (type == 'file_control') {
       final id = json['id'] as String?;
       if (id == null || id.isEmpty) return;
       final from = json['from'] as String? ?? '';
-      if (json['pause'] == true) {
+      final pause = json['pause'] == true;
+      if (pause) {
         if (from == 'sender') {
           TransferManager.instance.handleRemotePauseIncoming(id);
         } else if (from == 'receiver') {
           TransferManager.instance.handleRemotePauseOutgoing(id);
+        }
+      } else {
+        if (from == 'receiver') {
+          TransferManager.instance.handleRemoteResumeOutgoing(id);
+        } else if (from == 'sender') {
+          TransferManager.instance.handleRemoteResumeIncoming(id);
         }
       }
       return;
