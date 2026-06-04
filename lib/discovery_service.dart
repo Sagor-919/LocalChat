@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 
+import 'client_platform.dart';
 import 'device.dart';
 
 class DiscoveryService {
@@ -206,9 +207,9 @@ class DiscoveryService {
 
   void _broadcast() {
     final tag = me.lanStableTag.trim();
-    final msg = tag.isEmpty
-        ? 'LOCALCHAT|${me.userId}|${me.displayName}|$tcpPort'
-        : 'LOCALCHAT|${me.userId}|${me.displayName}|$tcpPort|$tag';
+    final tagField = tag.isEmpty ? '-' : tag;
+    final msg =
+        'LOCALCHAT|${me.userId}|${me.displayName}|$tcpPort|$tagField|${localClientPlatform}';
     final data = utf8.encode(msg);
     try {
       _socket?.send(data, InternetAddress('255.255.255.255'), udpPort);
@@ -232,21 +233,30 @@ class DiscoveryService {
     final name = parts[2];
     final port = int.tryParse(parts[3]) ?? tcpPort;
     String? wireTag;
+    String? platform;
     if (parts.length >= 5) {
-      final raw = parts[4].trim();
-      if (raw.isNotEmpty && raw != '-') wireTag = raw;
+      final field4 = parts[4].trim();
+      if (parts.length >= 6) {
+        if (field4.isNotEmpty && field4 != '-') wireTag = field4;
+        final p5 = parts[5].trim();
+        if (p5.isNotEmpty && p5 != '-') platform = p5;
+      } else if (field4.isNotEmpty && field4 != '-') {
+        wireTag = field4;
+      }
     }
 
     if (userId == me.userId) return;
 
     final existing = _peers[userId];
     final effectiveTag = wireTag ?? existing?.lanStableTag;
+    final effectivePlatform = platform ?? existing?.platform;
     if (existing != null) {
       existing.lastSeen = DateTime.now();
       if (existing.name != name ||
           existing.ip != senderIp ||
           existing.port != port ||
-          existing.lanStableTag != effectiveTag) {
+          existing.lanStableTag != effectiveTag ||
+          existing.platform != effectivePlatform) {
         _peers[userId] = PeerDevice(
           userId: userId,
           name: name,
@@ -254,6 +264,7 @@ class DiscoveryService {
           port: port,
           lastSeen: DateTime.now(),
           lanStableTag: effectiveTag,
+          platform: effectivePlatform,
         );
       }
     } else {
@@ -264,6 +275,7 @@ class DiscoveryService {
         port: port,
         lastSeen: DateTime.now(),
         lanStableTag: effectiveTag,
+        platform: effectivePlatform,
       );
     }
     onPeersChanged?.call();
@@ -279,6 +291,22 @@ class DiscoveryService {
     if (_peers.length != before) {
       onPeersChanged?.call();
     }
+  }
+
+  void updatePeerPlatform(String userId, String platform) {
+    final existing = _peers[userId];
+    if (existing == null) return;
+    if (existing.platform == platform) return;
+    _peers[userId] = PeerDevice(
+      userId: existing.userId,
+      name: existing.name,
+      ip: existing.ip,
+      port: existing.port,
+      lastSeen: existing.lastSeen,
+      lanStableTag: existing.lanStableTag,
+      platform: platform,
+    );
+    onPeersChanged?.call();
   }
 
   void stop() {

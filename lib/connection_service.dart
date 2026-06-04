@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:uuid/uuid.dart';
 
+import 'client_platform.dart';
 import 'device.dart';
 
 /// Chat TCP stream — behavior matches [MsgStream] in `netstreamer.cpp`:
@@ -148,8 +149,12 @@ class ConnectionService {
 
       _attachSocket(socket, peer.userId);
 
-      sendJson(peer.userId,
-          {'type': 'hello', 'id': me.userId, 'name': me.displayName});
+      sendJson(peer.userId, {
+        'type': 'hello',
+        'id': me.userId,
+        'name': me.displayName,
+        'platform': localClientPlatform,
+      });
       return socket;
     } catch (_) {
       return null;

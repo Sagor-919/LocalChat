@@ -109,6 +109,8 @@ class PeerDevice {
   DateTime lastSeen;
   /// From discovery payload; null if legacy peer or wire omitted.
   final String? lanStableTag;
+  /// From discovery/hello (`android`, `windows`, …); null if legacy peer.
+  final String? platform;
 
   PeerDevice({
     required this.userId,
@@ -117,6 +119,7 @@ class PeerDevice {
     required this.port,
     required this.lastSeen,
     this.lanStableTag,
+    this.platform,
   });
 
   Color get avatarColor {

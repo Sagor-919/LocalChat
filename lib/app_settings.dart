@@ -14,6 +14,8 @@ class AppSettings {
       'first_launch_onboarding_complete';
   /// Legacy key from notification-only first run; counts as onboarding done.
   static const _kFirstLaunchPermissionsDone = 'first_launch_permissions_done';
+  static const _kAutoAcceptIncomingFiles = 'auto_accept_incoming_files';
+  static const _kFolderSendAsZip = 'folder_send_as_zip';
 
   late SharedPreferences _prefs;
 
@@ -23,6 +25,10 @@ class AppSettings {
   final startWithWindows = ValueNotifier<bool>(false);
   /// Desktop: when true, closing the window hides to tray and keeps LAN active; when false, exit the app.
   final desktopRunInBackground = ValueNotifier<bool>(true);
+  /// When true, incoming [file_offer] is accepted after a space/write check (any file size).
+  final autoAcceptIncomingFiles = ValueNotifier<bool>(true);
+  /// Desktop folder sends: true = one .zip (temp file); false = send files with folder layout.
+  final folderSendAsZip = ValueNotifier<bool>(true);
 
   Future<void> init() async {
     _prefs = await SharedPreferences.getInstance();
@@ -35,6 +41,9 @@ class AppSettings {
     };
 
     notificationsMuted.value = _prefs.getBool('notifications_muted') ?? false;
+    autoAcceptIncomingFiles.value =
+        _prefs.getBool(_kAutoAcceptIncomingFiles) ?? true;
+    folderSendAsZip.value = _prefs.getBool(_kFolderSendAsZip) ?? true;
 
     if (!kIsWeb && (Platform.isWindows || Platform.isLinux || Platform.isMacOS)) {
       desktopRunInBackground.value =
@@ -76,6 +85,20 @@ class AppSettings {
     notificationsMuted.value = muted;
     await _prefs.setBool('notifications_muted', muted);
   }
+
+  Future<void> setAutoAcceptIncomingFiles(bool enabled) async {
+    autoAcceptIncomingFiles.value = enabled;
+    await _prefs.setBool(_kAutoAcceptIncomingFiles, enabled);
+  }
+
+  Future<void> setFolderSendAsZip(bool asZip) async {
+    folderSendAsZip.value = asZip;
+    await _prefs.setBool(_kFolderSendAsZip, asZip);
+  }
+
+  static bool get supportsDesktopFolderSend =>
+      !kIsWeb &&
+      (Platform.isWindows || Platform.isLinux || Platform.isMacOS);
 
   Future<void> setDesktopRunInBackground(bool enabled) async {
     if (kIsWeb ||
