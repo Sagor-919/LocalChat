@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -15,7 +16,13 @@ import 'app_metadata.dart';
 import 'app_settings.dart';
 import 'app_snackbar.dart';
 import 'message_store.dart';
+import 'debug_log.dart';
+import 'partial_downloads.dart';
+import 'peer_identity.dart';
+import 'settings_export.dart';
 import 'storage_usage.dart';
+import 'transfer_center_screen.dart';
+import 'device.dart';
 import 'package:path/path.dart' as p;
 
 class SettingsScreen extends StatefulWidget {
@@ -370,6 +377,158 @@ class _SettingsScreenState extends State<SettingsScreen>
             _buildStorageSection(context, isDark: isDark, cs: cs),
             const SizedBox(height: 16),
           ],
+
+          _sectionLabel(context, 'TRANSFERS'),
+          _card(
+            isDark: isDark,
+            cs: cs,
+            child: Column(
+              children: [
+                ListTile(
+                  leading: Icon(Icons.swap_horiz, color: cs.primary),
+                  title: const Text('Transfer center'),
+                  subtitle: const Text('Active, paused, and failed transfers'),
+                  onTap: () => Navigator.push(
+                    context,
+                    MaterialPageRoute<void>(
+                      builder: (_) => const TransferCenterScreen(),
+                    ),
+                  ),
+                ),
+                ValueListenableBuilder<bool>(
+                  valueListenable: _settings.encryptFileTransfers,
+                  builder: (_, v, __) => SwitchListTile(
+                    title: const Text('Encrypt file bytes on LAN'),
+                    subtitle: const Text('AES-GCM per chunk (both peers need this build)'),
+                    value: v,
+                    onChanged: (x) => _settings.setEncryptFileTransfers(x),
+                  ),
+                ),
+                ValueListenableBuilder<bool>(
+                  valueListenable: _settings.fileTransferChecksum,
+                  builder: (_, v, __) => SwitchListTile(
+                    title: const Text('SHA-256 checksum footer'),
+                    value: v,
+                    onChanged: (x) => _settings.setFileTransferChecksum(x),
+                  ),
+                ),
+                ValueListenableBuilder<int>(
+                  valueListenable: _settings.maxAttachmentSizeMb,
+                  builder: (_, mb, __) => ListTile(
+                    title: const Text('Max attachment size (MB)'),
+                    subtitle: Text(mb <= 0 ? 'Unlimited' : '$mb MB'),
+                    trailing: DropdownButton<int>(
+                      value: mb,
+                      items: const [
+                        DropdownMenuItem(value: 0, child: Text('Unlimited')),
+                        DropdownMenuItem(value: 100, child: Text('100')),
+                        DropdownMenuItem(value: 500, child: Text('500')),
+                        DropdownMenuItem(value: 1024, child: Text('1024')),
+                        DropdownMenuItem(value: 2048, child: Text('2048')),
+                      ],
+                      onChanged: (v) {
+                        if (v != null) _settings.setMaxAttachmentSizeMb(v);
+                      },
+                    ),
+                  ),
+                ),
+                ValueListenableBuilder<int>(
+                  valueListenable: _settings.transferThrottleKbps,
+                  builder: (_, kbps, __) => ListTile(
+                    title: const Text('Send throttle (KB/s)'),
+                    subtitle: Text(kbps <= 0 ? 'Unlimited' : '$kbps KB/s'),
+                    trailing: DropdownButton<int>(
+                      value: kbps,
+                      items: const [
+                        DropdownMenuItem(value: 0, child: Text('Off')),
+                        DropdownMenuItem(value: 512, child: Text('512')),
+                        DropdownMenuItem(value: 1024, child: Text('1024')),
+                        DropdownMenuItem(value: 5120, child: Text('5120')),
+                      ],
+                      onChanged: (v) {
+                        if (v != null) _settings.setTransferThrottleKbps(v);
+                      },
+                    ),
+                  ),
+                ),
+                ValueListenableBuilder<int>(
+                  valueListenable: _settings.maxConcurrentSends,
+                  builder: (_, n, __) => ListTile(
+                    title: const Text('Max concurrent sends'),
+                    trailing: DropdownButton<int>(
+                      value: n,
+                      items: List.generate(
+                        6,
+                        (i) => DropdownMenuItem(
+                          value: i + 1,
+                          child: Text('${i + 1}'),
+                        ),
+                      ),
+                      onChanged: (v) {
+                        if (v != null) _settings.setMaxConcurrentSends(v);
+                      },
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+
+          _sectionLabel(context, 'TOOLS'),
+          _card(
+            isDark: isDark,
+            cs: cs,
+            child: Column(
+              children: [
+                ListTile(
+                  leading: Icon(Icons.badge_outlined, color: cs.primary),
+                  title: const Text('My peer ID'),
+                  onTap: () async {
+                    final me = await DeviceInfo.load();
+                    if (!context.mounted) return;
+                    await showPeerIdentitySheet(
+                      context,
+                      userId: me.userId,
+                      displayName: me.displayName,
+                    );
+                  },
+                ),
+                ListTile(
+                  leading: Icon(Icons.upload_file, color: cs.primary),
+                  title: const Text('Export settings'),
+                  onTap: () async {
+                    final json = exportSettingsJson();
+                    await Clipboard.setData(ClipboardData(text: json));
+                    if (context.mounted) {
+                      showAppSnackBar(context, 'Settings JSON copied');
+                    }
+                  },
+                ),
+                ListTile(
+                  leading: Icon(Icons.download, color: cs.primary),
+                  title: const Text('Import settings'),
+                  onTap: () => _importSettingsDialog(context),
+                ),
+                ListTile(
+                  leading: Icon(Icons.bug_report_outlined, color: cs.primary),
+                  title: const Text('Export debug log'),
+                  onTap: () async {
+                    final f = await DebugLog.instance.exportToTempFile();
+                    if (context.mounted) {
+                      showAppSnackBar(context, 'Log saved: ${f.path}');
+                    }
+                  },
+                ),
+                ListTile(
+                  leading: Icon(Icons.hourglass_empty, color: cs.primary),
+                  title: const Text('Partial downloads'),
+                  onTap: () => _showPartialDownloads(context),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
 
           _sectionLabel(context, 'DATA'),
           _card(
@@ -735,9 +894,12 @@ class _SettingsScreenState extends State<SettingsScreen>
         return;
       }
     }
-    await _settings.setDownloadPath(dir);
+    final moved = await _settings.setDownloadPathWithMigration(dir);
     if (!kIsWeb) {
       await _refreshStorageBreakdown();
+    }
+    if (mounted && moved > 0) {
+      showAppSnackBar(context, 'Moved $moved item(s) to new download folder');
     }
   }
 
@@ -755,6 +917,60 @@ class _SettingsScreenState extends State<SettingsScreen>
     } catch (_) {}
   }
 
+  Future<void> _importSettingsDialog(BuildContext context) async {
+    final controller = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Import settings'),
+        content: TextField(
+          controller: controller,
+          maxLines: 8,
+          decoration: const InputDecoration(
+            hintText: 'Paste exported JSON',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Import'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true && controller.text.trim().isNotEmpty) {
+      try {
+        await importSettingsJson(controller.text.trim());
+        if (mounted) showAppSnackBar(context, 'Settings imported');
+      } catch (e) {
+        if (mounted) showAppSnackBar(context, 'Import failed: $e');
+      }
+    }
+    controller.dispose();
+  }
+
+  Future<void> _showPartialDownloads(BuildContext context) async {
+    final entries = await scanPartialDownloads(_settings.downloadPath.value);
+    if (!context.mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Partial downloads'),
+        content: Text(describePartialDownloads(entries)),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+  }
+
   void _confirmClearAll() {
     showDialog(
       context: context,
@@ -762,7 +978,8 @@ class _SettingsScreenState extends State<SettingsScreen>
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
         title: const Text('Clear All Chats'),
         content: const Text(
-            'Delete ALL message history for every conversation? This cannot be undone.'),
+            'Delete ALL message history and attachment files on disk for '
+            'every conversation? This cannot be undone.'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx),

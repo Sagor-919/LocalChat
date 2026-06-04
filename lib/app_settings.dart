@@ -16,6 +16,11 @@ class AppSettings {
   static const _kFirstLaunchPermissionsDone = 'first_launch_permissions_done';
   static const _kAutoAcceptIncomingFiles = 'auto_accept_incoming_files';
   static const _kFolderSendAsZip = 'folder_send_as_zip';
+  static const _kEncryptFileTransfers = 'encrypt_file_transfers';
+  static const _kFileTransferChecksum = 'file_transfer_checksum';
+  static const _kMaxAttachmentSizeMb = 'max_attachment_size_mb';
+  static const _kTransferThrottleKbps = 'transfer_throttle_kbps';
+  static const _kMaxConcurrentSends = 'max_concurrent_sends';
 
   late SharedPreferences _prefs;
 
@@ -29,6 +34,13 @@ class AppSettings {
   final autoAcceptIncomingFiles = ValueNotifier<bool>(true);
   /// Desktop folder sends: true = one .zip (temp file); false = send files with folder layout.
   final folderSendAsZip = ValueNotifier<bool>(true);
+  final encryptFileTransfers = ValueNotifier<bool>(true);
+  final fileTransferChecksum = ValueNotifier<bool>(false);
+  /// 0 = unlimited.
+  final maxAttachmentSizeMb = ValueNotifier<int>(0);
+  /// 0 = unlimited send throttle.
+  final transferThrottleKbps = ValueNotifier<int>(0);
+  final maxConcurrentSends = ValueNotifier<int>(3);
 
   Future<void> init() async {
     _prefs = await SharedPreferences.getInstance();
@@ -44,6 +56,16 @@ class AppSettings {
     autoAcceptIncomingFiles.value =
         _prefs.getBool(_kAutoAcceptIncomingFiles) ?? true;
     folderSendAsZip.value = _prefs.getBool(_kFolderSendAsZip) ?? true;
+    encryptFileTransfers.value =
+        _prefs.getBool(_kEncryptFileTransfers) ?? true;
+    fileTransferChecksum.value =
+        _prefs.getBool(_kFileTransferChecksum) ?? false;
+    maxAttachmentSizeMb.value =
+        _prefs.getInt(_kMaxAttachmentSizeMb) ?? 0;
+    transferThrottleKbps.value =
+        _prefs.getInt(_kTransferThrottleKbps) ?? 0;
+    maxConcurrentSends.value =
+        _prefs.getInt(_kMaxConcurrentSends) ?? 3;
 
     if (!kIsWeb && (Platform.isWindows || Platform.isLinux || Platform.isMacOS)) {
       desktopRunInBackground.value =
@@ -112,6 +134,75 @@ class AppSettings {
   Future<void> setDownloadPath(String path) async {
     downloadPath.value = path;
     await _prefs.setString('download_path', path);
+  }
+
+  /// Moves files from [oldPath] into [newPath] when changing download folder (QA 22).
+  Future<int> setDownloadPathWithMigration(String newPath) async {
+    final oldPath = downloadPath.value;
+    if (!kIsWeb &&
+        oldPath.isNotEmpty &&
+        oldPath != newPath &&
+        await Directory(oldPath).exists()) {
+      final dest = Directory(newPath);
+      await dest.create(recursive: true);
+      var moved = 0;
+      await for (final entity in Directory(oldPath).list(recursive: false)) {
+        final name = p.basename(entity.path);
+        final target = p.join(newPath, name);
+        try {
+          await entity.rename(target);
+          moved++;
+        } catch (_) {
+          if (entity is File) {
+            await entity.copy(target);
+            await entity.delete();
+            moved++;
+          }
+        }
+      }
+      await setDownloadPath(newPath);
+      return moved;
+    }
+    await setDownloadPath(newPath);
+    return 0;
+  }
+
+  Future<void> setEncryptFileTransfers(bool enabled) async {
+    encryptFileTransfers.value = enabled;
+    await _prefs.setBool(_kEncryptFileTransfers, enabled);
+  }
+
+  Future<void> setFileTransferChecksum(bool enabled) async {
+    fileTransferChecksum.value = enabled;
+    await _prefs.setBool(_kFileTransferChecksum, enabled);
+  }
+
+  Future<void> setMaxAttachmentSizeMb(int mb) async {
+    maxAttachmentSizeMb.value = mb < 0 ? 0 : mb;
+    await _prefs.setInt(_kMaxAttachmentSizeMb, maxAttachmentSizeMb.value);
+  }
+
+  Future<void> setTransferThrottleKbps(int kbps) async {
+    transferThrottleKbps.value = kbps < 0 ? 0 : kbps;
+    await _prefs.setInt(_kTransferThrottleKbps, transferThrottleKbps.value);
+  }
+
+  Future<void> setMaxConcurrentSends(int count) async {
+    final v = count.clamp(1, 8);
+    maxConcurrentSends.value = v;
+    await _prefs.setInt(_kMaxConcurrentSends, v);
+  }
+
+  int? get maxAttachmentSizeBytes {
+    final mb = maxAttachmentSizeMb.value;
+    if (mb <= 0) return null;
+    return mb * 1024 * 1024;
+  }
+
+  int? get transferThrottleBytesPerSec {
+    final kbps = transferThrottleKbps.value;
+    if (kbps <= 0) return null;
+    return (kbps * 1024) ~/ 8;
   }
 
   /// True after first-run welcome (notifications, storage on Android, download location).

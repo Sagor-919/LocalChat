@@ -1186,8 +1186,11 @@ class _ChatScreenState extends State<ChatScreen> {
         : plat == 'ios'
             ? '${peer.name} is on iOS, which does not support receiving a '
                 'folder as multiple files. Send as a ZIP instead?'
-            : '${peer.name} may not support receiving a folder as multiple '
-                'files (platform: $plat). Send as a ZIP instead?';
+            : plat == 'unknown'
+                ? '${peer.name}\'s platform is unknown (older app or not '
+                    'advertised). Send as a ZIP to avoid compatibility issues?'
+                : '${peer.name} may not support receiving a folder as multiple '
+                    'files (platform: $plat). Send as a ZIP instead?';
 
     final result = await showDialog<bool>(
       context: context,
