@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
 
+import 'message_attachment_cleanup.dart';
 import 'message_model.dart';
 import 'sqflite_init.dart';
 
@@ -684,15 +685,31 @@ class MessageStore {
 
   Future<void> clear(String peerId) async {
     return _withLock(peerId, () async {
+      final rows = await _db.query(
+        'messages',
+        where: 'peer_id = ?',
+        whereArgs: [peerId],
+      );
+      final messages = rows.map(_rowToMessage).toList();
       await _db.delete('messages', where: 'peer_id = ?', whereArgs: [peerId]);
       _notifyHistoryCleared(all: false, peerId: peerId);
+      await _deleteAttachmentsForMessages(messages);
     });
   }
 
   Future<void> clearAll() async {
+    final peers = await loadAllPeerInfos();
+    for (final peerId in peers.keys) {
+      final messages = await load(peerId);
+      await _deleteAttachmentsForMessages(messages);
+    }
     await _db.delete('messages');
     await _db.delete('peers');
     _notifyHistoryCleared(all: true);
+  }
+
+  Future<void> _deleteAttachmentsForMessages(List<ChatMessage> messages) async {
+    await deleteAttachmentFilesForMessages(messages);
   }
 
   Future<void> removePeerInfo(String peerId) async {
