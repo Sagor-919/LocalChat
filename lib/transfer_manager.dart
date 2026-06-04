@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'connection_service.dart';
@@ -125,6 +126,10 @@ class TransferManager {
   FlutterLocalNotificationsPlugin? _notifPlugin;
   Timer? _notifTimer;
   static const _transferNotifId = 99999;
+  static const _incomingOfferNotifId = 99998;
+  static const _largeOfferNotifBytes = 5 * 1024 * 1024;
+
+  int _outboundSendSlots = 0;
 
   /// Receiver-side partial path for resume (same [fileId]).
   final Map<String, String> _receivePathByFileId = {};
@@ -161,6 +166,7 @@ class TransferManager {
     _receiver!.resumePathResolver = _resolveResumeReceivePath;
     _receiver!.validateTransferToken = _validateIncomingTransferToken;
     _receiver!.isIncomingRegistered = _isIncomingRegistered;
+    _receiver!.localPeerId = _myId;
     _receiver!.onFileStarted = _onReceiveStarted;
     _receiver!.onProgress = _onReceiveProgress;
     _receiver!.onFileComplete = _onReceiveComplete;
@@ -267,6 +273,13 @@ class TransferManager {
         return;
       }
     } else {
+      if (size >= _largeOfferNotifBytes) {
+        unawaited(_showIncomingOfferNotification(
+          peerDisplayName: peerDisplayName,
+          fileLabel: name,
+          fileSizeBytes: size,
+        ));
+      }
       final dialog = incomingFileOfferDialog;
       if (dialog == null) {
         _connections.sendJson(peerId, {
@@ -361,6 +374,18 @@ class TransferManager {
   }
 
   /// [initialMessage] must already be in [MessageStore]. Prepares file (copy / folder zip), then sends.
+  Future<void> _acquireSendSlot() async {
+    final max = AppSettings.instance.maxConcurrentSends.value;
+    while (_outboundSendSlots >= max) {
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+    }
+    _outboundSendSlots++;
+  }
+
+  void _releaseSendSlot() {
+    if (_outboundSendSlots > 0) _outboundSendSlots--;
+  }
+
   Future<void> prepareAndSendOutbound({
     required ChatMessage initialMessage,
     required String peerId,
@@ -374,6 +399,13 @@ class TransferManager {
     bool? forceFolderAsZip,
   }) async {
     final id = initialMessage.id;
+    final maxBytes = AppSettings.instance.maxAttachmentSizeBytes;
+    final attachSize = initialMessage.attachmentSize ?? 0;
+    if (maxBytes != null && attachSize > maxBytes) {
+      throw StateError(
+        'File exceeds maximum size (${AppSettings.instance.maxAttachmentSizeMb.value} MB)',
+      );
+    }
     final hasContentUri =
         androidContentUri != null && androidContentUri.isNotEmpty;
     final preparing = kind == StagedSourceKind.folderToZip ||
@@ -789,7 +821,9 @@ class TransferManager {
     final startOff = t.transferredBytes;
     var lastReported = previousSent ?? startOff;
 
+    await _acquireSendSlot();
     try {
+      final settings = AppSettings.instance;
       await sender.send(
         host: peerIp,
         fileId: t.fileId,
@@ -800,6 +834,10 @@ class TransferManager {
         folderRoot: folderRoot,
         token: _outboundToken(t.peerId, t.fileId),
         senderPeerId: _myId,
+        encryptPeerId: t.peerId,
+        encryptPayload: settings.encryptFileTransfers.value,
+        throttleBytesPerSec: settings.transferThrottleBytesPerSec,
+        appendChecksum: settings.fileTransferChecksum.value,
         onProgress: (sent, total) {
           if (onChunkSent != null) {
             final delta = sent - lastReported;
@@ -843,10 +881,34 @@ class TransferManager {
         _notify();
       }
     } finally {
+      _releaseSendSlot();
       if (onChunkSent == null) {
         await _emitStoredFileMessageForPreview(t.peerId, t.fileId);
       }
     }
+  }
+
+  Future<void> _showIncomingOfferNotification({
+    required String peerDisplayName,
+    required String fileLabel,
+    required int fileSizeBytes,
+  }) async {
+    final plugin = _notifPlugin;
+    if (plugin == null) return;
+    final mb = (fileSizeBytes / (1024 * 1024)).toStringAsFixed(1);
+    await plugin.show(
+      _incomingOfferNotifId,
+      'Incoming file from $peerDisplayName',
+      '$fileLabel ($mb MB) — open app to accept or decline',
+      const NotificationDetails(
+        android: AndroidNotificationDetails(
+          'incoming_offers',
+          'Incoming file offers',
+          importance: Importance.high,
+          priority: Priority.high,
+        ),
+      ),
+    );
   }
 
   void cancel(String fileId) {
@@ -1315,6 +1377,23 @@ class TransferManager {
   void _notify() {
     _transferUpdates.add(null);
     _scheduleNotifUpdate();
+    _syncAndroidTransferWakelock();
+  }
+
+  void _syncAndroidTransferWakelock() {
+    if (kIsWeb || !Platform.isAndroid) return;
+    final busy = transfers.values.any(
+      (t) =>
+          t.error == null &&
+          !t.cancelled &&
+          (!t.isPaused ||
+              t.outgoingPhase == OutgoingTransferPhase.preparing),
+    );
+    if (busy) {
+      unawaited(WakelockPlus.enable());
+    } else {
+      unawaited(WakelockPlus.disable());
+    }
   }
 
   void _scheduleNotifUpdate() {
