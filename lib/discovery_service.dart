@@ -240,7 +240,7 @@ class DiscoveryService {
     final tag = me.lanStableTag.trim();
     final tagField = tag.isEmpty ? '-' : tag;
     final msg = DiscoverySigning.appendSignature(
-      'LOCALCHAT|${me.userId}|${me.displayName}|$tcpPort|$tagField|${localClientPlatform}',
+      'LOCALCHAT|${me.userId}|${me.displayName}|$tcpPort|$tagField|$localClientPlatform',
     );
     final data = utf8.encode(msg);
     try {

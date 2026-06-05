@@ -397,7 +397,7 @@ class _SettingsScreenState extends State<SettingsScreen>
                 ),
                 ValueListenableBuilder<bool>(
                   valueListenable: _settings.encryptFileTransfers,
-                  builder: (_, v, __) => SwitchListTile(
+                  builder: (_, v, _) => SwitchListTile(
                     title: const Text('Encrypt file bytes on LAN'),
                     subtitle: const Text('AES-GCM per chunk (both peers need this build)'),
                     value: v,
@@ -406,7 +406,7 @@ class _SettingsScreenState extends State<SettingsScreen>
                 ),
                 ValueListenableBuilder<bool>(
                   valueListenable: _settings.fileTransferChecksum,
-                  builder: (_, v, __) => SwitchListTile(
+                  builder: (_, v, _) => SwitchListTile(
                     title: const Text('SHA-256 checksum footer'),
                     value: v,
                     onChanged: (x) => _settings.setFileTransferChecksum(x),
@@ -414,7 +414,7 @@ class _SettingsScreenState extends State<SettingsScreen>
                 ),
                 ValueListenableBuilder<int>(
                   valueListenable: _settings.maxAttachmentSizeMb,
-                  builder: (_, mb, __) => ListTile(
+                  builder: (_, mb, _) => ListTile(
                     title: const Text('Max attachment size (MB)'),
                     subtitle: Text(mb <= 0 ? 'Unlimited' : '$mb MB'),
                     trailing: DropdownButton<int>(
@@ -434,7 +434,7 @@ class _SettingsScreenState extends State<SettingsScreen>
                 ),
                 ValueListenableBuilder<int>(
                   valueListenable: _settings.transferThrottleKbps,
-                  builder: (_, kbps, __) => ListTile(
+                  builder: (_, kbps, _) => ListTile(
                     title: const Text('Send throttle (KB/s)'),
                     subtitle: Text(kbps <= 0 ? 'Unlimited' : '$kbps KB/s'),
                     trailing: DropdownButton<int>(
@@ -453,7 +453,7 @@ class _SettingsScreenState extends State<SettingsScreen>
                 ),
                 ValueListenableBuilder<int>(
                   valueListenable: _settings.maxConcurrentSends,
-                  builder: (_, n, __) => ListTile(
+                  builder: (_, n, _) => ListTile(
                     title: const Text('Max concurrent sends'),
                     trailing: DropdownButton<int>(
                       value: n,
@@ -945,9 +945,11 @@ class _SettingsScreenState extends State<SettingsScreen>
     if (ok == true && controller.text.trim().isNotEmpty) {
       try {
         await importSettingsJson(controller.text.trim());
-        if (mounted) showAppSnackBar(context, 'Settings imported');
+        if (!context.mounted) return;
+        showAppSnackBar(context, 'Settings imported');
       } catch (e) {
-        if (mounted) showAppSnackBar(context, 'Import failed: $e');
+        if (!context.mounted) return;
+        showAppSnackBar(context, 'Import failed: $e');
       }
     }
     controller.dispose();

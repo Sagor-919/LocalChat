@@ -894,6 +894,7 @@ class _ChatScreenState extends State<ChatScreen> {
       }
     }
     if (!needsConfirm) return true;
+    if (!mounted) return false;
 
     final body = blocks.join('\n\n');
     final confirmed = await showDialog<bool>(
