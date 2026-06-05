@@ -375,6 +375,15 @@ class TransferManager {
     return destPath;
   }
 
+  void _enforceMaxAttachmentSize(int bytes) {
+    final maxBytes = AppSettings.instance.maxAttachmentSizeBytes;
+    if (maxBytes != null && bytes > maxBytes) {
+      throw StateError(
+        'File exceeds maximum size (${AppSettings.instance.maxAttachmentSizeMb.value} MB)',
+      );
+    }
+  }
+
   /// [initialMessage] must already be in [MessageStore]. Prepares file (copy / folder zip), then sends.
   Future<void> _acquireSendSlot() async {
     final max = AppSettings.instance.maxConcurrentSends.value;
@@ -403,10 +412,20 @@ class TransferManager {
     final id = initialMessage.id;
     final maxBytes = AppSettings.instance.maxAttachmentSizeBytes;
     final attachSize = initialMessage.attachmentSize ?? 0;
-    if (maxBytes != null && attachSize > maxBytes) {
-      throw StateError(
-        'File exceeds maximum size (${AppSettings.instance.maxAttachmentSizeMb.value} MB)',
-      );
+    if (maxBytes != null && attachSize > 0 && attachSize > maxBytes) {
+      final t = TransferState(
+        fileId: id,
+        peerId: peerId,
+        fileName: initialMessage.attachmentName!,
+        totalBytes: attachSize,
+        isSending: true,
+        filePath: null,
+        outgoingPhase: OutgoingTransferPhase.preparing,
+      )..error =
+          'File exceeds maximum size (${AppSettings.instance.maxAttachmentSizeMb.value} MB)';
+      transfers[id] = t;
+      _notify();
+      return;
     }
     final hasContentUri =
         androidContentUri != null && androidContentUri.isNotEmpty;
@@ -514,6 +533,7 @@ class TransferManager {
 
         sendPath = zipPath;
         sendSize = await File(zipPath).length();
+        _enforceMaxAttachmentSize(sendSize);
       } else {
         var workPath = sourcePath;
         final uri = androidContentUri;
@@ -580,6 +600,7 @@ class TransferManager {
           sendPath = workPath;
           sendSize = await f.length();
         }
+        _enforceMaxAttachmentSize(sendSize);
       }
 
       if (t.cancelRequested) throw const AttachmentPrepareCancelled();
@@ -845,7 +866,8 @@ class TransferManager {
         encryptPeerId: t.peerId,
         encryptPayload: settings.encryptFileTransfers.value,
         throttleBytesPerSec: settings.transferThrottleBytesPerSec,
-        appendChecksum: settings.fileTransferChecksum.value,
+        appendChecksum: settings.fileTransferChecksum.value &&
+            !settings.encryptFileTransfers.value,
         onProgress: (sent, total) {
           if (onChunkSent != null) {
             final delta = sent - lastReported;
@@ -1156,11 +1178,12 @@ class TransferManager {
     String fileId,
     String fileName,
     int fileSize,
-    String savePath,
+    String finalPath,
+    String writePath,
     int resumeOffset,
     bool encrypted,
   ) async {
-    _receivePathByFileId[fileId] = savePath;
+    _receivePathByFileId[fileId] = writePath;
 
     if (resumeOffset > 0) {
       final existing = transfers[fileId];
@@ -1188,7 +1211,7 @@ class TransferManager {
       }
     }
     if (pending == null) {
-      await deletePartialDownloadFile(savePath);
+      await deletePartialDownloadFile(writePath);
       _clearIncomingToken(fileId);
       _receiver?.cancelReceive(fileId);
       return;
@@ -1242,7 +1265,10 @@ class TransferManager {
     _notify();
   }
 
-  void _finishFolderBatchReceive(TransferState batch, String lastSavedPath) {
+  Future<void> _finishFolderBatchReceive(
+    TransferState batch,
+    String lastSavedPath,
+  ) async {
     final peerId = batch.peerId;
     final batchId = batch.fileId;
     _folderBatchRootIds.remove(batchId);
@@ -1250,7 +1276,7 @@ class TransferManager {
     _batchCompletedBytes.remove(batchId);
     _clearIncomingToken(batchId);
     final folderPath = p.dirname(lastSavedPath);
-    _store.updateAttachmentPath(
+    await _store.updateAttachmentPath(
       peerId,
       batchId,
       folderPath,
@@ -1333,7 +1359,7 @@ class TransferManager {
       _receivePathByFileId.remove(fileId);
       _clearIncomingToken(fileId);
       if (batch != null && added >= batch.totalBytes) {
-        _finishFolderBatchReceive(batch, savedPath);
+        await _finishFolderBatchReceive(batch, savedPath);
       }
       _notify();
       return;
@@ -1353,7 +1379,7 @@ class TransferManager {
         if (done >= batch.totalBytes) {
           _receivePathByFileId.remove(fileId);
           _clearIncomingToken(fileId);
-          _finishFolderBatchReceive(batch, savedPath);
+          await _finishFolderBatchReceive(batch, savedPath);
         }
       }
       _notify();
