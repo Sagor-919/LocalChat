@@ -281,6 +281,7 @@ class FileReceiver {
     int fileSize,
     String savePath,
     int resumeOffset,
+    bool encrypted,
   )? onFileStarted;
   void Function(String fileId, int received, int total)? onProgress;
   void Function(String fileId, String savedPath)? onFileComplete;
@@ -581,7 +582,13 @@ class FileReceiver {
       _socketsByFileId[fileId] = socket;
 
       await onFileStarted?.call(
-          fileId, fileName, totalBytes, path, resumeOffset);
+        fileId,
+        fileName,
+        totalBytes,
+        path,
+        resumeOffset,
+        encrypted,
+      );
 
       socket.write('START\n');
       await socket.flush();

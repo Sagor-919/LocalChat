@@ -47,6 +47,8 @@ class TransferState {
   final Stopwatch stopwatch = Stopwatch()..start();
   /// Shown in chat while [outgoingPhase] is [OutgoingTransferPhase.preparing].
   String preparingStatus = '';
+  /// AES-GCM file bytes on the file TCP socket (shown in chat as secure transfer).
+  bool encrypted = false;
 
   TransferState({
     required this.fileId,
@@ -411,6 +413,8 @@ class TransferManager {
     final preparing = kind == StagedSourceKind.folderToZip ||
         duplicatePathInBatch ||
         hasContentUri;
+    final encryptOutbound =
+        AppSettings.instance.encryptFileTransfers.value;
     final t = TransferState(
       fileId: id,
       peerId: peerId,
@@ -421,7 +425,7 @@ class TransferManager {
       outgoingPhase: preparing
           ? OutgoingTransferPhase.preparing
           : OutgoingTransferPhase.transferring,
-    );
+    )..encrypted = encryptOutbound;
     transfers[id] = t;
     _notify();
     await _runPrepareAndSend(
@@ -598,11 +602,13 @@ class TransferManager {
         initialMessage.id,
         path: outboundPath,
         size: sendSize,
+        transferEncrypted: t.encrypted,
       );
 
       final updated = initialMessage.copyWith(
         attachmentPath: outboundPath,
         attachmentSize: sendSize,
+        transferEncrypted: t.encrypted,
       );
       _fileMessages.add(FileMessageEvent(peerId, updated));
 
@@ -692,10 +698,12 @@ class TransferManager {
         peerId,
         initialMessage.id,
         size: total,
+        transferEncrypted: t.encrypted,
       );
       final updated = initialMessage.copyWith(
         attachmentName: label,
         attachmentSize: total,
+        transferEncrypted: t.encrypted,
       );
       _fileMessages.add(FileMessageEvent(peerId, updated));
       t.fileName = label;
@@ -750,7 +758,7 @@ class TransferManager {
           totalBytes: e.sizeBytes,
           isSending: true,
           filePath: e.absolutePath,
-        );
+        )..encrypted = t.encrypted;
         await _runSend(
           subState,
           targetIp,
@@ -852,6 +860,11 @@ class TransferManager {
       );
       t.isPaused = false;
       if (onChunkSent == null) {
+        await _store.updateOutboundAttachment(
+          t.peerId,
+          t.fileId,
+          transferEncrypted: t.encrypted,
+        );
         _cleanupOutgoingTemps(t);
         transfers.remove(t.fileId);
         _notify();
@@ -1145,6 +1158,7 @@ class TransferManager {
     int fileSize,
     String savePath,
     int resumeOffset,
+    bool encrypted,
   ) async {
     _receivePathByFileId[fileId] = savePath;
 
@@ -1156,6 +1170,7 @@ class TransferManager {
         existing.transferredBytes = resumeOffset;
         existing.progress =
             fileSize == 0 ? 0 : resumeOffset / fileSize;
+        if (encrypted) existing.encrypted = true;
       }
       _notify();
       return;
@@ -1184,6 +1199,10 @@ class TransferManager {
     if (batchId != null) {
       _receiveBatchParent[fileId] = batchId;
       _receiveBatchFileSize[fileId] = fileSize;
+      if (encrypted) {
+        final batch = transfers[batchId];
+        if (batch != null) batch.encrypted = true;
+      }
       _notify();
       return;
     }
@@ -1219,7 +1238,7 @@ class TransferManager {
       fileName: fileName,
       totalBytes: batchTotal ?? fileSize,
       isSending: false,
-    );
+    )..encrypted = encrypted;
     _notify();
   }
 
@@ -1231,7 +1250,12 @@ class TransferManager {
     _batchCompletedBytes.remove(batchId);
     _clearIncomingToken(batchId);
     final folderPath = p.dirname(lastSavedPath);
-    _store.updateAttachmentPath(peerId, batchId, folderPath);
+    _store.updateAttachmentPath(
+      peerId,
+      batchId,
+      folderPath,
+      transferEncrypted: batch.encrypted,
+    );
     final updated = ChatMessage(
       id: batchId,
       senderId: peerId,
@@ -1241,6 +1265,7 @@ class TransferManager {
       attachmentName: batch.fileName,
       attachmentPath: folderPath,
       attachmentSize: batch.totalBytes,
+      transferEncrypted: batch.encrypted,
     );
     _fileMessages.add(FileMessageEvent(peerId, updated));
   }
@@ -1292,7 +1317,7 @@ class TransferManager {
     _notify();
   }
 
-  void _onReceiveComplete(String fileId, String savedPath) {
+  Future<void> _onReceiveComplete(String fileId, String savedPath) async {
     if (_folderBatchRootIds.contains(fileId)) {
       final added = _receiveBatchFileSize.remove(fileId) ??
           transfers[fileId]?.totalBytes ??
@@ -1344,7 +1369,12 @@ class TransferManager {
     transfers.remove(fileId);
     _notify();
 
-    _store.updateAttachmentPath(peerId, fileId, savedPath);
+    await _store.updateAttachmentPath(
+      peerId,
+      fileId,
+      savedPath,
+      transferEncrypted: t.encrypted,
+    );
 
     final updated = ChatMessage(
       id: fileId,
@@ -1355,6 +1385,7 @@ class TransferManager {
       attachmentName: t.fileName,
       attachmentPath: savedPath,
       attachmentSize: t.totalBytes,
+      transferEncrypted: t.encrypted,
     );
     _fileMessages.add(FileMessageEvent(peerId, updated));
   }

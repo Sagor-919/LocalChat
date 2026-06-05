@@ -2501,6 +2501,30 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  bool _isSecureFileTransfer(ChatMessage m, TransferState? t) =>
+      t?.encrypted == true || m.transferEncrypted;
+
+  Widget _secureTransferBadge(Color color) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.lock_rounded, size: 13, color: color),
+          const SizedBox(width: 4),
+          Text(
+            'Secure transfer',
+            style: TextStyle(
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+              color: color,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildAttachment(
     BuildContext context,
     ChatMessage m,
@@ -2510,7 +2534,8 @@ class _ChatScreenState extends State<ChatScreen> {
     final isDark = Theme.of(context).brightness == Brightness.dark;
     final hasPath = m.attachmentPath != null;
     final isImg = hasPath && _isImage(m.attachmentName!);
-    final isTransferring = _tm.transfers.containsKey(m.id);
+    final transfer = _tm.transfers[m.id];
+    final isTransferring = transfer != null;
     final fgColor = strikeAborted
         ? (isDark ? Colors.orangeAccent.shade100 : Colors.deepOrange.shade800)
         : (mine ? Colors.white : (isDark ? Colors.white : Colors.black));
@@ -2526,6 +2551,8 @@ class _ChatScreenState extends State<ChatScreen> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        if (_isSecureFileTransfer(m, transfer))
+          _secureTransferBadge(subtleColor),
         if (isImg && !strikeAborted)
           Padding(
             padding: const EdgeInsets.only(bottom: 6),

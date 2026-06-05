@@ -18,6 +18,8 @@ class ChatMessage {
   final int? attachmentSize;
   /// User dismissed a failed/cancelled transfer; show strikethrough / muted bubble.
   final bool transferDismissed;
+  /// File bytes used AES-GCM on the file TCP socket.
+  final bool transferEncrypted;
   /// Only for [isMine] text messages; null means legacy or not applicable.
   final MessageDelivery? delivery;
 
@@ -31,6 +33,7 @@ class ChatMessage {
     this.attachmentPath,
     this.attachmentSize,
     this.transferDismissed = false,
+    this.transferEncrypted = false,
     this.delivery,
   });
 
@@ -68,6 +71,7 @@ class ChatMessage {
         'attachmentPath': attachmentPath,
         'attachmentSize': attachmentSize,
         'transferDismissed': transferDismissed,
+        'transferEncrypted': transferEncrypted,
         if (delivery != null) 'delivery': delivery!.name,
       };
 
@@ -92,6 +96,7 @@ class ChatMessage {
       attachmentPath: json['attachmentPath'] as String?,
       attachmentSize: (json['attachmentSize'] as num?)?.toInt(),
       transferDismissed: json['transferDismissed'] as bool? ?? false,
+      transferEncrypted: json['transferEncrypted'] as bool? ?? false,
       delivery: _deliveryFromStore(json['delivery']),
     );
   }
@@ -106,6 +111,7 @@ class ChatMessage {
     String? attachmentPath,
     int? attachmentSize,
     bool? transferDismissed,
+    bool? transferEncrypted,
     MessageDelivery? delivery,
     bool clearDelivery = false,
   }) {
@@ -119,6 +125,7 @@ class ChatMessage {
       attachmentPath: attachmentPath ?? this.attachmentPath,
       attachmentSize: attachmentSize ?? this.attachmentSize,
       transferDismissed: transferDismissed ?? this.transferDismissed,
+      transferEncrypted: transferEncrypted ?? this.transferEncrypted,
       delivery: clearDelivery ? null : (delivery ?? this.delivery),
     );
   }

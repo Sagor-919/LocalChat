@@ -53,7 +53,7 @@ class MessageStore {
 
   MessageStore._();
 
-  static const int _dbVersion = 2;
+  static const int _dbVersion = 3;
   static const int _defaultChatTcpPort = 4041;
 
   static Future<MessageStore> init() async {
@@ -73,6 +73,11 @@ class MessageStore {
         if (oldVersion < 2) {
           await db.execute(
               'ALTER TABLE peers ADD COLUMN lan_stable_tag TEXT');
+        }
+        if (oldVersion < 3) {
+          await db.execute(
+            'ALTER TABLE messages ADD COLUMN transfer_encrypted INTEGER NOT NULL DEFAULT 0',
+          );
         }
       },
     );
@@ -102,6 +107,7 @@ class MessageStore {
         attachment_path TEXT,
         attachment_size INTEGER,
         transfer_dismissed INTEGER NOT NULL DEFAULT 0,
+        transfer_encrypted INTEGER NOT NULL DEFAULT 0,
         delivery TEXT,
         PRIMARY KEY (peer_id, id)
       )
@@ -204,6 +210,8 @@ class MessageStore {
       'attachment_path': m['attachmentPath'] as String?,
       'attachment_size': (m['attachmentSize'] as num?)?.toInt(),
       'transfer_dismissed': (m['transferDismissed'] as bool?) == true ? 1 : 0,
+      'transfer_encrypted':
+          (m['transferEncrypted'] as bool?) == true ? 1 : 0,
       'delivery': m['delivery'] as String?,
     };
   }
@@ -220,6 +228,7 @@ class MessageStore {
       'attachment_path': msg.attachmentPath,
       'attachment_size': msg.attachmentSize,
       'transfer_dismissed': msg.transferDismissed ? 1 : 0,
+      'transfer_encrypted': msg.transferEncrypted ? 1 : 0,
       'delivery': msg.delivery?.name,
     };
   }
@@ -235,6 +244,7 @@ class MessageStore {
       'attachmentPath': row['attachment_path'] as String?,
       'attachmentSize': (row['attachment_size'] as int?),
       'transferDismissed': (row['transfer_dismissed'] as int? ?? 0) != 0,
+      'transferEncrypted': (row['transfer_encrypted'] as int? ?? 0) != 0,
       'delivery': row['delivery'] as String?,
     });
   }
@@ -638,11 +648,19 @@ class MessageStore {
   }
 
   Future<void> updateAttachmentPath(
-      String peerId, String messageId, String path) async {
+    String peerId,
+    String messageId,
+    String path, {
+    bool? transferEncrypted,
+  }) async {
     return _withLock(peerId, () async {
+      final map = <String, Object?>{'attachment_path': path};
+      if (transferEncrypted != null) {
+        map['transfer_encrypted'] = transferEncrypted ? 1 : 0;
+      }
       await _db.update(
         'messages',
-        {'attachment_path': path},
+        map,
         where: 'peer_id = ? AND id = ?',
         whereArgs: [peerId, messageId],
       );
@@ -655,11 +673,15 @@ class MessageStore {
     String messageId, {
     String? path,
     int? size,
+    bool? transferEncrypted,
   }) async {
     await _withLock(peerId, () async {
       final map = <String, Object?>{};
       if (path != null) map['attachment_path'] = path;
       if (size != null) map['attachment_size'] = size;
+      if (transferEncrypted != null) {
+        map['transfer_encrypted'] = transferEncrypted ? 1 : 0;
+      }
       if (map.isEmpty) return;
       await _db.update(
         'messages',
