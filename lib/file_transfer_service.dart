@@ -16,6 +16,9 @@ import 'folder_send.dart';
 const int kFileTransferPort = 4042;
 const int kChunkSize = 65536; // 64 KB
 
+/// In-progress downloads use this suffix until the file is complete.
+String partialDownloadWritePath(String finalPath) => '$finalPath.part';
+
 Future<Socket> connectFileClient(String host, int port) async {
   final trimmed = host.trim();
   if (trimmed.isEmpty) {
@@ -129,7 +132,7 @@ class FileSender {
       if (encryptPayload) {
         header['encrypted'] = true;
       }
-      if (appendChecksum) {
+      if (appendChecksum && !encryptPayload) {
         header['checksum'] = true;
       }
       socket.write('${jsonEncode(header)}\n');
@@ -186,7 +189,7 @@ class FileSender {
         await raf.close();
       }
 
-      if (appendChecksum) {
+      if (appendChecksum && encKey == null) {
         final digest = await sha256.bind(file.openRead()).first;
         socket.write('\nCHECKSUM:${digest.toString()}\n');
         await socket.flush();
@@ -279,7 +282,8 @@ class FileReceiver {
     String fileId,
     String fileName,
     int fileSize,
-    String savePath,
+    String finalPath,
+    String writePath,
     int resumeOffset,
     bool encrypted,
   )? onFileStarted;
@@ -337,7 +341,8 @@ class FileReceiver {
     int fileWritten = 0;
     int resumeOffset = 0;
     String fileId = '';
-    String? savePath;
+    String? writePath;
+    String finalPath = '';
     var encrypted = false;
     var expectChecksum = false;
     SecretKey? decKey;
@@ -394,7 +399,14 @@ class FileReceiver {
         if (encBuffer.length < 4 + len) break;
         final cipher = Uint8List.fromList(encBuffer.sublist(4, 4 + len));
         encBuffer.removeRange(0, 4 + len);
-        if (decKey == null) return;
+        if (decKey == null) {
+          if (!done.isCompleted) {
+            done.completeError(
+              StateError('Encrypted transfer missing decryption key'),
+            );
+          }
+          return;
+        }
         final plain =
             await FileTransferCrypto.decryptChunk(decKey, decSeq++, cipher);
         await writePlain(plain);
@@ -549,7 +561,18 @@ class FileReceiver {
         );
       }
 
-      late final String path;
+      if (encrypted && decKey == null) {
+        try {
+          await socket.close();
+        } catch (_) {}
+        onFileError?.call(
+          fileId,
+          'Rejected: encrypted transfer missing peer identity',
+          null,
+        );
+        return;
+      }
+
       if (resumeOffset > 0) {
         final resumeLabel = fileName.replaceAll(RegExp(r'[/\\]'), '_');
         final resolved =
@@ -558,24 +581,24 @@ class FileReceiver {
           onFileError?.call(fileId, 'Cannot resume: missing partial file', null);
           return;
         }
-        path = resolved;
-        savePath = path;
-        final len = await File(path).length();
+        finalPath = resolved;
+        writePath = resolved;
+        final len = await File(writePath!).length();
         if (len != resumeOffset) {
-          await deletePartialDownloadFile(path);
+          await deletePartialDownloadFile(writePath);
           onFileError?.call(
             fileId,
             'Cannot resume: partial size mismatch ($len vs $resumeOffset)',
-            path,
+            writePath,
           );
           return;
         }
-        raf = await File(path).open(mode: FileMode.append);
+        raf = await File(writePath!).open(mode: FileMode.append);
         fileWritten = resumeOffset;
       } else {
-        path = await _resolveSavePath(fileName, folderRoot: folderRoot);
-        savePath = path;
-        raf = await File(path).open(mode: FileMode.write);
+        finalPath = await _resolveSavePath(fileName, folderRoot: folderRoot);
+        writePath = partialDownloadWritePath(finalPath);
+        raf = await File(writePath!).open(mode: FileMode.write);
         fileWritten = 0;
       }
 
@@ -585,7 +608,8 @@ class FileReceiver {
         fileId,
         fileName,
         totalBytes,
-        path,
+        finalPath,
+        writePath!,
         resumeOffset,
         encrypted,
       );
@@ -614,7 +638,7 @@ class FileReceiver {
         await _transferIdsLock.synchronized(() {
           _pausedIds.remove(fileId);
         });
-        onFilePaused?.call(fileId, path, fileWritten);
+        onFilePaused?.call(fileId, writePath!, fileWritten);
         return;
       } on _CancelledException catch (_) {
         try {
@@ -625,8 +649,8 @@ class FileReceiver {
         await _transferIdsLock.synchronized(() {
           _cancelledIds.remove(fileId);
         });
-        await deletePartialDownloadFile(path);
-        onFileError?.call(fileId, 'Transfer cancelled', path);
+        await deletePartialDownloadFile(writePath);
+        onFileError?.call(fileId, 'Transfer cancelled', writePath);
         return;
       }
 
@@ -641,7 +665,7 @@ class FileReceiver {
         ),
       );
 
-      if (expectChecksum && encBuffer.isNotEmpty) {
+      if (expectChecksum && !encrypted && encBuffer.isNotEmpty) {
         final tail = utf8.decode(encBuffer, allowMalformed: true);
         final m = RegExp(r'CHECKSUM:([a-f0-9]{64})').firstMatch(tail);
         if (m != null) {
@@ -650,25 +674,34 @@ class FileReceiver {
           digestSink.close();
           final actual = payloadDigest?.toString() ?? '';
           if (expected != actual) {
-            await deletePartialDownloadFile(path);
-            onFileError?.call(fileId, 'Checksum mismatch after transfer', path);
+            await deletePartialDownloadFile(writePath);
+            onFileError?.call(
+              fileId,
+              'Checksum mismatch after transfer',
+              writePath,
+            );
             return;
           }
         }
       }
 
       if (totalBytes == 0 ? fileWritten == 0 : fileWritten == totalBytes) {
-        onFileComplete?.call(fileId, path);
+        final completedPath =
+            await _finalizePartialDownload(writePath!, finalPath);
+        onFileComplete?.call(fileId, completedPath);
       } else {
         if (wasPaused) {
-          onFilePaused?.call(fileId, path, fileWritten);
+          onFilePaused?.call(fileId, writePath!, fileWritten);
         } else if (wasCancelled) {
-          await deletePartialDownloadFile(path);
-          onFileError?.call(fileId, 'Transfer cancelled', path);
+          await deletePartialDownloadFile(writePath);
+          onFileError?.call(fileId, 'Transfer cancelled', writePath);
         } else {
-          await deletePartialDownloadFile(path);
+          await deletePartialDownloadFile(writePath);
           onFileError?.call(
-              fileId, 'Incomplete: $fileWritten/$totalBytes bytes', path);
+            fileId,
+            'Incomplete: $fileWritten/$totalBytes bytes',
+            writePath,
+          );
         }
       }
     } catch (e) {
@@ -679,18 +712,18 @@ class FileReceiver {
       _socketsByFileId.remove(fileId);
 
       if (e is _CancelledException) {
-        await deletePartialDownloadFile(savePath);
-        onFileError?.call(fileId, e.toString(), savePath);
+        await deletePartialDownloadFile(writePath);
+        onFileError?.call(fileId, e.toString(), writePath);
         return;
       }
       if (e is TransferPausedException) {
-        if (savePath != null && savePath.isNotEmpty) {
-          onFilePaused?.call(fileId, savePath, fileWritten);
+        if (writePath != null && writePath.isNotEmpty) {
+          onFilePaused?.call(fileId, writePath, fileWritten);
         }
         return;
       }
-      await deletePartialDownloadFile(savePath);
-      onFileError?.call(fileId, humanizeFileReceiverError(e), savePath);
+      await deletePartialDownloadFile(writePath);
+      onFileError?.call(fileId, humanizeFileReceiverError(e), writePath);
     } finally {
       try {
         await sub.cancel();
@@ -705,6 +738,22 @@ class FileReceiver {
         _socketsByFileId.remove(fileId);
       }
     }
+  }
+
+  static Future<String> _finalizePartialDownload(
+    String writePath,
+    String finalPath,
+  ) async {
+    if (writePath == finalPath) return finalPath;
+    final part = File(writePath);
+    if (!await part.exists()) return finalPath;
+    final dest = File(finalPath);
+    if (await dest.exists()) {
+      await part.delete();
+    } else {
+      await part.rename(finalPath);
+    }
+    return finalPath;
   }
 
   static Future<String> _resolveSavePath(
