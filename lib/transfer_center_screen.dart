@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import 'transfer_manager.dart';
@@ -11,12 +13,26 @@ class TransferCenterScreen extends StatefulWidget {
 }
 
 class _TransferCenterScreenState extends State<TransferCenterScreen> {
+  StreamSubscription<void>? _transferSub;
+  Timer? _refreshTimer;
+
   @override
   void initState() {
     super.initState();
-    TransferManager.instance.transferUpdates.listen((_) {
-      if (mounted) setState(() {});
+    _transferSub = TransferManager.instance.transferUpdates.listen((_) {
+      if (!mounted) return;
+      _refreshTimer?.cancel();
+      _refreshTimer = Timer(const Duration(milliseconds: 250), () {
+        if (mounted) setState(() {});
+      });
     });
+  }
+
+  @override
+  void dispose() {
+    _refreshTimer?.cancel();
+    _transferSub?.cancel();
+    super.dispose();
   }
 
   @override
