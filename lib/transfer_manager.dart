@@ -679,6 +679,8 @@ class TransferManager {
       if (e is AttachmentPrepareCancelled || t2.cancelRequested) {
         t2.error = 'Cancelled';
         t2.cancelled = true;
+      } else if (e is StateError) {
+        t2.error = e.message;
       } else {
         t2.error = e.toString();
       }
@@ -706,6 +708,7 @@ class TransferManager {
         throw AttachmentPrepareException('Folder is empty');
       }
       final total = totalFolderBytes(entries);
+      _enforceMaxAttachmentSize(total);
       final label = '$folderName (${entries.length} files)';
 
       t.outgoingPhase = OutgoingTransferPhase.preparing;
@@ -806,6 +809,8 @@ class TransferManager {
       if (e is AttachmentPrepareCancelled || t2.cancelRequested) {
         t2.error = 'Cancelled';
         t2.cancelled = true;
+      } else if (e is StateError) {
+        t2.error = e.message;
       } else {
         t2.error = e.toString();
       }
