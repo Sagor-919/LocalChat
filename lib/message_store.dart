@@ -363,6 +363,14 @@ class MessageStore {
   }) async {
     if (fromPeerId == toPeerId) return;
     await _db.transaction((txn) async {
+      // PRIMARY KEY is (peer_id, id); if any source row shares an id with an
+      // existing destination row, a plain UPDATE would hit a constraint and
+      // abort the whole merge. Drop colliding source rows first, then re-point.
+      await txn.rawDelete(
+        'DELETE FROM messages WHERE peer_id = ? AND id IN '
+        '(SELECT id FROM messages WHERE peer_id = ?)',
+        [fromPeerId, toPeerId],
+      );
       await txn.update(
         'messages',
         {'peer_id': toPeerId},

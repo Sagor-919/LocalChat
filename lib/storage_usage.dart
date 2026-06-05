@@ -43,13 +43,21 @@ Future<int> directoryByteSize(String dirPath) async {
   final dir = Directory(dirPath);
   if (!await dir.exists()) return 0;
   var total = 0;
-  await for (final entity in dir.list(recursive: true, followLinks: false)) {
-    if (entity is File) {
-      try {
-        total += await entity.length();
-      } catch (_) {}
+  // handleError swallows per-entry listing errors (denied ACLs, removed
+  // drive); wrap the iteration too so a terminal stream error returns the
+  // partial total instead of escaping and hanging the caller.
+  final stream = dir.list(recursive: true, followLinks: false).handleError(
+    (_) {},
+  );
+  try {
+    await for (final entity in stream) {
+      if (entity is File) {
+        try {
+          total += await entity.length();
+        } catch (_) {}
+      }
     }
-  }
+  } catch (_) {}
   return total;
 }
 

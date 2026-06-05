@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.9.0 (2026-06-05)
+
+**Publisher:** RecklessGalaxy.com · **Developer:** Sagor Hossen
+
+### Highlights
+
+- **QA roadmap (items 1–28)**: storage transparency, transfer center, pause/resume/retry controls, file-port auth tokens, encrypted transfers, checksums, concurrent sends, incoming-offer notifications, signed discovery, settings import/export, and partial-download management.
+
+### Bug fixes (audit)
+
+- **File transfer**: resumed transfers with checksums no longer delete the completed file on a false mismatch; folder-direct receives now finalize only after all files arrive (not after the first); encrypted-chunk length prefix is bounded; AES-GCM nonce widened to 64-bit to remove any wrap.
+- **Connections**: simultaneous-connect (glare) no longer leaks a socket or tears down the healthy connection; socket teardown is identity-guarded.
+- **Discovery**: IPv6 socket and listener are closed on stop; rebind is serialized against concurrent network/resume events; display names are sanitized against the `|` delimiter.
+- **Storage**: the Storage screen can no longer hang on an unreadable folder; partial-download listing is read-only and never deletes paused transfers — cleanup is now an explicit action.
+- **UI**: Transfer Center progress no longer freezes mid-transfer; Settings "Open folder" works on macOS/Linux; cancelling the folder-as-ZIP prompt no longer leaves a phantom message.
+- **Android**: inbound shares are re-queued instead of lost when a chat unmounts mid-delivery; consumer detach is identity-checked.
+- **Data**: LAN-identity merges tolerate primary-key collisions; id-less incoming messages are rejected instead of collapsing into one row.
+
+### Notes
+
+- Alpha builds are for testing. Report issues via the contact on the Settings screen.
+
+---
+
 ## 1.8.0 (2026-04-30)
 
 **Publisher:** RecklessGalaxy.com · **Developer:** Sagor Hossen

@@ -21,7 +21,10 @@ class _TransferCenterScreenState extends State<TransferCenterScreen> {
     super.initState();
     _transferSub = TransferManager.instance.transferUpdates.listen((_) {
       if (!mounted) return;
-      _refreshTimer?.cancel();
+      // Leading-skip throttle: fire at most once per window but keep firing
+      // while events stream in. A reset-debounce would never fire mid-transfer
+      // because chunks arrive faster than the window resets.
+      if (_refreshTimer?.isActive ?? false) return;
       _refreshTimer = Timer(const Duration(milliseconds: 250), () {
         if (mounted) setState(() {});
       });

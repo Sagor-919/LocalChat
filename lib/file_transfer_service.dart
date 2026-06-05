@@ -15,6 +15,8 @@ import 'folder_send.dart';
 
 const int kFileTransferPort = 4042;
 const int kChunkSize = 65536; // 64 KB
+// Max on-wire encrypted chunk: plaintext + GCM nonce(12) + tag(16) + slack.
+const int kMaxEncChunkLen = kChunkSize + 12 + 16 + 64;
 
 /// In-progress downloads use this suffix until the file is complete.
 String partialDownloadWritePath(String finalPath) => '$finalPath.part';
@@ -405,6 +407,16 @@ class FileReceiver {
         final len = ByteData.sublistView(
           Uint8List.fromList(encBuffer.sublist(0, 4)),
         ).getUint32(0);
+        if (len > kMaxEncChunkLen) {
+          // Length prefix is attacker/corruption controlled; refuse to buffer
+          // an absurd amount of memory and abort the transfer.
+          if (!done.isCompleted) {
+            done.completeError(
+              StateError('Encrypted chunk length $len exceeds maximum'),
+            );
+          }
+          return;
+        }
         if (encBuffer.length < 4 + len) break;
         final cipher = Uint8List.fromList(encBuffer.sublist(4, 4 + len));
         encBuffer.removeRange(0, 4 + len);
@@ -604,6 +616,25 @@ class FileReceiver {
         }
         raf = await File(writePath).open(mode: FileMode.append);
         fileWritten = resumeOffset;
+        // The sender's checksum covers the WHOLE file, but payloadHasher only
+        // sees bytes written this session. Seed it with the already-on-disk
+        // partial so the final digest matches and a resumed transfer is not
+        // wrongly deleted as a checksum mismatch.
+        if (expectChecksum && !encrypted && resumeOffset > 0) {
+          final existing = await File(writePath).open(mode: FileMode.read);
+          try {
+            var remaining = resumeOffset;
+            while (remaining > 0) {
+              final take = remaining < 65536 ? remaining : 65536;
+              final chunk = await existing.read(take);
+              if (chunk.isEmpty) break;
+              payloadHasher.add(chunk);
+              remaining -= chunk.length;
+            }
+          } finally {
+            await existing.close();
+          }
+        }
       } else {
         finalPath = await _resolveSavePath(fileName, folderRoot: folderRoot);
         writePath = partialDownloadWritePath(finalPath);

@@ -43,10 +43,12 @@ class AndroidShareInbound {
   static final ValueNotifier<int> pendingRevision = ValueNotifier<int>(0);
   static final Lock _shareLock = Lock();
 
-  static void Function(List<SharedInboundFile>)? _chatConsumer;
+  // Returns true if the batch was actually consumed; false (e.g. the chat
+  // unmounted) means the caller must re-queue it so the share is not lost.
+  static bool Function(List<SharedInboundFile>)? _chatConsumer;
 
   /// While a chat is open, shared files are passed here (after post-frame).
-  static void attachChat(void Function(List<SharedInboundFile>) onFiles) {
+  static void attachChat(bool Function(List<SharedInboundFile>) onFiles) {
     unawaited(() async {
       List<SharedInboundFile>? batch;
       await _shareLock.synchronized(() async {
@@ -63,9 +65,13 @@ class AndroidShareInbound {
     }());
   }
 
-  static void detachChat() {
+  /// Only clears the consumer if it still belongs to [onFiles]; a newer chat
+  /// may have registered before this (older) chat's dispose runs.
+  static void detachChat(bool Function(List<SharedInboundFile>) onFiles) {
     unawaited(_shareLock.synchronized(() async {
-      _chatConsumer = null;
+      if (identical(_chatConsumer, onFiles)) {
+        _chatConsumer = null;
+      }
     }));
   }
 
@@ -81,12 +87,20 @@ class AndroidShareInbound {
   }
 
   static void _scheduleDeliver(
-    void Function(List<SharedInboundFile>) onFiles,
+    bool Function(List<SharedInboundFile>) onFiles,
     List<SharedInboundFile> files,
   ) {
     if (files.isEmpty) return;
     SchedulerBinding.instance.addPostFrameCallback((_) {
-      onFiles(files);
+      final delivered = onFiles(files);
+      if (!delivered) {
+        // Consumer was gone (chat unmounted between capture and this frame).
+        // Re-queue so the home banner reflects it and the next sync re-delivers.
+        unawaited(_shareLock.synchronized(() async {
+          _queued.addAll(files);
+          pendingRevision.value++;
+        }));
+      }
     });
   }
 
@@ -135,7 +149,7 @@ class AndroidShareInbound {
         }
       }
       if (files.isEmpty) return;
-      void Function(List<SharedInboundFile>)? consumer;
+      bool Function(List<SharedInboundFile>)? consumer;
       await _shareLock.synchronized(() async {
         consumer = _chatConsumer;
         if (consumer == null) {

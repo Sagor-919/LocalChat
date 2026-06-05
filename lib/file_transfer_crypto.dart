@@ -25,7 +25,11 @@ class FileTransferCrypto {
   static List<int> _nonce(int sequence) {
     final n = Uint8List(12);
     final bd = ByteData.sublistView(n);
-    bd.setUint32(8, sequence);
+    // Encode the full 64-bit sequence (high/low) so the nonce never wraps
+    // within any addressable file size — a 32-bit-only counter would reuse a
+    // (key, nonce) pair for very large streams, which is fatal for GCM.
+    bd.setUint32(4, (sequence >> 32) & 0xFFFFFFFF);
+    bd.setUint32(8, sequence & 0xFFFFFFFF);
     return n;
   }
 

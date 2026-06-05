@@ -27,6 +27,8 @@ class DiscoveryService {
   RawDatagramSocket? _socket;
   RawDatagramSocket? _socketV6;
   StreamSubscription<RawSocketEvent>? _socketSub;
+  StreamSubscription<RawSocketEvent>? _socketSubV6;
+  bool _rebinding = false;
   Timer? _broadcastTimer;
   Timer? _cleanupTimer;
   Timer? _broadcastTargetsTimer;
@@ -119,7 +121,8 @@ class DiscoveryService {
     });
     final s6 = _socketV6;
     if (s6 != null) {
-      s6.listen((event) {
+      _socketSubV6?.cancel();
+      _socketSubV6 = s6.listen((event) {
         if (event != RawSocketEvent.read) return;
         final dg = s6.receive();
         if (dg == null) return;
@@ -136,32 +139,45 @@ class DiscoveryService {
   /// Close and rebind so discovery works again without killing the process.
   Future<void> rebindUdpSocket() async {
     if (!_started) return;
-    _socketSub?.cancel();
-    _socketSub = null;
+    // Network-change and app-resume events can both fire a rebind near
+    // simultaneously; overlapping rebinds race on the same UDP port (bind
+    // fails when reuseAddress is off on Android). Serialize them.
+    if (_rebinding) return;
+    _rebinding = true;
     try {
-      _socket?.close();
-    } catch (_) {}
-    _socket = null;
-    try {
-      _socketV6?.close();
-    } catch (_) {}
-    _socketV6 = null;
-
-    if (Platform.isAndroid) {
+      _socketSub?.cancel();
+      _socketSub = null;
+      _socketSubV6?.cancel();
+      _socketSubV6 = null;
       try {
-        await _androidDiscovery.invokeMethod<void>('acquireMulticastLock');
+        _socket?.close();
       } catch (_) {}
-    }
+      _socket = null;
+      try {
+        _socketV6?.close();
+      } catch (_) {}
+      _socketV6 = null;
 
-    await _bindUdpSocket();
-    _attachDatagramListener();
-    await _refreshBroadcastTargets();
-    _joinMulticastGroups();
-    _broadcast();
-    await Future<void>.delayed(const Duration(milliseconds: 150));
-    _broadcast();
-    await Future<void>.delayed(const Duration(milliseconds: 150));
-    _broadcast();
+      if (Platform.isAndroid) {
+        try {
+          await _androidDiscovery.invokeMethod<void>('acquireMulticastLock');
+        } catch (_) {}
+      }
+
+      try {
+        await _bindUdpSocket();
+      } catch (_) {}
+      _attachDatagramListener();
+      await _refreshBroadcastTargets();
+      _joinMulticastGroups();
+      _broadcast();
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+      _broadcast();
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+      _broadcast();
+    } finally {
+      _rebinding = false;
+    }
   }
 
   /// Joins multicast on the default socket and per IPv4 interface. Safe to call
@@ -239,8 +255,11 @@ class DiscoveryService {
   void _broadcast() {
     final tag = me.lanStableTag.trim();
     final tagField = tag.isEmpty ? '-' : tag;
+    // The beacon is '|'-delimited; a name containing '|' (or newlines) would
+    // shift every later field. Strip those so parsing stays aligned.
+    final safeName = me.displayName.replaceAll(RegExp(r'[|\r\n]'), ' ');
     final msg = DiscoverySigning.appendSignature(
-      'LOCALCHAT|${me.userId}|${me.displayName}|$tcpPort|$tagField|$localClientPlatform',
+      'LOCALCHAT|${me.userId}|$safeName|$tcpPort|$tagField|$localClientPlatform',
     );
     final data = utf8.encode(msg);
     try {
@@ -370,8 +389,12 @@ class DiscoveryService {
     _cleanupTimer = null;
     _socketSub?.cancel();
     _socketSub = null;
+    _socketSubV6?.cancel();
+    _socketSubV6 = null;
     _socket?.close();
     _socket = null;
+    _socketV6?.close();
+    _socketV6 = null;
     if (Platform.isAndroid) {
       try {
         _androidDiscovery.invokeMethod<void>('releaseMulticastLock');

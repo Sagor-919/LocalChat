@@ -1237,6 +1237,10 @@ class TransferManager {
 
     if (pending.batchTotalSize != null) {
       _folderBatchRootIds.add(fileId);
+      // Record the root sub-file's OWN size; totalBytes below carries the full
+      // batch total, so without this _onReceiveComplete would credit the whole
+      // batch on the first file and finalize prematurely.
+      _receiveBatchFileSize[fileId] = fileSize;
     }
 
     final msg = ChatMessage(

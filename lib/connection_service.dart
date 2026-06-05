@@ -179,6 +179,14 @@ class ConnectionService {
         _processBuffer(buf, peerId, (resolvedId, json) {
           if (peerId == null && resolvedId != null) {
             peerId = resolvedId;
+            // Glare: a socket may already be mapped to this peer (e.g. both
+            // peers dialed each other). Evict the stale one before overwriting
+            // so it cannot leak. Its onDone is identity-guarded below, so
+            // destroying it will not remove this newer live entry.
+            final old = _sockets[resolvedId];
+            if (old != null && !identical(old, socket)) {
+              try { old.destroy(); } catch (_) {}
+            }
             _sockets[resolvedId] = socket;
             _buffers[resolvedId] = buf;
             onIncomingConnection?.call(socket, resolvedId);
@@ -189,25 +197,23 @@ class ConnectionService {
         });
       },
       onDone: () {
-        if (peerId != null) {
-          final id = peerId!;
-          final had = _sockets.remove(peerId) != null;
-          _buffers.remove(peerId);
-          if (had) {
-            _clearPingState(id);
-            _notifyDisconnected(peerId!);
-          }
+        final id = peerId;
+        // Only tear down if the map still points at THIS socket; a newer
+        // socket may have replaced it (glare/reconnect).
+        if (id != null && identical(_sockets[id], socket)) {
+          _sockets.remove(id);
+          _buffers.remove(id);
+          _clearPingState(id);
+          _notifyDisconnected(id);
         }
       },
       onError: (e, st) {
-        if (peerId != null) {
-          final id = peerId!;
-          final had = _sockets.remove(peerId) != null;
-          _buffers.remove(peerId);
-          if (had) {
-            _clearPingState(id);
-            _notifyDisconnected(peerId!);
-          }
+        final id = peerId;
+        if (id != null && identical(_sockets[id], socket)) {
+          _sockets.remove(id);
+          _buffers.remove(id);
+          _clearPingState(id);
+          _notifyDisconnected(id);
         }
       },
       cancelOnError: true,

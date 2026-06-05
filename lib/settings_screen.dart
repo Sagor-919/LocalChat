@@ -707,15 +707,21 @@ class _SettingsScreenState extends State<SettingsScreen>
   Future<void> _refreshStorageBreakdown() async {
     setState(() => _storageLoading = true);
     final dbPath = p.join(widget.store.dataDirectoryPath, 'localchat.db');
-    final breakdown = await loadStorageBreakdown(
-      downloadPath: _settings.downloadPath.value,
-      databasePath: dbPath,
-    );
-    if (mounted) {
-      setState(() {
-        _storage = breakdown;
-        _storageLoading = false;
-      });
+    StorageBreakdown? breakdown;
+    try {
+      breakdown = await loadStorageBreakdown(
+        downloadPath: _settings.downloadPath.value,
+        databasePath: dbPath,
+      );
+    } catch (_) {
+      // Best-effort; clear the spinner in finally so the UI can never hang.
+    } finally {
+      if (mounted) {
+        setState(() {
+          if (breakdown != null) _storage = breakdown;
+          _storageLoading = false;
+        });
+      }
     }
   }
 
@@ -904,8 +910,17 @@ class _SettingsScreenState extends State<SettingsScreen>
   }
 
   void _openPath(String path) {
-    if (_isDesktop) {
-      Process.run('explorer.exe', [path]);
+    // explorer.exe only exists on Windows; use `open` on macOS and OpenFilex
+    // (xdg-open / platform handler) elsewhere. Swallow failures so a missing
+    // launcher does not become an unhandled async error.
+    if (!kIsWeb && Platform.isWindows) {
+      Process.run('explorer.exe', [path]).catchError(
+        (_) => ProcessResult(0, 0, '', ''),
+      );
+    } else if (!kIsWeb && Platform.isMacOS) {
+      Process.run('open', [path]).catchError(
+        (_) => ProcessResult(0, 0, '', ''),
+      );
     } else {
       OpenFilex.open(path);
     }
@@ -958,12 +973,32 @@ class _SettingsScreenState extends State<SettingsScreen>
   Future<void> _showPartialDownloads(BuildContext context) async {
     final entries = await scanPartialDownloads(_settings.downloadPath.value);
     if (!context.mounted) return;
+    final hasExpired = entries.any(
+      (e) => e.modified.isBefore(
+        DateTime.now().subtract(const Duration(days: 7)),
+      ),
+    );
     await showDialog<void>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Partial downloads'),
         content: Text(describePartialDownloads(entries)),
         actions: [
+          if (hasExpired)
+            TextButton(
+              onPressed: () async {
+                Navigator.pop(ctx);
+                final removed = await cleanupExpiredPartialDownloads(
+                  _settings.downloadPath.value,
+                );
+                if (!context.mounted) return;
+                showAppSnackBar(
+                  context,
+                  'Removed $removed expired partial file(s)',
+                );
+              },
+              child: const Text('Clean up old'),
+            ),
           TextButton(
             onPressed: () => Navigator.pop(ctx),
             child: const Text('OK'),

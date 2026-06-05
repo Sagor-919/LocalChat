@@ -182,8 +182,13 @@ Future<void> _handleIncomingEncryptedMessage(
   if (ct == null || ct.isEmpty) return;
   final (text, _) = await ChatCrypto.decryptMessage(_me.userId, peerId, ct);
   if (text == null) return;
+  // The store dedups on (peer_id, id); an empty id would collapse every
+  // id-less message from a peer into one row (silent loss). Reject frames
+  // without a usable id rather than substituting ''.
+  final msgId = json['id'] as String?;
+  if (msgId == null || msgId.isEmpty) return;
   final msg = ChatMessage(
-    id: json['id'] as String? ?? '',
+    id: msgId,
     senderId: json['from'] as String? ?? '',
     text: text,
     timestamp:

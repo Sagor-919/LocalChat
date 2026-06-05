@@ -305,8 +305,8 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  void _consumeAndroidShare(List<SharedInboundFile> files) {
-    if (!mounted || files.isEmpty) return;
+  bool _consumeAndroidShare(List<SharedInboundFile> files) {
+    if (!mounted || files.isEmpty) return false;
     _stageFiles(
       files
           .map(
@@ -318,6 +318,7 @@ class _ChatScreenState extends State<ChatScreen> {
           )
           .toList(),
     );
+    return true;
   }
 
   /// Desktop: Enter sends (Shift+Enter keeps newline). Uses hardware handler so
@@ -531,7 +532,7 @@ class _ChatScreenState extends State<ChatScreen> {
     widget.store.messageHistoryRevision.removeListener(_onStoreRevision);
     HardwareKeyboard.instance.removeHandler(_handleComposerHardwareKey);
     if (!kIsWeb && Platform.isAndroid) {
-      AndroidShareInbound.detachChat();
+      AndroidShareInbound.detachChat(_consumeAndroidShare);
     }
     _connTimer?.cancel();
     _scroll.removeListener(_onScroll);
@@ -1122,6 +1123,17 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!widget.connections.isConnected(_peerId)) {
       await widget.connections.connectTo(live, forceNew: false);
     }
+    if (!mounted) return;
+
+    // Resolve the folder-as-ZIP choice BEFORE persisting any message, so a
+    // cancel does not leave a false "sent file" bubble that never transferred.
+    bool? forceFolderAsZip;
+    if (df.kind == StagedSourceKind.folderToZip) {
+      forceFolderAsZip = await _resolveFolderSendAsZip(live);
+      if (forceFolderAsZip == null) return;
+      if (!mounted) return;
+    }
+
     final fileId = _uuid.v4();
     final ts = _nextOutgoingTimestamp();
     final msg = ChatMessage(
@@ -1152,12 +1164,6 @@ class _ChatScreenState extends State<ChatScreen> {
     );
     if (inserted) _totalInDb++;
     if (!mounted) return;
-
-    bool? forceFolderAsZip;
-    if (df.kind == StagedSourceKind.folderToZip) {
-      forceFolderAsZip = await _resolveFolderSendAsZip(live);
-      if (forceFolderAsZip == null) return;
-    }
 
     await _tm.prepareAndSendOutbound(
       initialMessage: msg,

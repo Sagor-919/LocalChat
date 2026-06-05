@@ -1,7 +1,7 @@
 name: local_chat
 description: "Local Chat — peer-to-peer LAN messenger (Alpha). Publisher: RecklessGalaxy.com"
 publish_to: 'none'
-version: 1.8.0+8
+version: 1.9.0+9
 
 environment:
   sdk: ^3.11.4
