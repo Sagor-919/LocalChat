@@ -1,8 +1,32 @@
 import 'dart:convert';
+import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:path/path.dart' as p;
 
 import 'app_settings.dart';
+
+Future<bool> _isWritableDownloadPath(String path) async {
+  if (kIsWeb || path.isEmpty) return false;
+  try {
+    final dir = Directory(path);
+    if (!await dir.exists()) {
+      await dir.create(recursive: true);
+    }
+    final probe = File(
+      p.join(
+        path,
+        '.localchat_import_probe_${DateTime.now().microsecondsSinceEpoch}',
+      ),
+    );
+    await probe.writeAsString('ok', flush: true);
+    await probe.delete();
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
 
 /// Export / import non-secret preferences (QA item 21).
 Map<String, dynamic> exportSettingsSnapshot() {
@@ -69,6 +93,8 @@ Future<void> importSettingsJson(String jsonText) async {
   }
   final path = map['download_path'] as String?;
   if (path != null && path.isNotEmpty) {
-    await s.setDownloadPath(path);
+    if (await _isWritableDownloadPath(path)) {
+      await s.setDownloadPath(path);
+    }
   }
 }
