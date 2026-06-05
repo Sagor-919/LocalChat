@@ -1,25 +1,17 @@
 import 'dart:convert';
 
 import 'package:crypto/crypto.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
 /// HMAC for UDP discovery payloads (QA item 20).
+///
+/// Uses a protocol-wide key so every peer can verify every other peer's beacon
+/// (per-device secrets broke discovery between updated builds).
 class DiscoverySigning {
   DiscoverySigning._();
 
-  static const _kSecret = 'discovery_hmac_secret_v1';
-
-  static Future<String> ensureSecret(SharedPreferences prefs) async {
-    var s = prefs.getString(_kSecret);
-    if (s == null || s.isEmpty) {
-      s = List.generate(
-        32,
-        (i) => (DateTime.now().microsecondsSinceEpoch + i).toRadixString(16),
-      ).join();
-      await prefs.setString(_kSecret, s);
-    }
-    return s;
-  }
+  /// Shared LAN discovery integrity key (not a peer identity secret).
+  static String get protocolHmacKey =>
+      sha256.convert(utf8.encode('localchat:discovery:v1')).toString();
 
   static String signPayload(String payload, String secret) {
     final mac = Hmac(sha256, utf8.encode(secret));
@@ -38,8 +30,9 @@ class DiscoverySigning {
   }
 
   /// `LOCALCHAT|...|platform|sig`
-  static String appendSignature(String unsigned, String secret) {
-    final sig = signPayload(unsigned, secret);
+  static String appendSignature(String unsigned, [String? secret]) {
+    final key = secret ?? protocolHmacKey;
+    final sig = signPayload(unsigned, key);
     return '$unsigned|$sig';
   }
 

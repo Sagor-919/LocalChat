@@ -6,7 +6,6 @@ import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:window_manager/window_manager.dart';
@@ -19,7 +18,6 @@ import 'chat_crypto.dart';
 import 'chat_protocol_handler.dart';
 import 'chat_screen.dart';
 import 'debug_log.dart';
-import 'discovery_signing.dart';
 import 'storage_usage.dart';
 import 'connection_service.dart';
 import 'desktop_drop_queue.dart';
@@ -429,10 +427,6 @@ Future<void> _bootstrapServices() async {
   _discovery = DiscoveryService(me: _me);
   _connections = ConnectionService(me: _me);
   _discovery.hasActiveChatTcp = (id) => _connections.isConnected(id);
-  final prefs = await SharedPreferences.getInstance();
-  _discovery.setDiscoveryHmacSecret(
-    await DiscoverySigning.ensureSecret(prefs),
-  );
   await _connections.startServer();
   await _discovery.start();
 

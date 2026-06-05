@@ -26,7 +26,6 @@ class DiscoveryService {
   final Map<String, PeerDevice> _peers = {};
   RawDatagramSocket? _socket;
   RawDatagramSocket? _socketV6;
-  String? _discoveryHmacSecret;
   StreamSubscription<RawSocketEvent>? _socketSub;
   Timer? _broadcastTimer;
   Timer? _cleanupTimer;
@@ -42,10 +41,6 @@ class DiscoveryService {
   bool _started = false;
 
   DiscoveryService({required this.me});
-
-  void setDiscoveryHmacSecret(String? secret) {
-    _discoveryHmacSecret = secret;
-  }
 
   List<PeerDevice> get peers => _peers.values.toList();
 
@@ -244,12 +239,9 @@ class DiscoveryService {
   void _broadcast() {
     final tag = me.lanStableTag.trim();
     final tagField = tag.isEmpty ? '-' : tag;
-    var msg =
-        'LOCALCHAT|${me.userId}|${me.displayName}|$tcpPort|$tagField|${localClientPlatform}';
-    final secret = _discoveryHmacSecret;
-    if (secret != null && secret.isNotEmpty) {
-      msg = DiscoverySigning.appendSignature(msg, secret);
-    }
+    final msg = DiscoverySigning.appendSignature(
+      'LOCALCHAT|${me.userId}|${me.displayName}|$tcpPort|$tagField|${localClientPlatform}',
+    );
     final data = utf8.encode(msg);
     try {
       _socket?.send(data, InternetAddress('255.255.255.255'), udpPort);
@@ -273,16 +265,17 @@ class DiscoveryService {
 
   void _handleMessage(String raw, String senderIp) {
     if (!raw.startsWith('LOCALCHAT|')) return;
-    final secret = _discoveryHmacSecret;
     var payload = raw;
-    if (secret != null && secret.isNotEmpty) {
-      final split = DiscoverySigning.splitSignedLine(raw);
-      if (split.sig != null) {
-        if (!DiscoverySigning.verifyPayload(split.payload, split.sig!, secret)) {
-          return;
-        }
-        payload = split.payload;
+    final split = DiscoverySigning.splitSignedLine(raw);
+    if (split.sig != null) {
+      if (!DiscoverySigning.verifyPayload(
+        split.payload,
+        split.sig!,
+        DiscoverySigning.protocolHmacKey,
+      )) {
+        return;
       }
+      payload = split.payload;
     }
     final parts = payload.split('|');
     if (parts.length < 4) return;
