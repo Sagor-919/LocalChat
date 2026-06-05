@@ -124,9 +124,11 @@ class ChatProtocolHandler {
     }
 
     if (type == 'file_notify') {
+      final id = json['id'] as String?;
+      if (id == null || id.isEmpty) return;
       TransferManager.instance.registerIncoming(
         peerId,
-        json['id'] as String? ?? '',
+        id,
         json['name'] as String? ?? '',
         (json['size'] as num?)?.toInt() ?? 0,
         folderRoot: json['folderRoot'] as String?,
