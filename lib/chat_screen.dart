@@ -9,7 +9,6 @@ import 'package:flutter/cupertino.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/rendering.dart' show ScrollCacheExtent;
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:open_filex/open_filex.dart';
@@ -1642,7 +1641,7 @@ class _ChatScreenState extends State<ChatScreen> {
                       )
                     : ListView.builder(
                         controller: _scroll,
-                        scrollCacheExtent: const ScrollCacheExtent.pixels(400),
+                        cacheExtent: 400,
                         padding: const EdgeInsets.symmetric(
                           horizontal: 14,
                           vertical: 8,
