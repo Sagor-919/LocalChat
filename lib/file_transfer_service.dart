@@ -19,6 +19,15 @@ const int kChunkSize = 65536; // 64 KB
 /// In-progress downloads use this suffix until the file is complete.
 String partialDownloadWritePath(String finalPath) => '$finalPath.part';
 
+/// Maps a `.part` write path back to the intended final file path.
+String finalPathFromPartialWritePath(String writePath) {
+  const suffix = '.part';
+  if (writePath.endsWith(suffix)) {
+    return writePath.substring(0, writePath.length - suffix.length);
+  }
+  return writePath;
+}
+
 Future<Socket> connectFileClient(String host, int port) async {
   final trimmed = host.trim();
   if (trimmed.isEmpty) {
@@ -341,8 +350,8 @@ class FileReceiver {
     int fileWritten = 0;
     int resumeOffset = 0;
     String fileId = '';
-    String? writePath;
-    String finalPath = '';
+    var writePath = '';
+    var finalPath = '';
     var encrypted = false;
     var expectChecksum = false;
     SecretKey? decKey;
@@ -380,7 +389,7 @@ class FileReceiver {
           final take = min(plain.length - offset, totalBytes - fileWritten);
           final slice = plain.sublist(offset, offset + take);
           payloadHasher.add(slice);
-          await raf!.writeFrom(slice);
+          await raf.writeFrom(slice);
           fileWritten += take;
           offset += take;
           onProgress?.call(fileId, fileWritten, totalBytes);
@@ -445,7 +454,7 @@ class FileReceiver {
           final take = min(data.length - offset, totalBytes - fileWritten);
           final slice = data.sublist(offset, offset + take);
           payloadHasher.add(slice);
-          await raf!.writeFrom(slice);
+          await raf.writeFrom(slice);
           fileWritten += take;
           offset += take;
           onProgress?.call(fileId, fileWritten, totalBytes);
@@ -581,9 +590,9 @@ class FileReceiver {
           onFileError?.call(fileId, 'Cannot resume: missing partial file', null);
           return;
         }
-        finalPath = resolved;
         writePath = resolved;
-        final len = await File(writePath!).length();
+        finalPath = finalPathFromPartialWritePath(writePath);
+        final len = await File(writePath).length();
         if (len != resumeOffset) {
           await deletePartialDownloadFile(writePath);
           onFileError?.call(
@@ -593,12 +602,12 @@ class FileReceiver {
           );
           return;
         }
-        raf = await File(writePath!).open(mode: FileMode.append);
+        raf = await File(writePath).open(mode: FileMode.append);
         fileWritten = resumeOffset;
       } else {
         finalPath = await _resolveSavePath(fileName, folderRoot: folderRoot);
         writePath = partialDownloadWritePath(finalPath);
-        raf = await File(writePath!).open(mode: FileMode.write);
+        raf = await File(writePath).open(mode: FileMode.write);
         fileWritten = 0;
       }
 
@@ -609,7 +618,7 @@ class FileReceiver {
         fileName,
         totalBytes,
         finalPath,
-        writePath!,
+        writePath,
         resumeOffset,
         encrypted,
       );
@@ -638,7 +647,7 @@ class FileReceiver {
         await _transferIdsLock.synchronized(() {
           _pausedIds.remove(fileId);
         });
-        onFilePaused?.call(fileId, writePath!, fileWritten);
+        onFilePaused?.call(fileId, writePath, fileWritten);
         return;
       } on _CancelledException catch (_) {
         try {
@@ -687,11 +696,11 @@ class FileReceiver {
 
       if (totalBytes == 0 ? fileWritten == 0 : fileWritten == totalBytes) {
         final completedPath =
-            await _finalizePartialDownload(writePath!, finalPath);
+            await _finalizePartialDownload(writePath, finalPath);
         onFileComplete?.call(fileId, completedPath);
       } else {
         if (wasPaused) {
-          onFilePaused?.call(fileId, writePath!, fileWritten);
+          onFilePaused?.call(fileId, writePath, fileWritten);
         } else if (wasCancelled) {
           await deletePartialDownloadFile(writePath);
           onFileError?.call(fileId, 'Transfer cancelled', writePath);
@@ -717,7 +726,7 @@ class FileReceiver {
         return;
       }
       if (e is TransferPausedException) {
-        if (writePath != null && writePath.isNotEmpty) {
+        if (writePath.isNotEmpty) {
           onFilePaused?.call(fileId, writePath, fileWritten);
         }
         return;
@@ -740,6 +749,20 @@ class FileReceiver {
     }
   }
 
+  static Future<String> _uniqueSiblingPath(String candidatePath) async {
+    if (!await File(candidatePath).exists()) return candidatePath;
+    final leaf = p.basename(candidatePath);
+    final parent = p.dirname(candidatePath);
+    final dot = leaf.lastIndexOf('.');
+    final baseName = dot > 0 ? leaf.substring(0, dot) : leaf;
+    final ext = dot > 0 ? leaf.substring(dot) : '';
+    for (var i = 1; i < 100; i++) {
+      final path = p.join(parent, '$baseName ($i)$ext');
+      if (!await File(path).exists()) return path;
+    }
+    return p.join(parent, '${DateTime.now().millisecondsSinceEpoch}_$leaf');
+  }
+
   static Future<String> _finalizePartialDownload(
     String writePath,
     String finalPath,
@@ -747,13 +770,12 @@ class FileReceiver {
     if (writePath == finalPath) return finalPath;
     final part = File(writePath);
     if (!await part.exists()) return finalPath;
-    final dest = File(finalPath);
-    if (await dest.exists()) {
-      await part.delete();
-    } else {
-      await part.rename(finalPath);
+    var destPath = finalPath;
+    if (await File(destPath).exists()) {
+      destPath = await _uniqueSiblingPath(destPath);
     }
-    return finalPath;
+    await part.rename(destPath);
+    return destPath;
   }
 
   static Future<String> _resolveSavePath(
