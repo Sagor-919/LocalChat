@@ -720,11 +720,9 @@ class MessageStore {
   }
 
   Future<void> clearAll() async {
-    final peers = await loadAllPeerInfos();
-    for (final peerId in peers.keys) {
-      final messages = await load(peerId);
-      await _deleteAttachmentsForMessages(messages);
-    }
+    final rows = await _db.query('messages');
+    final messages = rows.map(_rowToMessage).toList();
+    await _deleteAttachmentsForMessages(messages);
     await _db.delete('messages');
     await _db.delete('peers');
     _notifyHistoryCleared(all: true);
