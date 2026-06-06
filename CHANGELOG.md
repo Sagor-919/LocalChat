@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.8.2 (2026-06-06)
+
+### Discovery (LAN) — robust multi-homed adapter handling + active discovery
+
+- **NetworkAdapterService**: new module that enumerates and classifies every IPv4
+  adapter as usable / virtual / loopback / link-local / non-private. Hyper‑V
+  "Default Switch", WSL, Docker, VPN, VMware, VirtualBox host-only, Tailscale, and
+  ZeroTier are excluded **by name** even when their IP looks private (e.g. the
+  Hyper‑V Default Switch on `172.x`), so discovery only advertises on the real LAN.
+- **Subnet broadcast & multicast** now flow only through selected real LAN adapters.
+- **Manual adapter override**: Settings → Network lists each adapter with its IP and
+  used/ignored reason, and lets you pick a preferred adapter when auto-detection
+  chooses the wrong NIC. Changing it rebinds discovery immediately.
+- **Active unicast sweep**: when no peers are found ~5s after launch, Local Chat
+  walks every host on each real subnet with throttled directed beacons (~20/s) —
+  needed when a router blocks wired→Wi‑Fi broadcast (AP isolation).
+- **Startup unicast to known peers**: stored peer IPs are beaconed on launch so an
+  online-but-broadcast-unreachable peer appears without first sending a message.
+- **Add by IP**: empty-state offers a manual connect when auto-discovery is exhausted.
+- **Phased empty state**: searching → scanning your network → "Add by IP" + tips.
+
+---
+
 ## 1.8.1 (2026-06-06)
 
 ### Discovery (LAN)

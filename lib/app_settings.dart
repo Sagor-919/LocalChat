@@ -24,6 +24,10 @@ class AppSettings {
   /// Desktop: when true, closing the window hides to tray and keeps LAN active; when false, exit the app.
   final desktopRunInBackground = ValueNotifier<bool>(true);
 
+  /// Manual LAN adapter override by interface name. Empty = automatic adapter
+  /// selection. Used when auto-detection picks the wrong NIC on a multi-homed PC.
+  final preferredAdapterName = ValueNotifier<String>('');
+
   Future<void> init() async {
     _prefs = await SharedPreferences.getInstance();
 
@@ -35,6 +39,8 @@ class AppSettings {
     };
 
     notificationsMuted.value = _prefs.getBool('notifications_muted') ?? false;
+
+    preferredAdapterName.value = _prefs.getString('preferred_adapter_name') ?? '';
 
     if (!kIsWeb && (Platform.isWindows || Platform.isLinux || Platform.isMacOS)) {
       desktopRunInBackground.value =
@@ -84,6 +90,12 @@ class AppSettings {
     }
     desktopRunInBackground.value = enabled;
     await _prefs.setBool('desktop_run_in_background', enabled);
+  }
+
+  Future<void> setPreferredAdapterName(String name) async {
+    final v = name.trim();
+    preferredAdapterName.value = v;
+    await _prefs.setString('preferred_adapter_name', v);
   }
 
   Future<void> setDownloadPath(String path) async {

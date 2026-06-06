@@ -9,6 +9,7 @@ import 'package:flutter/material.dart';
 import 'android_app_control.dart';
 import 'android_share_inbound.dart';
 import 'app_branding.dart';
+import 'app_snackbar.dart';
 import 'chat_screen.dart';
 import 'connection_service.dart';
 import 'desktop_drop_queue.dart';
@@ -540,38 +541,91 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _buildChatsBody(BuildContext context, ColorScheme cs) {
-    if (_peerList.isEmpty) {
-      return Center(
+  Widget _buildEmptyState(
+    BuildContext context,
+    ColorScheme cs,
+    DiscoverySearchPhase phase,
+  ) {
+    final exhausted = phase == DiscoverySearchPhase.exhausted;
+    final scanning = phase == DiscoverySearchPhase.scanning;
+    final title = switch (phase) {
+      DiscoverySearchPhase.searching => 'Searching for devices\u2026',
+      DiscoverySearchPhase.scanning => 'Scanning your network directly\u2026',
+      DiscoverySearchPhase.exhausted => 'No devices found nearby',
+    };
+
+    return Center(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.symmetric(vertical: 24),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(Icons.wifi_find,
-                size: 56, color: cs.outline.withValues(alpha: 0.4)),
+            Icon(
+              exhausted ? Icons.wifi_tethering_off : Icons.wifi_find,
+              size: 56,
+              color: cs.outline.withValues(alpha: 0.4),
+            ),
             const SizedBox(height: 12),
             Text(
-              'Searching for devices\u2026',
+              title,
+              textAlign: TextAlign.center,
               style: TextStyle(
                 color: cs.outline,
                 fontSize: 15,
                 fontWeight: FontWeight.w500,
               ),
             ),
-            const SizedBox(height: 10),
-            SizedBox(
-              width: 100,
-              child: LinearProgressIndicator(
-                borderRadius: BorderRadius.circular(99),
+            if (!exhausted) ...[
+              const SizedBox(height: 10),
+              SizedBox(
+                width: 100,
+                child: LinearProgressIndicator(
+                  borderRadius: BorderRadius.circular(99),
+                ),
               ),
-            ),
+            ],
+            if (scanning) ...[
+              const SizedBox(height: 8),
+              Text(
+                'Checking every device on your subnet\u2026',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: cs.outline.withValues(alpha: 0.8),
+                  fontSize: 12.5,
+                ),
+              ),
+            ],
+            if (exhausted) ...[
+              const SizedBox(height: 16),
+              FilledButton.icon(
+                onPressed: _addByIp,
+                icon: const Icon(Icons.add_link, size: 18),
+                label: const Text('Add by IP'),
+              ),
+            ],
             if (widget.discovery.showsMixedNetworkHint) ...[
               const SizedBox(height: 16),
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 28),
                 child: Text(
                   'PC on Ethernet and phone on Wi\u2011Fi? Discovery may be '
-                  'one\u2011way. Use the same Wi\u2011Fi on both, or open a chat '
-                  'from history after a file or message.',
+                  'one\u2011way through your router. Use the same Wi\u2011Fi on '
+                  'both, or use "Add by IP" with the other device\u2019s address.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: cs.outline.withValues(alpha: 0.85),
+                    fontSize: 13,
+                    height: 1.35,
+                  ),
+                ),
+              ),
+            ] else if (exhausted) ...[
+              const SizedBox(height: 12),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 28),
+                child: Text(
+                  'Make sure both devices are on the same Wi\u2011Fi/LAN and '
+                  'Local Chat is open on the other device.',
                   textAlign: TextAlign.center,
                   style: TextStyle(
                     color: cs.outline.withValues(alpha: 0.85),
@@ -583,6 +637,106 @@ class _HomeScreenState extends State<HomeScreen> {
             ],
           ],
         ),
+      ),
+    );
+  }
+
+  Future<void> _addByIp() async {
+    final controller = TextEditingController();
+    final ip = await showDialog<String>(
+      context: context,
+      builder: (ctx) {
+        String? error;
+        return StatefulBuilder(builder: (ctx, setDialogState) {
+          return AlertDialog(
+            shape:
+                RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+            title: const Text('Add by IP'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text(
+                  'Enter the other device\u2019s LAN IP address (shown on its '
+                  'Local Chat settings or Wi\u2011Fi details).',
+                  style: TextStyle(fontSize: 13.5, height: 1.35),
+                ),
+                const SizedBox(height: 14),
+                TextField(
+                  controller: controller,
+                  autofocus: true,
+                  keyboardType: const TextInputType.numberWithOptions(
+                      decimal: true),
+                  decoration: InputDecoration(
+                    labelText: 'IP address',
+                    hintText: '192.168.0.155',
+                    errorText: error,
+                    prefixIcon: const Icon(Icons.lan_outlined),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                  onSubmitted: (_) {
+                    final v = controller.text.trim();
+                    if (_isValidIpv4(v)) {
+                      Navigator.pop(ctx, v);
+                    } else {
+                      setDialogState(() => error = 'Enter a valid IPv4 address');
+                    }
+                  },
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () {
+                  final v = controller.text.trim();
+                  if (_isValidIpv4(v)) {
+                    Navigator.pop(ctx, v);
+                  } else {
+                    setDialogState(() => error = 'Enter a valid IPv4 address');
+                  }
+                },
+                child: const Text('Connect'),
+              ),
+            ],
+          );
+        });
+      },
+    );
+
+    if (ip == null || !mounted) return;
+    // Fire a few directed beacons; the peer learns our IP from the packet
+    // source and starts beaconing back, so it appears even when broadcast is
+    // blocked across Ethernet/Wi‑Fi.
+    widget.discovery.unicastBeaconTo(ip);
+    for (final ms in const [300, 800, 1500]) {
+      Future<void>.delayed(Duration(milliseconds: ms), () {
+        widget.discovery.unicastBeaconTo(ip);
+      });
+    }
+    showAppSnackBar(context, 'Looking for a device at $ip\u2026');
+  }
+
+  static bool _isValidIpv4(String s) {
+    final parts = s.split('.');
+    if (parts.length != 4) return false;
+    for (final p in parts) {
+      if (p.isEmpty || p.length > 3) return false;
+      final n = int.tryParse(p);
+      if (n == null || n < 0 || n > 255) return false;
+    }
+    return true;
+  }
+
+  Widget _buildChatsBody(BuildContext context, ColorScheme cs) {
+    if (_peerList.isEmpty) {
+      return ValueListenableBuilder<DiscoverySearchPhase>(
+        valueListenable: widget.discovery.searchPhase,
+        builder: (context, phase, _) => _buildEmptyState(context, cs, phase),
       );
     }
 
@@ -783,7 +937,10 @@ class _HomeScreenState extends State<HomeScreen> {
                 onPressed: () {
                   Navigator.of(context).push(
                     MaterialPageRoute(
-                      builder: (_) => SettingsScreen(store: widget.store),
+                      builder: (_) => SettingsScreen(
+                        store: widget.store,
+                        discovery: widget.discovery,
+                      ),
                     ),
                   );
                 },

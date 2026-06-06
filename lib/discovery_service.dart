@@ -6,13 +6,28 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 
+import 'app_settings.dart';
 import 'device.dart';
+import 'network_adapter_service.dart';
+
+/// Empty-state search progression for the home screen:
+/// passive listen → active subnet sweep → exhausted (offer "Add by IP").
+enum DiscoverySearchPhase { searching, scanning, exhausted }
 
 class DiscoveryService {
   static const int udpPort = 4040;
   static const int tcpPort = 4041;
   static const Duration broadcastInterval = Duration(seconds: 2);
   static const Duration staleTimeout = Duration(seconds: 6);
+
+  /// Delay after start with no peers before the active unicast sweep begins.
+  static const Duration sweepDelay = Duration(seconds: 5);
+
+  /// Sweep throttle: at most [_sweepHostsPerTick] datagrams every [_sweepTick]
+  /// (~20 IPs/sec) so a /24 finishes in ~13s without flooding the NIC.
+  static const Duration _sweepTick = Duration(milliseconds: 250);
+  static const int _sweepHostsPerTick = 5;
+
   /// Link-local admin multicast; works on many networks when 255.255.255.255 is filtered.
   static const String _multicastGroup = '239.255.76.76';
 
@@ -20,16 +35,26 @@ class DiscoveryService {
       MethodChannel('local_chat/discovery');
 
   final DeviceInfo me;
+  final NetworkAdapterService _adapters = const NetworkAdapterService();
   final Map<String, PeerDevice> _peers = {};
   RawDatagramSocket? _socket;
   StreamSubscription<RawSocketEvent>? _socketSub;
   Timer? _broadcastTimer;
   Timer? _cleanupTimer;
   Timer? _broadcastTargetsTimer;
+  Timer? _sweepDelayTimer;
+  Timer? _sweepTimer;
   List<InternetAddress> _cachedBroadcastTargets = [];
+  List<LanAdapter> _activeAdapters = [];
+  List<InternetAddress> _sweepQueue = [];
+  int _sweepIndex = 0;
   bool _hasVirtualLanInterface = false;
   bool _hasPhysicalLanInterface = false;
   void Function()? onPeersChanged;
+
+  /// Empty-state phase for the home screen. UI listens to drive its messaging.
+  final ValueNotifier<DiscoverySearchPhase> searchPhase =
+      ValueNotifier<DiscoverySearchPhase>(DiscoverySearchPhase.searching);
 
   /// When non-null, peers for which this returns true are **not** pruned for
   /// UDP silence — avoids dropping from the list while chat TCP is still up.
@@ -50,33 +75,15 @@ class DiscoveryService {
   bool get showsMixedNetworkHint =>
       _hasVirtualLanInterface && _hasPhysicalLanInterface;
 
-  /// True when interface name looks like a host-only virtual switch (Hyper‑V,
-  /// WSL, Docker, VPN, etc.) — not the LAN where phones live.
+  /// Back-compat shim — see [NetworkAdapterService.isVirtualInterfaceName].
   @visibleForTesting
-  static bool isVirtualLanInterfaceName(String name) {
-    final n = name.toLowerCase();
-    return n.contains('vethernet') ||
-        n.contains('hyper-v') ||
-        n.contains('wsl') ||
-        n.contains('docker') ||
-        n.contains('virtualbox') ||
-        n.contains('vmware') ||
-        n.contains('vpn') ||
-        n.contains('tap') ||
-        n.contains('tun') ||
-        n.contains('loopback');
-  }
+  static bool isVirtualLanInterfaceName(String name) =>
+      NetworkAdapterService.isVirtualInterfaceName(name);
 
-  /// IPv4 suitable for LAN discovery beacons (not loopback / link-local).
+  /// Back-compat shim — see [NetworkAdapterService.isLanRoutableIpv4].
   @visibleForTesting
-  static bool isLanRoutableIpv4(InternetAddress addr) {
-    if (addr.type != InternetAddressType.IPv4 || addr.isLoopback) return false;
-    final r = addr.rawAddress;
-    if (r.length != 4) return false;
-    // APIPA
-    if (r[0] == 169 && r[1] == 254) return false;
-    return true;
-  }
+  static bool isLanRoutableIpv4(InternetAddress addr) =>
+      NetworkAdapterService.isLanRoutableIpv4(addr);
 
   Future<void> start() async {
     if (Platform.isAndroid) {
@@ -110,6 +117,7 @@ class DiscoveryService {
         const Duration(seconds: 2), (_) => _removeStale());
     _broadcast();
     _started = true;
+    _scheduleSweep();
   }
 
   Future<void> _bindUdpSocket() async {
@@ -162,6 +170,25 @@ class DiscoveryService {
     );
   }
 
+  /// Send a directed discovery beacon to a single host. Used by the active
+  /// sweep, startup unicast to stored peers, and the manual "Add by IP" flow.
+  void unicastBeaconTo(String ip) {
+    final addr = InternetAddress.tryParse(ip.trim());
+    if (addr == null || !NetworkAdapterService.isLanRoutableIpv4(addr)) return;
+    try {
+      _socket?.send(_beaconBytes(), addr, udpPort);
+    } catch (_) {}
+  }
+
+  /// Fire directed beacons at known peer IPs from history so a peer that is
+  /// online but unreachable by broadcast (router AP isolation) appears fast
+  /// without first exchanging a TCP message.
+  void pingStoredPeers(Iterable<String> ips) {
+    for (final ip in ips) {
+      unicastBeaconTo(ip);
+    }
+  }
+
   /// After Wi‑Fi/VPN changes, the old [RawDatagramSocket] may stop receiving
   /// multicast/broadcast until the process restarts — same as “restart app fixes it”.
   /// Close and rebind so discovery works again without killing the process.
@@ -189,9 +216,12 @@ class DiscoveryService {
     _broadcast();
     await Future<void>.delayed(const Duration(milliseconds: 150));
     _broadcast();
+    if (_peers.isEmpty) _scheduleSweep();
   }
 
-  /// Joins multicast on the default socket and per physical IPv4 interface.
+  /// Joins multicast on the default socket and per active LAN interface, so the
+  /// receive path is bound to the real LAN NIC (not a Hyper‑V/WSL switch) and
+  /// honors any manual adapter override.
   void _joinMulticastGroups() {
     final s = _socket;
     if (s == null) return;
@@ -200,19 +230,37 @@ class DiscoveryService {
       s.joinMulticast(group);
     } catch (_) {}
     if (kIsWeb) return;
-    try {
-      NetworkInterface.list(includeLinkLocal: false).then((ifaces) {
+    final pref = AppSettings.instance.preferredAdapterName.value.trim();
+    unawaited(() async {
+      try {
+        final ifaces = await NetworkInterface.list(
+          includeLinkLocal: false,
+          type: InternetAddressType.IPv4,
+        );
         for (final iface in ifaces) {
-          if (isVirtualLanInterfaceName(iface.name)) continue;
-          for (final addr in iface.addresses) {
-            if (!isLanRoutableIpv4(addr)) continue;
-            try {
-              s.joinMulticast(group, iface);
-            } catch (_) {}
-          }
+          if (!_interfaceSelected(iface, pref)) continue;
+          try {
+            s.joinMulticast(group, iface);
+          } catch (_) {}
         }
-      });
-    } catch (_) {}
+      } catch (_) {}
+    }());
+  }
+
+  /// Mirrors [NetworkAdapterService.selectActive] for a live [NetworkInterface]:
+  /// a manual override wins by name; otherwise the interface must carry a usable
+  /// LAN address.
+  bool _interfaceSelected(NetworkInterface iface, String pref) {
+    if (pref.isNotEmpty) {
+      return iface.name.toLowerCase() == pref.toLowerCase();
+    }
+    for (final addr in iface.addresses) {
+      if (NetworkAdapterService.classify(iface.name, addr) ==
+          LanAdapterStatus.usable) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /// App resumed — refresh targets and rebind UDP so receive path works again.
@@ -220,13 +268,12 @@ class DiscoveryService {
     await rebindUdpSocket();
   }
 
-  /// Subnet broadcast(s) for Wi‑Fi/LAN; skips Hyper‑V/WSL virtual NICs.
+  /// Subnet broadcast(s) for Wi‑Fi/LAN; skips Hyper‑V/WSL virtual NICs and
+  /// honors any manual adapter override.
   Future<void> _refreshBroadcastTargets() async {
     if (kIsWeb) return;
     final seen = <String>{};
     final out = <InternetAddress>[];
-    var sawVirtual = false;
-    var sawPhysical = false;
 
     void addAddr(String host) {
       if (seen.contains(host)) return;
@@ -243,39 +290,33 @@ class DiscoveryService {
       } catch (_) {}
     }
 
-    try {
-      for (final iface in await NetworkInterface.list(includeLinkLocal: false)) {
-        final virtual = isVirtualLanInterfaceName(iface.name);
-        if (virtual) {
-          sawVirtual = true;
-          continue;
-        }
-        for (final addr in iface.addresses) {
-          if (!isLanRoutableIpv4(addr)) continue;
-          sawPhysical = true;
-          final b24 = _ipv4Broadcast24(addr);
-          if (b24 != null) addAddr(b24);
-        }
-      }
-    } catch (_) {}
+    final all = await _adapters.enumerate();
+    _hasVirtualLanInterface =
+        all.any((a) => a.status == LanAdapterStatus.virtual);
+    _hasPhysicalLanInterface = all.any((a) => a.isUsable);
+
+    final pref = AppSettings.instance.preferredAdapterName.value;
+    final active =
+        NetworkAdapterService.selectActive(all, preferredAdapterName: pref);
+    _activeAdapters = active;
+    for (final a in active) {
+      final b24 = a.broadcast;
+      if (b24 != null) addAddr(b24);
+    }
 
     _cachedBroadcastTargets = out;
-    _hasVirtualLanInterface = sawVirtual;
-    _hasPhysicalLanInterface = sawPhysical;
   }
 
-  static String? _ipv4Broadcast24(InternetAddress addr) {
-    if (!isLanRoutableIpv4(addr)) return null;
-    final r = addr.rawAddress;
-    return '${r[0]}.${r[1]}.${r[2]}.255';
-  }
-
-  void _broadcast() {
+  List<int> _beaconBytes() {
     final tag = me.lanStableTag.trim();
     final msg = tag.isEmpty
         ? 'LOCALCHAT|${me.userId}|${me.displayName}|$tcpPort'
         : 'LOCALCHAT|${me.userId}|${me.displayName}|$tcpPort|$tag';
-    final data = utf8.encode(msg);
+    return utf8.encode(msg);
+  }
+
+  void _broadcast() {
+    final data = _beaconBytes();
     try {
       _socket?.send(data, InternetAddress('255.255.255.255'), udpPort);
     } catch (_) {}
@@ -293,12 +334,97 @@ class DiscoveryService {
       final ip = peer.ip.trim();
       if (ip.isEmpty || unicastIps.contains(ip)) continue;
       final addr = InternetAddress.tryParse(ip);
-      if (addr == null || !isLanRoutableIpv4(addr)) continue;
+      if (addr == null || !NetworkAdapterService.isLanRoutableIpv4(addr)) {
+        continue;
+      }
       unicastIps.add(ip);
       try {
         _socket?.send(data, addr, udpPort);
       } catch (_) {}
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Active unicast sweep (Layer 2)
+  // ---------------------------------------------------------------------------
+
+  /// Arm the delayed sweep. If peers are still empty after [sweepDelay], walk
+  /// every host on each active /24 with directed beacons — needed when the
+  /// router blocks wired→Wi‑Fi broadcast and broadcast alone never works.
+  void _scheduleSweep() {
+    if (kIsWeb) return;
+    _sweepDelayTimer?.cancel();
+    _searchPhase(DiscoverySearchPhase.searching);
+    _sweepDelayTimer = Timer(sweepDelay, () {
+      if (_peers.isNotEmpty) return;
+      _startSweep();
+    });
+  }
+
+  void _startSweep() {
+    _sweepTimer?.cancel();
+    _sweepQueue = _buildSweepHosts();
+    _sweepIndex = 0;
+    if (_sweepQueue.isEmpty) {
+      _searchPhase(DiscoverySearchPhase.exhausted);
+      return;
+    }
+    _searchPhase(DiscoverySearchPhase.scanning);
+    _sweepTimer = Timer.periodic(_sweepTick, (_) => _sweepTickFire());
+  }
+
+  void _sweepTickFire() {
+    if (_peers.isNotEmpty) {
+      _stopSweep();
+      return;
+    }
+    var sent = 0;
+    while (sent < _sweepHostsPerTick && _sweepIndex < _sweepQueue.length) {
+      final addr = _sweepQueue[_sweepIndex++];
+      try {
+        _socket?.send(_beaconBytes(), addr, udpPort);
+      } catch (_) {}
+      sent++;
+    }
+    if (_sweepIndex >= _sweepQueue.length) {
+      _sweepTimer?.cancel();
+      _sweepTimer = null;
+      if (_peers.isEmpty) {
+        _searchPhase(DiscoverySearchPhase.exhausted);
+      }
+    }
+  }
+
+  void _stopSweep() {
+    _sweepTimer?.cancel();
+    _sweepTimer = null;
+    _sweepQueue = const [];
+    _sweepIndex = 0;
+  }
+
+  /// Every host address on each active adapter's /24, excluding our own IP,
+  /// the network (.0), and broadcast (.255). Deduplicated across adapters.
+  List<InternetAddress> _buildSweepHosts() {
+    final seen = <String>{};
+    final hosts = <InternetAddress>[];
+    for (final a in _activeAdapters) {
+      final r = a.ip.rawAddress;
+      if (r.length != 4) continue;
+      final own = r[3];
+      for (var h = 1; h <= 254; h++) {
+        if (h == own) continue;
+        final s = '${r[0]}.${r[1]}.${r[2]}.$h';
+        if (seen.contains(s)) continue;
+        seen.add(s);
+        final addr = InternetAddress.tryParse(s);
+        if (addr != null) hosts.add(addr);
+      }
+    }
+    return hosts;
+  }
+
+  void _searchPhase(DiscoverySearchPhase phase) {
+    if (searchPhase.value != phase) searchPhase.value = phase;
   }
 
   void _handleMessage(String raw, String senderIp) {
@@ -336,6 +462,7 @@ class DiscoveryService {
     final existing = _peers[userId];
     final effectiveTag = lanStableTag ?? existing?.lanStableTag;
     final now = DateTime.now();
+    final wasEmpty = _peers.isEmpty;
 
     if (existing != null) {
       final same = existing.name == name &&
@@ -365,6 +492,11 @@ class DiscoveryService {
       lastSeen: now,
       lanStableTag: effectiveTag,
     );
+    if (wasEmpty) {
+      _stopSweep();
+      _sweepDelayTimer?.cancel();
+      _searchPhase(DiscoverySearchPhase.searching);
+    }
     onPeersChanged?.call();
   }
 
@@ -376,6 +508,7 @@ class DiscoveryService {
       return now.difference(p.lastSeen) > staleTimeout;
     });
     if (_peers.length != before) {
+      if (_peers.isEmpty) _scheduleSweep();
       onPeersChanged?.call();
     }
   }
@@ -388,6 +521,9 @@ class DiscoveryService {
     _broadcastTimer = null;
     _cleanupTimer?.cancel();
     _cleanupTimer = null;
+    _sweepDelayTimer?.cancel();
+    _sweepDelayTimer = null;
+    _stopSweep();
     _socketSub?.cancel();
     _socketSub = null;
     _socket?.close();
