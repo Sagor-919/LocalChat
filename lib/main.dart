@@ -442,6 +442,21 @@ Future<void> _bootstrapServices() async {
   await _connections.startServer();
   await _discovery.start();
 
+  // Startup: directly beacon stored peer IPs so a peer that is online but
+  // unreachable by broadcast (router AP isolation) shows up fast, without
+  // first exchanging a TCP message.
+  unawaited(() async {
+    try {
+      final infos = await _store.loadAllPeerInfos();
+      final ips = <String>[
+        for (final info in infos.values)
+          if (((info['ip'] as String?) ?? '').trim().isNotEmpty)
+            (info['ip'] as String).trim(),
+      ];
+      if (ips.isNotEmpty) _discovery.pingStoredPeers(ips);
+    } catch (_) {}
+  }());
+
   _connections.onIncomingConnection = (socket, peerId) {
     final addr = socket.remoteAddress;
     if (addr.type != InternetAddressType.IPv4) return;
@@ -741,7 +756,7 @@ class _LocalChatAppState extends State<LocalChatApp>
     if (ctx == null) return;
     Navigator.of(ctx).push(
       MaterialPageRoute<void>(
-        builder: (_) => SettingsScreen(store: _store),
+        builder: (_) => SettingsScreen(store: _store, discovery: _discovery),
       ),
     );
     unawaited(() async {
