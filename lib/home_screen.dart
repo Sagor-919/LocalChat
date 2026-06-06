@@ -564,6 +564,23 @@ class _HomeScreenState extends State<HomeScreen> {
                 borderRadius: BorderRadius.circular(99),
               ),
             ),
+            if (widget.discovery.showsMixedNetworkHint) ...[
+              const SizedBox(height: 16),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 28),
+                child: Text(
+                  'PC on Ethernet and phone on Wi\u2011Fi? Discovery may be '
+                  'one\u2011way. Use the same Wi\u2011Fi on both, or open a chat '
+                  'from history after a file or message.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: cs.outline.withValues(alpha: 0.85),
+                    fontSize: 13,
+                    height: 1.35,
+                  ),
+                ),
+              ),
+            ],
           ],
         ),
       );
