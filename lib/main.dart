@@ -442,6 +442,19 @@ Future<void> _bootstrapServices() async {
   await _connections.startServer();
   await _discovery.start();
 
+  _connections.onIncomingConnection = (socket, peerId) {
+    final addr = socket.remoteAddress;
+    if (addr.type != InternetAddressType.IPv4) return;
+    final peer = _discoveryPeerById(peerId);
+    _discovery.rememberPeerFromTcp(
+      userId: peerId,
+      name: (peer?.name ?? '').trim().isNotEmpty ? peer!.name : 'Peer',
+      ip: addr.address,
+      port: peer?.port ?? ConnectionService.tcpPort,
+      lanStableTag: peer?.lanStableTag,
+    );
+  };
+
   await TransferManager.instance.init(
     connections: _connections,
     store: _store,
@@ -474,6 +487,15 @@ Future<void> _bootstrapServices() async {
       final displayName = name.isNotEmpty
           ? name
           : ((peer?.name ?? '').trim().isNotEmpty ? peer!.name : 'Peer');
+      if (ip.isNotEmpty) {
+        _discovery.rememberPeerFromTcp(
+          userId: peerId,
+          name: displayName,
+          ip: ip,
+          port: port,
+          lanStableTag: peer?.lanStableTag,
+        );
+      }
       unawaited(_store.savePeerInfo(
         peerId,
         displayName,

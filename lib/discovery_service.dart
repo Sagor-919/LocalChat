@@ -27,6 +27,8 @@ class DiscoveryService {
   Timer? _cleanupTimer;
   Timer? _broadcastTargetsTimer;
   List<InternetAddress> _cachedBroadcastTargets = [];
+  bool _hasVirtualLanInterface = false;
+  bool _hasPhysicalLanInterface = false;
   void Function()? onPeersChanged;
 
   /// When non-null, peers for which this returns true are **not** pruned for
@@ -42,6 +44,39 @@ class DiscoveryService {
 
   /// UDP bound and discovery loop running — best-effort signal that we can advertise.
   bool get isAdvertisingActive => _started && _socket != null;
+
+  /// Hyper‑V / WSL / Docker virtual NICs plus a real LAN NIC — common cause of
+  /// one-way discovery when PC is wired and phone is on Wi‑Fi.
+  bool get showsMixedNetworkHint =>
+      _hasVirtualLanInterface && _hasPhysicalLanInterface;
+
+  /// True when interface name looks like a host-only virtual switch (Hyper‑V,
+  /// WSL, Docker, VPN, etc.) — not the LAN where phones live.
+  @visibleForTesting
+  static bool isVirtualLanInterfaceName(String name) {
+    final n = name.toLowerCase();
+    return n.contains('vethernet') ||
+        n.contains('hyper-v') ||
+        n.contains('wsl') ||
+        n.contains('docker') ||
+        n.contains('virtualbox') ||
+        n.contains('vmware') ||
+        n.contains('vpn') ||
+        n.contains('tap') ||
+        n.contains('tun') ||
+        n.contains('loopback');
+  }
+
+  /// IPv4 suitable for LAN discovery beacons (not loopback / link-local).
+  @visibleForTesting
+  static bool isLanRoutableIpv4(InternetAddress addr) {
+    if (addr.type != InternetAddressType.IPv4 || addr.isLoopback) return false;
+    final r = addr.rawAddress;
+    if (r.length != 4) return false;
+    // APIPA
+    if (r[0] == 169 && r[1] == 254) return false;
+    return true;
+  }
 
   Future<void> start() async {
     if (Platform.isAndroid) {
@@ -62,7 +97,9 @@ class DiscoveryService {
     }
     _attachDatagramListener();
 
-    unawaited(_refreshBroadcastTargets());
+    // Subnet broadcast targets must be ready before the first beacon — many
+    // Android devices ignore 255.255.255.255 but accept 192.168.x.255.
+    await _refreshBroadcastTargets();
     _broadcastTargetsTimer =
         Timer.periodic(const Duration(seconds: 15), (_) {
       unawaited(_refreshBroadcastTargets());
@@ -103,6 +140,28 @@ class DiscoveryService {
     });
   }
 
+  /// Register a peer learned from an active TCP session (chat or file). Keeps
+  /// the home list in sync when UDP broadcast is blocked (e.g. Ethernet PC →
+  /// Wi‑Fi phone) and enables directed unicast discovery beacons to that IP.
+  void rememberPeerFromTcp({
+    required String userId,
+    required String name,
+    required String ip,
+    int port = tcpPort,
+    String? lanStableTag,
+  }) {
+    if (userId == me.userId) return;
+    final trimmedIp = ip.trim();
+    if (trimmedIp.isEmpty) return;
+    _upsertPeer(
+      userId: userId,
+      name: name,
+      ip: trimmedIp,
+      port: port,
+      lanStableTag: lanStableTag,
+    );
+  }
+
   /// After Wi‑Fi/VPN changes, the old [RawDatagramSocket] may stop receiving
   /// multicast/broadcast until the process restarts — same as “restart app fixes it”.
   /// Close and rebind so discovery works again without killing the process.
@@ -132,8 +191,7 @@ class DiscoveryService {
     _broadcast();
   }
 
-  /// Joins multicast on the default socket and per IPv4 interface. Safe to call
-  /// again after Wi‑Fi/VPN changes (see [rebindUdpSocket]).
+  /// Joins multicast on the default socket and per physical IPv4 interface.
   void _joinMulticastGroups() {
     final s = _socket;
     if (s == null) return;
@@ -145,9 +203,9 @@ class DiscoveryService {
     try {
       NetworkInterface.list(includeLinkLocal: false).then((ifaces) {
         for (final iface in ifaces) {
+          if (isVirtualLanInterfaceName(iface.name)) continue;
           for (final addr in iface.addresses) {
-            if (addr.type != InternetAddressType.IPv4) continue;
-            if (addr.isLoopback) continue;
+            if (!isLanRoutableIpv4(addr)) continue;
             try {
               s.joinMulticast(group, iface);
             } catch (_) {}
@@ -162,11 +220,13 @@ class DiscoveryService {
     await rebindUdpSocket();
   }
 
-  /// Subnet broadcast(s) for Wi‑Fi/LAN; global broadcast is unreliable on many Androids.
+  /// Subnet broadcast(s) for Wi‑Fi/LAN; skips Hyper‑V/WSL virtual NICs.
   Future<void> _refreshBroadcastTargets() async {
     if (kIsWeb) return;
     final seen = <String>{};
     final out = <InternetAddress>[];
+    var sawVirtual = false;
+    var sawPhysical = false;
 
     void addAddr(String host) {
       if (seen.contains(host)) return;
@@ -185,9 +245,14 @@ class DiscoveryService {
 
     try {
       for (final iface in await NetworkInterface.list(includeLinkLocal: false)) {
+        final virtual = isVirtualLanInterfaceName(iface.name);
+        if (virtual) {
+          sawVirtual = true;
+          continue;
+        }
         for (final addr in iface.addresses) {
-          if (addr.type != InternetAddressType.IPv4) continue;
-          if (addr.isLoopback) continue;
+          if (!isLanRoutableIpv4(addr)) continue;
+          sawPhysical = true;
           final b24 = _ipv4Broadcast24(addr);
           if (b24 != null) addAddr(b24);
         }
@@ -195,12 +260,13 @@ class DiscoveryService {
     } catch (_) {}
 
     _cachedBroadcastTargets = out;
+    _hasVirtualLanInterface = sawVirtual;
+    _hasPhysicalLanInterface = sawPhysical;
   }
 
   static String? _ipv4Broadcast24(InternetAddress addr) {
-    if (addr.type != InternetAddressType.IPv4 || addr.isLoopback) return null;
+    if (!isLanRoutableIpv4(addr)) return null;
     final r = addr.rawAddress;
-    if (r.length != 4) return null;
     return '${r[0]}.${r[1]}.${r[2]}.255';
   }
 
@@ -221,6 +287,18 @@ class DiscoveryService {
         _socket?.send(data, target, udpPort);
       } catch (_) {}
     }
+    // Directed unicast: works when router blocks wired→Wi‑Fi broadcast.
+    final unicastIps = <String>{};
+    for (final peer in _peers.values) {
+      final ip = peer.ip.trim();
+      if (ip.isEmpty || unicastIps.contains(ip)) continue;
+      final addr = InternetAddress.tryParse(ip);
+      if (addr == null || !isLanRoutableIpv4(addr)) continue;
+      unicastIps.add(ip);
+      try {
+        _socket?.send(data, addr, udpPort);
+      } catch (_) {}
+    }
   }
 
   void _handleMessage(String raw, String senderIp) {
@@ -233,39 +311,60 @@ class DiscoveryService {
     final port = int.tryParse(parts[3]) ?? tcpPort;
     String? wireTag;
     if (parts.length >= 5) {
-      final raw = parts[4].trim();
-      if (raw.isNotEmpty && raw != '-') wireTag = raw;
+      final tagRaw = parts[4].trim();
+      if (tagRaw.isNotEmpty && tagRaw != '-') wireTag = tagRaw;
     }
 
     if (userId == me.userId) return;
 
+    _upsertPeer(
+      userId: userId,
+      name: name,
+      ip: senderIp,
+      port: port,
+      lanStableTag: wireTag,
+    );
+  }
+
+  void _upsertPeer({
+    required String userId,
+    required String name,
+    required String ip,
+    required int port,
+    String? lanStableTag,
+  }) {
     final existing = _peers[userId];
-    final effectiveTag = wireTag ?? existing?.lanStableTag;
+    final effectiveTag = lanStableTag ?? existing?.lanStableTag;
+    final now = DateTime.now();
+
     if (existing != null) {
-      existing.lastSeen = DateTime.now();
-      if (existing.name != name ||
-          existing.ip != senderIp ||
-          existing.port != port ||
-          existing.lanStableTag != effectiveTag) {
+      final same = existing.name == name &&
+          existing.ip == ip &&
+          existing.port == port &&
+          existing.lanStableTag == effectiveTag;
+      existing.lastSeen = now;
+      if (!same) {
         _peers[userId] = PeerDevice(
           userId: userId,
           name: name,
-          ip: senderIp,
+          ip: ip,
           port: port,
-          lastSeen: DateTime.now(),
+          lastSeen: now,
           lanStableTag: effectiveTag,
         );
+        onPeersChanged?.call();
       }
-    } else {
-      _peers[userId] = PeerDevice(
-        userId: userId,
-        name: name,
-        ip: senderIp,
-        port: port,
-        lastSeen: DateTime.now(),
-        lanStableTag: effectiveTag,
-      );
+      return;
     }
+
+    _peers[userId] = PeerDevice(
+      userId: userId,
+      name: name,
+      ip: ip,
+      port: port,
+      lastSeen: now,
+      lanStableTag: effectiveTag,
+    );
     onPeersChanged?.call();
   }
 

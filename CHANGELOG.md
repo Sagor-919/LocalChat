@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.8.1 (2026-06-06)
+
+### Discovery (LAN)
+
+- **Directed unicast beacons** to known peer IPs when broadcast is blocked (common with Ethernet PC + Wi‑Fi phone)
+- **TCP peer learning**: register peers from active chat/file TCP sessions so the home list stays in sync without UDP
+- **LAN-only broadcast**: skip Hyper‑V / WSL / Docker virtual NICs when choosing subnet broadcast targets
+- **Startup**: await subnet broadcast targets before the first discovery beacon
+- **Android**: `NEARBY_WIFI_DEVICES` manifest permission for LAN multicast on Android 13+
+- **UI hint** when virtual and physical LAN adapters are both present
+
+---
+
 ## 1.8.0 (2026-04-30)
 
 **Publisher:** RecklessGalaxy.com · **Developer:** Sagor Hossen
